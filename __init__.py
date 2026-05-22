@@ -92,6 +92,10 @@ _EXPOSE_MAP = {
 }
 
 NODE_CLASS_MAPPINGS = {new: NODE_CLASS_MAPPINGS[old] for old, new in _EXPOSE_MAP.items() if old in NODE_CLASS_MAPPINGS}
-NODE_DISPLAY_NAME_MAPPINGS = {new: NODE_DISPLAY_NAME_MAPPINGS.get(old, new) for old, new in _EXPOSE_MAP.items()}
+NODE_DISPLAY_NAME_MAPPINGS = {new: new for new in _EXPOSE_MAP.values()}
+
+# Fix category from WanVideoWrapper to WanAnimatePlus
+for node_class in NODE_CLASS_MAPPINGS.values():
+    node_class.CATEGORY = "WanAnimatePlus"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
