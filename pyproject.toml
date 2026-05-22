@@ -1,0 +1,15 @@
+[project]
+name = "ComfyUI-WanAnimatePlus"
+description = "Seamless video connection and multi-reference image support for Wan Animate."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["accelerate >= 1.2.1", "diffusers >= 0.33.0", "peft >= 0.17.0", "ftfy", "gguf >= 0.17.1", "pyloudnorm"]
+
+[project.urls]
+Repository = "https://github.com/kijai/ComfyUI-WanVideoWrapper"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "wuwukasi"
+DisplayName = "ComfyUI-WanAnimatePlus"
+Icon = ""

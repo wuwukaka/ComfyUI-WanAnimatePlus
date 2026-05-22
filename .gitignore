@@ -1,0 +1,14 @@
+output/
+*__pycache__/
+samples*/
+runs/
+checkpoints/
+master_ip
+logs/
+*.DS_Store
+.idea
+tools/
+.vscode/
+convert_*
+*.pt
+*.pth
