@@ -1,3 +1,6 @@
+# Modified from the original work (kijai/ComfyUI-WanVideoWrapper)
+#   - Updated duplicate node detection to check for WanAnimatePlus
+# Licensed under the Apache License, Version 2.0
 import importlib.metadata
 import torch
 import logging
@@ -703,10 +706,9 @@ def check_duplicate_nodes():
 
     # Check all directories in custom_nodes
     for path in custom_nodes_dir.iterdir():
-        if (path.is_dir() and 
+        if (path.is_dir() and
             path != current_path and
-            'wanvideo' in path.name.lower() and
-            'wrapper' in path.name.lower()):
+            'wananimateplus' in path.name.lower()):
             wanvideo_dirs.append(str(path))
 
     return wanvideo_dirs
