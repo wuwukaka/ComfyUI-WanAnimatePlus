@@ -1,0 +1,141 @@
+# ComfyUI-WanAnimatePlus
+
+[English](./README.md) | [中文](./README_ZH.md)
+
+Multi-reference image injection and seamless video connection for ComfyUI's WanAnimate pipeline.
+
+## Overview
+
+`ComfyUI-WanAnimatePlus` adds two core inputs to the original WanVideoWrapper's WanAnimate workflow:
+
+- **prefix_frames**: allows passing 1–5 additional reference images for multi-reference guided generation
+- **transition_video**: allows passing the last 21 frames of the previous video segment for seamless video connection
+
+When used together, canvas layout and frame offsets are automatically coordinated without conflicts.
+
+Use cases:
+
+- Multi-shot video sequence generation
+- Video continuation / extension
+- Motion transfer with multi-reference control
+
+## Demo
+
+### prefix_frames & transition_video usage
+
+![Usage](docs/images/iamge_001.png)
+
+<!-- Demo video -->
+<!-- [](docs/images/demo.mp4) -->
+
+## Features
+
+### prefix_frames (Multi-Reference Injection)
+
+Allows 1–5 additional reference images. Internally expands the canvas pixel space and encodes reference images across the front frames, with automatic frame offset coordination for control signals (pose / face).
+
+- Supports 1–5 reference images (truncated if exceeding 5)
+- Auto-resizes reference images to target resolution
+- Automatically aligns frame offsets for pose / face / bg / mask signals
+
+### transition_video (Seamless Video Connection)
+
+Allows passing the last 21 frames of the previous video segment. Writes these pixel frames directly into the front of the generation canvas, with sampled+reversed padding for control signal offsets.
+
+- Non-looping: embeds directly into canvas; Looping: handled via context window mechanism
+- Automatically coordinates with prefix when both are used
+
+## Installation
+
+Place this repository into ComfyUI's `custom_nodes` directory:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
+```
+
+Restart ComfyUI after installation.
+
+> **Note**: This plugin requires the original [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper). This plugin only provides prefix / transition extension nodes. Use the original for model loading, text encoding, and other base nodes.
+
+## Quick Start
+
+1. Start ComfyUI and confirm 10 nodes appear under the `WanAnimatePlus` category
+2. In your WanAnimate workflow, replace `WanVideoAnimateEmbeds` with `WanAnimatePlus AnimateEmbeds`, `WanVideoSampler` with `WanAnimatePlus Sampler`, and `WanVideoDecode` with `WanAnimatePlus Decode`
+3. Connect `prefix_frames` and/or `transition_video` inputs as needed
+4. Example workflows coming soon (to be placed in `example_workflows/`)
+
+## Nodes
+
+### WanAnimatePlus AnimateEmbeds
+
+Core node, replaces the original `WanVideoAnimateEmbeds`.
+
+**New inputs:**
+
+| Input | Description |
+|------|------|
+| `prefix_frames` | 1–5 additional reference images for multi-reference guided generation |
+| `transition_video` | Last 21 frames of the previous video segment for seamless video connection |
+
+Other inputs are identical to the original WanVideoAnimateEmbeds: `vae`, `width`, `height`, `num_frames`, `ref_images`, `pose_images`, `face_images`, `bg_images`, `mask`, `start_ref_image`, `clip_embeds`, etc.
+
+## Project Structure
+
+```text
+ComfyUI-WanAnimatePlus/
+├─ wanvideo/                 # WanVideo core model code
+├─ nodes.py                  # Main nodes (includes WanAnimatePlus AnimateEmbeds)
+├─ nodes_sampler.py          # Sampler nodes
+├─ nodes_model_loading.py    # Model loading nodes
+├─ nodes_utility.py          # Utility nodes
+├─ utils.py                  # Shared utilities
+├─ cache_methods/            # Cache acceleration
+├─ <other model dirs>        # Imported but not exposed to ComfyUI
+├─ docs/
+│  └─ images/                # Documentation images
+├─ example_workflows/        # Example workflows
+├─ __init__.py               # Node registration entry point
+├─ pyproject.toml
+├─ requirements.txt
+└─ LICENSE
+```
+
+## FAQ
+
+### 1. Nodes not showing after installation
+
+- Verify the repo path is `ComfyUI/custom_nodes/ComfyUI-WanAnimatePlus`
+- Ensure the original `ComfyUI-WanVideoWrapper` is also installed
+- Restart ComfyUI and search for `WanAnimatePlus` in the node list
+
+### 2. Conflicts with original nodes?
+
+No. All node names use the `WanAnimatePlus` prefix, completely avoiding conflicts with the original `WanVideo` prefixed nodes. Both can be installed simultaneously.
+
+### 3. How many images for prefix_frames?
+
+3 is recommended. Up to 5 are accepted (excess is truncated). The node works with fewer than 3 as well, but the coverage range will be smaller.
+
+### 4. How many frames for transition_video?
+
+Input is automatically cropped to 21 frames (padded with the first frame if insufficient).
+
+## Acknowledgments
+
+Modified from [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper). Deep respect to the original author for their tremendous contributions to the WanVideo ecosystem.
+
+## Contact
+
+- Bilibili: [@wuwukasi](https://space.bilibili.com/670281046)
+- Email: wuwukawayi@gmail.com
+
+## Sponsorship
+
+If you find this project helpful, consider buying me a coffee!
+
+<p align="center"><img src="docs/images/iamge_003.png" alt="WeChat Sponsor QR" width="400"/></p>
+
+## License
+
+Based on the original project, released under **Apache License, Version 2.0**. Modified files include copyright attribution and modification notices in their headers.
