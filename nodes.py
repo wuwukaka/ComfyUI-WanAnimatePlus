@@ -1217,7 +1217,7 @@ class WanVideoAnimateEmbeds:
                 "transition_video": ("IMAGE", {"default": None, "tooltip": "Transition video frames (32 images, encoded to 8 latent frames). Acts as hard conditioning guide for seamless connection."}),
                 "prefix_frames": ("IMAGE", {"default": None, "tooltip": "3 reference images. Expands canvas by 17 pixel frames, encoded together with bg frames. Image 0 ×5, image 1 ×4, image 2 ×4, image 0 ×4. Shifts pose/face by 17 frames."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
-                "signature": ("BOOLEAN", {"default": True, "label_on": "Prefix & Transition Video by wuwukasi(bilibili)", "label_off": "Prefix & Transition Video by wuwukasi(bilibili)"}),
+                " ": ("BOOLEAN", {"default": True, "label_on": "Prefix & Transition Video by wuwukasi(bilibili)", "label_off": "Prefix & Transition Video by wuwukasi(bilibili)"}),
             }
         }
 
@@ -1228,7 +1228,7 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
                 ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None,
-                transition_video=None, prefix_frames=None, signature=True):
+                transition_video=None, prefix_frames=None, **kwargs):
         
         W = (width // 16) * 16
         H = (height // 16) * 16
