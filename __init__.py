@@ -80,16 +80,16 @@ for module_path, name in OPTIONAL_MODULES:
 # Only expose nodes related to prefix/transition video feature
 # Rename WanVideo prefix to WanAnimatePlus to avoid conflicts with original project
 _EXPOSE_MAP = {
-    "WanVideoAnimateEmbeds":        "WanAnimatePlusAnimateEmbeds",
-    "WanVideoSampler":              "WanAnimatePlusSampler",
-    "WanVideoSamplerv2":            "WanAnimatePlusSamplerv2",
-    "WanVideoScheduler":            "WanAnimatePlusScheduler",
-    "WanVideoSchedulerv2":          "WanAnimatePlusSchedulerv2",
-    "WanVideoSamplerSettings":      "WanAnimatePlusSamplerSettings",
-    "WanVideoSamplerFromSettings":  "WanAnimatePlusSamplerFromSettings",
-    "WanVideoEncode":               "WanAnimatePlusEncode",
-    "WanVideoDecode":               "WanAnimatePlusDecode",
-    "WanVideoVAELoader":            "WanAnimatePlusVAELoader",
+    "WanVideoAnimateEmbeds":        "WanAnimatePlus AnimateEmbeds",
+    "WanVideoSampler":              "WanAnimatePlus Sampler",
+    "WanVideoSamplerv2":            "WanAnimatePlus Samplerv2",
+    "WanVideoScheduler":            "WanAnimatePlus Scheduler",
+    "WanVideoSchedulerv2":          "WanAnimatePlus Schedulerv2",
+    "WanVideoSamplerSettings":      "WanAnimatePlus SamplerSettings",
+    "WanVideoSamplerFromSettings":  "WanAnimatePlus SamplerFromSettings",
+    "WanVideoEncode":               "WanAnimatePlus Encode",
+    "WanVideoDecode":               "WanAnimatePlus Decode",
+    "WanVideoVAELoader":            "WanAnimatePlus VAELoader",
 }
 
 NODE_CLASS_MAPPINGS = {new: NODE_CLASS_MAPPINGS[old] for old, new in _EXPOSE_MAP.items() if old in NODE_CLASS_MAPPINGS}
