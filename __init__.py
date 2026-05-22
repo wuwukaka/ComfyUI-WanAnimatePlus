@@ -1,4 +1,5 @@
-# Modified from the original work (kijai/ComfyUI-WanVideoWrapper)
+# Copyright (c) 2025 kijai
+# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
 #   - Filtered node exposure to WanAnimatePlus-only nodes
 #   - Renamed node prefix from WanVideo to WanAnimatePlus
 # Licensed under the Apache License, Version 2.0

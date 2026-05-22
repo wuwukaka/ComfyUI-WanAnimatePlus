@@ -1,4 +1,5 @@
-# Modified from the original work (kijai/ComfyUI-WanVideoWrapper)
+# Copyright (c) 2025 kijai
+# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
 #   - Updated duplicate node detection to check for WanAnimatePlus
 # Licensed under the Apache License, Version 2.0
 import importlib.metadata

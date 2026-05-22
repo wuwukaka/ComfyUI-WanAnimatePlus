@@ -1,4 +1,5 @@
-# Modified from the original work (kijai/ComfyUI-WanVideoWrapper)
+# Copyright (c) 2025 kijai
+# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
 #   - Added prefix frames context prepend in WanVideoSampler
 #   - Added canvas_expansion_px awareness for uni3c render_latent padding
 #   - Transition-aware context window handling
