@@ -1228,7 +1228,7 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
                 ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None,
-                transition_video=None, prefix_frames=None):
+                transition_video=None, prefix_frames=None, signature=True):
         
         W = (width // 16) * 16
         H = (height // 16) * 16
