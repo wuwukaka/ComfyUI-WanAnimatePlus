@@ -23,7 +23,7 @@ Use cases:
 
 ### prefix_frames & transition_video usage
 
-![Usage](docs/images/iamge_001.png)
+![Usage](docs/images/image_001.png)
 
 <!-- Demo video -->
 <!-- [](docs/images/demo.mp4) -->
@@ -152,7 +152,7 @@ Modified from [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-W
 
 If you find this project helpful, consider buying me a coffee!
 
-<p align="center"><img src="docs/images/iamge_003.png" alt="WeChat Sponsor QR" width="400"/></p>
+<p align="center"><img src="docs/images/image_003.png" alt="WeChat Sponsor QR" width="400"/></p>
 
 ## License
 
