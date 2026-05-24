@@ -27,7 +27,11 @@
 
 ### prefix_frames 效果演示
 
-[](https://github.com/user-attachments/assets/02be9bee-8dd5-4543-aef2-d9e0c259fac7)
+[](https://github.com/user-attachments/assets/6df01023-5daa-42ab-9817-27a3b49bd6af)
+
+### transition_video 效果演示
+
+[](https://github.com/user-attachments/assets/4c6d2d29-dc21-406c-8ae9-5201d4cc416b)
 
 ## 功能特性
 
