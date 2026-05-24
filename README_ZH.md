@@ -64,7 +64,7 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 2. **将整个工作流链路替换**为 WanAnimatePlus 版本：`ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler`、`Decode` 及配套节点
 3. **不要**在同一个工作流中混用原版 WanVideoWrapper 节点
 4. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
-5. 示例工作流待补充（放入 `example_workflows/` 目录）
+5. 示例工作流见 `example_workflows/` 目录
 
 ## 节点说明
 

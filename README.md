@@ -64,7 +64,7 @@ Restart ComfyUI after installation.
 2. **Replace the entire workflow chain** with WanAnimatePlus counterparts: `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, `Decode`, and supporting nodes
 3. Do **not** mix original WanVideoWrapper nodes in the same workflow
 4. Connect `prefix_frames` and/or `transition_video` inputs as needed
-5. Example workflows coming soon (to be placed in `example_workflows/`)
+5. Example workflows are available in the `example_workflows/` directory
 
 ## Nodes
 
