@@ -1,1 +1,0 @@
-# WanAnimatePlus node package
