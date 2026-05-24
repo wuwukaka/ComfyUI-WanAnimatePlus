@@ -25,8 +25,9 @@ Use cases:
 
 ![Usage](docs/images/image_001.png)
 
-<!-- Demo video -->
-<!-- [](docs/images/demo.mp4) -->
+### prefix_frames demo
+
+[](https://github.com/user-attachments/assets/02be9bee-8dd5-4543-aef2-d9e0c259fac7)
 
 ## Features
 

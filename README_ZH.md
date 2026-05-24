@@ -25,8 +25,9 @@
 
 ![使用方法](docs/images/image_001.png)
 
-<!-- 效果视频 -->
-<!-- [](docs/images/demo.mp4) -->
+### prefix_frames 效果演示
+
+[](https://github.com/user-attachments/assets/02be9bee-8dd5-4543-aef2-d9e0c259fac7)
 
 ## 功能特性
 
