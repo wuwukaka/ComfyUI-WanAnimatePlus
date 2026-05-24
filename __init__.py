@@ -1,6 +1,7 @@
 # Copyright (c) 2025 kijai
 # Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
 #   - Registers a complete WanAnimatePlus workflow node chain with renamed node keys
+#   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility
 #   - Keeps WanAnimatePlus nodes isolated from original WanVideoWrapper node names
 # Licensed under the Apache License, Version 2.0
 try:
