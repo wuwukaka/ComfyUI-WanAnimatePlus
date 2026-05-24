@@ -47,7 +47,6 @@ Allows 1–5 additional reference images. Internally expands the canvas pixel sp
 
 Allows passing the last 21 frames of the previous video segment. Writes these pixel frames directly into the front of the generation canvas, with sampled+reversed padding for control signal offsets.
 
-- Non-looping: embeds directly into canvas; Looping: handled via context window mechanism
 - Automatically coordinates with prefix when both are used
 
 ## Installation
