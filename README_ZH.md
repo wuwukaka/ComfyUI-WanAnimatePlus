@@ -56,14 +56,15 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 安装完成后重启 ComfyUI。
 
-> **注意**：为了获得稳定结果，请尽量使用 WanAnimatePlus 节点组成完整工作流链路。不要在同一个工作流中混用 WanAnimatePlus 的 model / context / sampler 节点和原版 WanVideoWrapper 的对应节点。
+> **重要**：要使用 `prefix_frames` 和 `transition_video`，**必须**全链路替换为 WanAnimatePlus 版本节点。在同一个工作流中混用 WanAnimatePlus 节点和原版 WanVideoWrapper 节点会导致输出异常。
 
 ## 快速开始
 
 1. 启动 ComfyUI，确认 `WanAnimatePlus` 分类下能看到完整节点链路
-2. 在 WanAnimate 工作流中，将原版 WanVideoWrapper 节点替换为对应的 WanAnimatePlus 节点，尤其是 `ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler` 和 `Decode`
-3. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
-4. 示例工作流待补充（放入 `example_workflows/` 目录）
+2. **将整个工作流链路替换**为 WanAnimatePlus 版本：`ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler`、`Decode` 及配套节点
+3. **不要**在同一个工作流中混用原版 WanVideoWrapper 节点
+4. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
+5. 示例工作流待补充（放入 `example_workflows/` 目录）
 
 ## 节点说明
 
@@ -83,6 +84,7 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
 - `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
 - `WanAnimatePlus TorchCompileSettings`
+- `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 
 ### WanAnimatePlus AnimateEmbeds
 

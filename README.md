@@ -56,14 +56,15 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 Restart ComfyUI after installation.
 
-> **Note**: For best results, use WanAnimatePlus nodes as a complete workflow chain. Avoid mixing WanAnimatePlus model / context / sampler nodes with the original WanVideoWrapper equivalents in the same workflow.
+> **Important**: To use `prefix_frames` and `transition_video`, you **must** replace the full workflow chain with WanAnimatePlus nodes. Mixing WanAnimatePlus nodes with original WanVideoWrapper nodes in the same workflow will result in degraded output.
 
 ## Quick Start
 
 1. Start ComfyUI and confirm the WanAnimatePlus nodes appear under the `WanAnimatePlus` category
-2. In your WanAnimate workflow, replace the original WanVideoWrapper nodes with their WanAnimatePlus counterparts, especially `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, and `Decode`
-3. Connect `prefix_frames` and/or `transition_video` inputs as needed
-4. Example workflows coming soon (to be placed in `example_workflows/`)
+2. **Replace the entire workflow chain** with WanAnimatePlus counterparts: `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, `Decode`, and supporting nodes
+3. Do **not** mix original WanVideoWrapper nodes in the same workflow
+4. Connect `prefix_frames` and/or `transition_video` inputs as needed
+5. Example workflows coming soon (to be placed in `example_workflows/`)
 
 ## Nodes
 
@@ -83,6 +84,7 @@ Core nodes:
 - `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
 - `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
 - `WanAnimatePlus TorchCompileSettings`
+- `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 
 ### WanAnimatePlus AnimateEmbeds
 
