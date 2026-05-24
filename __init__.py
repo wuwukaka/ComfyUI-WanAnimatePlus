@@ -39,6 +39,7 @@ from .nodes_model_loading import (
     WanVideoTorchCompileSettings,
     WanVideoVAELoader,
 )
+from .uni3c.nodes import WanVideoUni3C_ControlnetLoader, WanVideoUni3C_embeds
 
 NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus AnimateEmbeds": WanVideoAnimateEmbeds,
@@ -60,6 +61,8 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus BlockSwap": WanVideoBlockSwap,
     "WanAnimatePlus SetBlockSwap": WanVideoSetBlockSwap,
     "WanAnimatePlus TorchCompileSettings": WanVideoTorchCompileSettings,
+    "WanAnimatePlus Uni3C ControlnetLoader": WanVideoUni3C_ControlnetLoader,
+    "WanAnimatePlus Uni3C Embeds": WanVideoUni3C_embeds,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: k for k in NODE_CLASS_MAPPINGS}
