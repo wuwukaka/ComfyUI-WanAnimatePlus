@@ -1,8 +1,9 @@
 # Copyright (c) 2025 kijai
 # Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
-#   - Added prefix_frames support to WanVideoAnimateEmbeds
+#   - Added prefix_frames support to WanVideoAnimateEmbeds for multi-reference guidance
+#   - Added transition_video canvas embedding for seamless video continuation
 #   - Added canvas_expansion_px trimming to WanVideoDecode
-#   - Unified canvas expansion for prefix and transition video
+#   - Added WanAnimatePlus signature widget to the embeds node
 # Licensed under the Apache License, Version 2.0
 import os, gc, math
 import torch

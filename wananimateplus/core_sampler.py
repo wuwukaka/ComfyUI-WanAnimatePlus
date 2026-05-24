@@ -1,26 +1,23 @@
 # Copyright (c) 2025 kijai
 # Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
-#   - Added prefix frame support in WanVideoSampler context windows
-#   - Added transition-aware context window handling
-#   - Added canvas_expansion_px awareness for Uni3C render_latent padding
+#   - Added prefix frames context prepend in WanVideoSampler_plus
+#   - Added canvas_expansion_px awareness for uni3c render_latent padding
+#   - Transition-aware context window handling
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy
 import torch
 import numpy as np
 from tqdm import tqdm
 import inspect
-from .wanvideo.modules.model import rope_params
-from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
-from .wanvideo.schedulers import get_scheduler, scheduler_list
-from .gguf.gguf import set_lora_params_gguf
-from .multitalk.multitalk import add_noise
-from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
+from ..wanvideo.modules.model import rope_params
+from ..custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
+from ..wanvideo.schedulers import get_scheduler, scheduler_list
+from ..gguf.gguf import set_lora_params_gguf
+from ..utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling, offload_transformer, init_blockswap)
-from .multitalk.multitalk_loop import multitalk_loop
-from .cache_methods.cache_methods import cache_report
-from .nodes_model_loading import load_weights
-from .enhance_a_video.globals import set_enhance_weight, set_num_frames
-from .WanMove.trajectory import replace_feature
+from ..cache_methods.cache_methods import cache_report
+from ..nodes_model_loading import load_weights
+from ..enhance_a_video.globals import set_enhance_weight, set_num_frames
 from contextlib import nullcontext
 
 from comfy import model_management as mm
@@ -38,7 +35,13 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 
-class WanVideoSampler:
+def add_noise(original_samples: torch.FloatTensor, noise: torch.FloatTensor, timesteps: torch.IntTensor) -> torch.FloatTensor:
+    timesteps = timesteps.float() / 1000
+    timesteps = timesteps.view(timesteps.shape + (1,) * (len(noise.shape) - 1))
+    return (1 - timesteps) * original_samples + timesteps * noise
+
+
+class WanVideoSampler_plus:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -67,10 +70,7 @@ class WanVideoSampler:
                 "loop_args": ("LOOPARGS", ),
                 "experimental_args": ("EXPERIMENTALARGS", ),
                 "sigmas": ("SIGMAS", ),
-                "unianimate_poses": ("UNIANIMATE_POSE", ),
-                "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
                 "uni3c_embeds": ("UNI3C_EMBEDS", ),
-                "multitalk_embeds": ("MULTITALK_EMBEDS", ),
                 "freeinit_args": ("FREEINITARGS", ),
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
@@ -86,7 +86,7 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, uni3c_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
@@ -150,7 +150,7 @@ class WanVideoSampler:
         if model["auto_cpu_offload"] is False:
             transformer = compile_model(transformer, model["compile_args"])
 
-        multitalk_sampling = image_embeds.get("multitalk_sampling", False)
+        multitalk_sampling = False
 
         if multitalk_sampling and context_options is not None:
             raise Exception("context_options are not compatible or necessary with 'WanVideoImageToVideoMultiTalk' node, since it's already an alternative method that creates the video in a loop.")
@@ -248,17 +248,8 @@ class WanVideoSampler:
             else:
                 image_cond[:, 1:] = 0
 
-            #ATI tracks
-            if transformer_options is not None:
-                ATI_tracks = transformer_options.get("ati_tracks", None)
-                if ATI_tracks is not None:
-                    from .ATI.motion_patch import patch_motion
-                    topk = transformer_options.get("ati_topk", 2)
-                    temperature = transformer_options.get("ati_temperature", 220.0)
-                    ati_start_percent = transformer_options.get("ati_start_percent", 0.0)
-                    ati_end_percent = transformer_options.get("ati_end_percent", 1.0)
-                    image_cond_ati = patch_motion(ATI_tracks.to(image_cond.device, image_cond.dtype), image_cond, topk=topk, temperature=temperature)
-                    log.info(f"ATI tracks shape: {ATI_tracks.shape}")
+            # ATI tracking is not part of WanAnimatePlus core.
+            ATI_tracks = None
 
             add_cond_latents = image_embeds.get("add_cond_latents", None)
             if add_cond_latents is not None:
@@ -359,12 +350,9 @@ class WanVideoSampler:
                 log.info(f"RecamMaster source video shape: {recam_latents.shape}")
                 seq_len *= 2
 
-            if image_embeds.get("mocha_embeds", None) is not None:
-                mocha_embeds = image_embeds.get("mocha_embeds", None)
-                mocha_num_refs = image_embeds.get("mocha_num_refs", 0)
-                orig_noise_len = noise.shape[1]
-                seq_len = image_embeds.get("seq_len", seq_len)
-                log.info(f"MoCha embeds shape: {mocha_embeds.shape}")
+            # MoCha is not part of WanAnimatePlus core.
+            mocha_embeds = None
+            mocha_num_refs = 0
 
             # Fun control and control lora
             control_embeds = image_embeds.get("control_embeds", None)
@@ -429,26 +417,13 @@ class WanVideoSampler:
 
         num_frames = image_embeds.get("num_frames", 0)
 
-        #HuMo inputs
-        humo_audio = image_embeds.get("humo_audio_emb", None)
-        humo_audio_neg = image_embeds.get("humo_audio_emb_neg", None)
-        humo_reference_count = image_embeds.get("humo_reference_count", 0)
-
-        if humo_audio is not None:
-            from .HuMo.nodes import get_audio_emb_window
-            if not multitalk_sampling:
-                humo_audio, _ = get_audio_emb_window(humo_audio, num_frames, frame0_idx=0)
-                zero_audio_pad = torch.zeros(humo_reference_count, *humo_audio.shape[1:]).to(humo_audio.device)
-                humo_audio = torch.cat([humo_audio, zero_audio_pad], dim=0)
-                humo_audio_neg = torch.zeros_like(humo_audio, dtype=humo_audio.dtype, device=humo_audio.device)
-            humo_audio = humo_audio.to(device, dtype)
-
-        if humo_audio_neg is not None:
-            humo_audio_neg = humo_audio_neg.to(device, dtype)
-        humo_audio_scale = image_embeds.get("humo_audio_scale", 1.0)
-        humo_image_cond = image_embeds.get("humo_image_cond", None)
-        humo_image_cond_neg = image_embeds.get("humo_image_cond_neg", None)
-
+        # HuMo is not part of WanAnimatePlus core.
+        humo_audio = None
+        humo_audio_neg = None
+        humo_reference_count = 0
+        humo_audio_scale = 1.0
+        humo_image_cond = None
+        humo_image_cond_neg = None
         pos_latent = neg_latent = None
 
         # Ovi
@@ -473,11 +448,9 @@ class WanVideoSampler:
             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
             humo_image_cond = humo_image_cond_neg = None
 
-        humo_audio_cfg_scale = image_embeds.get("humo_audio_cfg_scale", 1.0)
-        humo_start_percent = image_embeds.get("humo_start_percent", 0.0)
-        humo_end_percent = image_embeds.get("humo_end_percent", 1.0)
-        if not isinstance(humo_audio_cfg_scale, list):
-            humo_audio_cfg_scale = [humo_audio_cfg_scale] * (steps + 1)
+        humo_audio_cfg_scale = [1.0] * (steps + 1)
+        humo_start_percent = 0.0
+        humo_end_percent = 1.0
 
         # region WanAnim inputs
         frame_window_size = image_embeds.get("frame_window_size", 77)
@@ -522,7 +495,7 @@ class WanVideoSampler:
         # Initialize FreeInit filter if enabled
         freq_filter = None
         if freeinit_args is not None:
-            from .freeinit.freeinit_utils import get_freq_filter, freq_mix_3d
+            from ..freeinit.freeinit_utils import get_freq_filter, freq_mix_3d
             filter_shape = list(noise.shape)  # [batch, C, T, H, W]
             freq_filter = get_freq_filter(
                 filter_shape,
@@ -536,6 +509,11 @@ class WanVideoSampler:
                 saved_generator_state = samples.get("generator_state", None)
                 if saved_generator_state is not None:
                     seed_g.set_state(saved_generator_state)
+
+        # UniAnimate / audio avatar extensions are not part of WanAnimatePlus core.
+        unianimate_poses = None
+        fantasytalking_embeds = None
+        multitalk_embeds = None
 
         # UniAnimate
         if unianimate_poses is not None:
@@ -611,7 +589,7 @@ class WanVideoSampler:
 
         # FantasyPortrait
         fantasy_portrait_input = None
-        fantasy_portrait_embeds = image_embeds.get("portrait_embeds", None)
+        fantasy_portrait_embeds = None
         if fantasy_portrait_embeds is not None:
             log.info("Using FantasyPortrait embeddings")
             fantasy_portrait_input = fantasy_portrait_embeds.copy()
@@ -674,42 +652,29 @@ class WanVideoSampler:
                         noise[:, place_idx:place_idx + delta, :, :] = noise[:, list_idx, :, :]
 
                 log.info(f"Context schedule enabled: {context_frames} frames, {context_stride} stride, {context_overlap} overlap")
-                from .context_windows.context import get_context_scheduler, create_window_mask, WindowTracker
+                from ..context_windows.context import get_context_scheduler, create_window_mask, WindowTracker
                 self.window_tracker = WindowTracker(verbose=context_options["verbose"])
                 context = get_context_scheduler(context_schedule)
             else:
                 log.info("Context frames is larger than total num_frames, disabling context windows")
                 context_options = None
 
-        #MTV Crafter
-        mtv_input = image_embeds.get("mtv_crafter_motion", None)
+        # MTV Crafter is not part of WanAnimatePlus core.
+        mtv_input = None
         mtv_motion_tokens = None
-        if mtv_input is not None:
-            from .MTV.mtv import prepare_motion_embeddings
-            log.info("Using MTV Crafter embeddings")
-            mtv_start_percent = mtv_input.get("start_percent", 0.0)
-            mtv_end_percent = mtv_input.get("end_percent", 1.0)
-            mtv_strength = mtv_input.get("strength", 1.0)
-            mtv_motion_tokens = mtv_input.get("mtv_motion_tokens", None)
-            if not isinstance(mtv_strength, list):
-                mtv_strength = [mtv_strength] * (steps + 1)
-            d = transformer.dim // transformer.num_heads
-            mtv_freqs = torch.cat([
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6))
-            ],
-            dim=1)
-            motion_rotary_emb = prepare_motion_embeddings(
-                latent_video_length if context_options is None else context_frames,
-                24, mtv_input["global_mean"], [mtv_input["global_std"]], device=device)
-            log.info(f"mtv_motion_rotary_emb: {motion_rotary_emb[0].shape}")
-            mtv_freqs = mtv_freqs.to(device, dtype)
+        mtv_strength = [1.0] * (steps + 1)
+        mtv_freqs = None
+        motion_rotary_emb = None
 
-        #region S2V
+        # S2V is not part of WanAnimatePlus core.
         s2v_audio_input = s2v_ref_latent = s2v_pose = s2v_ref_motion = None
+        s2v_audio_scale = 1.0
+        s2v_pose_start_percent = 0.0
+        s2v_pose_end_percent = 1.0
+        s2v_num_repeat = 1
+        s2v_motion_frames = [1, 0]
         framepack = False
-        s2v_audio_embeds = image_embeds.get("audio_embeds", None)
+        s2v_audio_embeds = None
         if s2v_audio_embeds is not None:
             log.info("Using S2V audio embeddings")
             framepack = s2v_audio_embeds.get("enable_framepack", False)
@@ -909,7 +874,7 @@ class WanVideoSampler:
         transformer.enable_teacache = transformer.enable_magcache = transformer.enable_easycache = False
         cache_args = teacache_args if teacache_args is not None else cache_args #for backward compatibility on old workflows
         if cache_args is not None:
-            from .cache_methods.cache_methods import set_transformer_cache_method
+            from ..cache_methods.cache_methods import set_transformer_cache_method
             transformer = set_transformer_cache_method(transformer, timesteps, cache_args)
 
             # Initialize cache state
@@ -993,18 +958,7 @@ class WanVideoSampler:
         transformer.rope_embedder.num_frames = None
         d = transformer.dim // transformer.num_heads
 
-        if mocha_embeds is not None:
-            from .mocha.nodes import rope_params_mocha
-            log.info("Using Mocha RoPE")
-            rope_function = 'mocha'
-
-            freqs = torch.cat([
-                rope_params_mocha(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index, start=-1),
-                rope_params_mocha(1024, 2 * (d // 6), start=-1),
-                rope_params_mocha(1024, 2 * (d // 6), start=-1)
-            ],
-            dim=1)
-        elif "default" in rope_function or bidirectional_sampling: # original RoPE
+        if "default" in rope_function or bidirectional_sampling: # original RoPE
             freqs = torch.cat([
                 rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
                 rope_params(1024, 2 * (d // 6)),
@@ -1168,16 +1122,8 @@ class WanVideoSampler:
             scail_data = dict_to_device(scail_data, device, dtype)
 
 
-        # WanMove
+        # WanMove is not part of WanAnimatePlus core.
         wanmove_embeds = None
-        if image_cond is not None:
-            wanmove_embeds = image_embeds.get("wanmove_embeds", None)
-            if wanmove_embeds is not None:
-                track_pos = wanmove_embeds["track_pos"]
-                if any(not math.isclose(c, 1.0) for c in cfg):
-                    image_cond_neg = torch.cat([image_embeds["mask"], image_cond])
-                if context_options is None:
-                    image_cond = replace_feature(image_cond.unsqueeze(0).clone(), track_pos.unsqueeze(0), wanmove_embeds.get("strength", 1.0))[0]
 
         # LongVie2 dual control
         dual_control_embeds = image_embeds.get("dual_control", None)
@@ -1439,9 +1385,6 @@ class WanVideoSampler:
                         scail_data_in["pose_latent"] = scail_data["pose_latent"][:, context_window]
                     else:
                         scail_data_in = scail_data
-
-                if wanmove_embeds is not None and context_window is not None:
-                    image_cond_input = replace_feature(image_cond_input.unsqueeze(0), track_pos[:, context_window].unsqueeze(0), wanmove_embeds.get("strength", 1.0))[0]
 
                 dual_control_in = None
                 if dual_control_embeds is not None:
@@ -1731,7 +1674,7 @@ class WanVideoSampler:
         if args.preview_method in [LatentPreviewMethod.Auto, LatentPreviewMethod.Latent2RGB]: #default for latent2rgb
             from latent_preview import prepare_callback
         else:
-            from .latent_preview import prepare_callback #custom for tiny VAE previews
+            from ..latent_preview import prepare_callback #custom for tiny VAE previews
         callback = prepare_callback(patcher, len(timesteps))
 
         if not multitalk_sampling and not framepack and not wananimate_loop:
@@ -2144,9 +2087,6 @@ class WanVideoSampler:
                             counter[:, c] += window_mask
                             context_pbar.update_absolute(step_start_progress + (i + 1) * fraction_per_context, len(timesteps))
                         noise_pred /= counter
-                    #region multitalk
-                    elif multitalk_sampling:
-                        return multitalk_loop(**locals())
                     # region framepack loop
                     elif framepack:
                         framepack_out = []
@@ -2303,7 +2243,7 @@ class WanVideoSampler:
                         target_latent_len = (target_len - 1) // 4 + estimated_iterations
                         latent_window_size = (frame_window_size - 1) // 4 + 1
 
-                        from .utils import tensor_pingpong_pad
+                        from ..utils import tensor_pingpong_pad
 
                         ref_latent = image_embeds.get("ref_latent", None)
                         ref_images = image_embeds.get("ref_image", None)
@@ -2805,18 +2745,20 @@ class WanVideoSampler:
             "samples": callback_latent.unsqueeze(0).cpu() if callback is not None else None,
         })
 
-class WanVideoSamplerSettings(WanVideoSampler):
+
+class WanVideoSamplerSettings_plus(WanVideoSampler_plus):
     RETURN_TYPES = ("SAMPLER_ARGS",)
     RETURN_NAMES = ("sampler_inputs", )
-    DESCRIPTION = "Node to output all settings and inputs for the WanVideoSamplerFromSettings -node"
+    DESCRIPTION = "Node to output all settings and inputs for the WanVideoSamplerFromSettings_plus -node"
     def process(self, *args, **kwargs):
         import inspect
-        params = inspect.signature(WanVideoSampler.process).parameters
+        params = inspect.signature(WanVideoSampler_plus.process).parameters
         args_dict = {name: kwargs.get(name, param.default if param.default is not inspect.Parameter.empty else None)
                      for name, param in params.items() if name != "self"}
         return args_dict,
 
-class WanVideoSamplerFromSettings(WanVideoSampler):
+
+class WanVideoSamplerFromSettings_plus(WanVideoSampler_plus):
     DESCRIPTION = "Utility node with no other functionality than to look cleaner, useful for the live preview as the main sampler node has become a messy monster"
     @classmethod
     def INPUT_TYPES(s):
@@ -2829,37 +2771,7 @@ class WanVideoSamplerFromSettings(WanVideoSampler):
         return super().process(**sampler_inputs)
 
 
-class WanVideoSamplerExtraArgs():
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-            },
-            "optional": {
-                "riflex_freq_index": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1, "tooltip": "Frequency index for RIFLEX, disabled when 0, default 6. Allows for new frames to be generated after without looping"}),
-                "feta_args": ("FETAARGS", ),
-                "context_options": ("WANVIDCONTEXT", ),
-                "cache_args": ("CACHEARGS", ),
-                "slg_args": ("SLGARGS", ),
-                "rope_function": (rope_functions, {"default": "comfy", "tooltip": "Comfy's RoPE implementation doesn't use complex numbers and can thus be compiled, that should be a lot faster when using torch.compile. Chunked version has reduced peak VRAM usage when not using torch.compile"}),
-                "loop_args": ("LOOPARGS", ),
-                "experimental_args": ("EXPERIMENTALARGS", ),
-                "unianimate_poses": ("UNIANIMATE_POSE", ),
-                "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
-                "uni3c_embeds": ("UNI3C_EMBEDS", ),
-                "multitalk_embeds": ("MULTITALK_EMBEDS", ),
-            }
-        }
-    RETURN_TYPES = ("WANVIDSAMPLEREXTRAARGS",)
-    RETURN_NAMES = ("extra_args", )
-    FUNCTION = "process"
-    CATEGORY = "WanVideoWrapper"
-
-    def process(self, *args, **kwargs):
-        return kwargs,
-
-
-class WanVideoSamplerv2(WanVideoSampler):
+class WanVideoSamplerv2_plus(WanVideoSampler_plus):
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2881,7 +2793,7 @@ class WanVideoSamplerv2(WanVideoSampler):
 
     def process(self, *args, extra_args=None, **kwargs):
         import inspect
-        params = inspect.signature(WanVideoSampler.process).parameters
+        params = inspect.signature(WanVideoSampler_plus.process).parameters
         args_dict = {name: kwargs.get(name, param.default if param.default is not inspect.Parameter.empty else None)
                      for name, param in params.items() if name != "self"}
 
@@ -2893,7 +2805,7 @@ class WanVideoSamplerv2(WanVideoSampler):
         return super().process(**args_dict)
 
 
-class WanVideoScheduler:
+class WanVideoScheduler_plus:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -2998,7 +2910,8 @@ class WanVideoScheduler:
 
         return (sigmas, steps, shift, scheduler_dict, start_step, end_step)
 
-class WanVideoSchedulerv2(WanVideoScheduler):
+
+class WanVideoSchedulerv2_plus(WanVideoScheduler_plus):
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -3026,22 +2939,3 @@ class WanVideoSchedulerv2(WanVideoScheduler):
     def process(self, *args, **kwargs):
         sigmas, steps, shift, scheduler_dict, start_step, end_step = super().process(*args, **kwargs)
         return scheduler_dict,
-
-NODE_CLASS_MAPPINGS = {
-    "WanVideoSampler": WanVideoSampler,
-    "WanVideoSamplerSettings": WanVideoSamplerSettings,
-    "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
-    "WanVideoSamplerv2": WanVideoSamplerv2,
-    "WanVideoSamplerExtraArgs": WanVideoSamplerExtraArgs,
-    "WanVideoScheduler": WanVideoScheduler,
-    "WanVideoSchedulerv2": WanVideoSchedulerv2,
-    }
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "WanVideoSampler": "WanVideo Sampler",
-    "WanVideoSamplerSettings": "WanVideo Sampler Settings",
-    "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
-    "WanVideoSamplerv2": "WanVideo Sampler v2",
-    "WanVideoSamplerExtraArgs": "WanVideoSampler v2 Extra Args",
-    "WanVideoScheduler": "WanVideo Scheduler",
-    "WanVideoSchedulerv2": "WanVideo Scheduler v2",
-}

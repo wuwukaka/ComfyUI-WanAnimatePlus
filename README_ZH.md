@@ -56,18 +56,35 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 安装完成后重启 ComfyUI。
 
-> **注意**：本插件需要配合原版 [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) 使用。本插件仅提供 prefix / transition 相关的扩展节点，模型加载、文本编码等基础节点请使用原版。
+> **注意**：为了获得稳定结果，请尽量使用 WanAnimatePlus 节点组成完整工作流链路。不要在同一个工作流中混用 WanAnimatePlus 的 model / context / sampler 节点和原版 WanVideoWrapper 的对应节点。
 
 ## 快速开始
 
-1. 启动 ComfyUI，确认 `WanAnimatePlus` 分类下存在 10 个节点
-2. 在原版 WanAnimate 工作流基础上，将 `WanVideoAnimateEmbeds` 替换为 `WanAnimatePlusAnimateEmbeds`，`WanVideoSampler` 替换为 `WanAnimatePlusSampler`，`WanVideoDecode` 替换为 `WanAnimatePlusDecode`
+1. 启动 ComfyUI，确认 `WanAnimatePlus` 分类下能看到完整节点链路
+2. 在 WanAnimate 工作流中，将原版 WanVideoWrapper 节点替换为对应的 WanAnimatePlus 节点，尤其是 `ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler` 和 `Decode`
 3. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
 4. 示例工作流待补充（放入 `example_workflows/` 目录）
 
 ## 节点说明
 
-### WanAnimatePlusAnimateEmbeds
+WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanVideoWrapper 节点跨包混用。
+
+核心节点：
+
+- `WanAnimatePlus ModelLoader`
+- `WanAnimatePlus VAELoader`
+- `WanAnimatePlus TextEncodeCached`
+- `WanAnimatePlus ClipVisionEncode`
+- `WanAnimatePlus ContextOptions`
+- `WanAnimatePlus AnimateEmbeds`
+- `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
+- `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
+- `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
+- `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
+- `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
+- `WanAnimatePlus TorchCompileSettings`
+
+### WanAnimatePlus AnimateEmbeds
 
 核心节点，替代原版 `WanVideoAnimateEmbeds`。
 
@@ -85,13 +102,12 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 ```text
 ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo 核心模型代码
-├─ nodes.py                  # 主节点（含 WanAnimatePlusAnimateEmbeds）
-├─ nodes_sampler.py          # 采样器节点
-├─ nodes_model_loading.py    # 模型加载节点
-├─ nodes_utility.py          # 工具节点
-├─ utils.py                  # 公共工具函数
+├─ nodes.py                  # WanAnimatePlus embeds / encode / decode 核心节点
+├─ nodes_sampler.py          # WanAnimatePlus sampler / scheduler 核心节点
+├─ nodes_model_loading.py    # WanAnimatePlus model / VAE / LoRA / block swap 节点
+├─ context_windows/          # Context window 调度
 ├─ cache_methods/            # 缓存加速方法
-├─ <其他模型子目录>            # 导入但不暴露给 ComfyUI
+├─ utils.py                  # 公共工具函数
 ├─ docs/
 │  └─ images/                # 文档图片
 ├─ example_workflows/        # 示例工作流

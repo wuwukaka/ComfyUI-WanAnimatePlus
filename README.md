@@ -56,16 +56,33 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 Restart ComfyUI after installation.
 
-> **Note**: This plugin requires the original [ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper). This plugin only provides prefix / transition extension nodes. Use the original for model loading, text encoding, and other base nodes.
+> **Note**: For best results, use WanAnimatePlus nodes as a complete workflow chain. Avoid mixing WanAnimatePlus model / context / sampler nodes with the original WanVideoWrapper equivalents in the same workflow.
 
 ## Quick Start
 
-1. Start ComfyUI and confirm 10 nodes appear under the `WanAnimatePlus` category
-2. In your WanAnimate workflow, replace `WanVideoAnimateEmbeds` with `WanAnimatePlus AnimateEmbeds`, `WanVideoSampler` with `WanAnimatePlus Sampler`, and `WanVideoDecode` with `WanAnimatePlus Decode`
+1. Start ComfyUI and confirm the WanAnimatePlus nodes appear under the `WanAnimatePlus` category
+2. In your WanAnimate workflow, replace the original WanVideoWrapper nodes with their WanAnimatePlus counterparts, especially `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, and `Decode`
 3. Connect `prefix_frames` and/or `transition_video` inputs as needed
 4. Example workflows coming soon (to be placed in `example_workflows/`)
 
 ## Nodes
+
+WanAnimatePlus exposes a complete workflow chain to avoid cross-package object mixing with the original WanVideoWrapper nodes.
+
+Core nodes:
+
+- `WanAnimatePlus ModelLoader`
+- `WanAnimatePlus VAELoader`
+- `WanAnimatePlus TextEncodeCached`
+- `WanAnimatePlus ClipVisionEncode`
+- `WanAnimatePlus ContextOptions`
+- `WanAnimatePlus AnimateEmbeds`
+- `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
+- `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
+- `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
+- `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
+- `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
+- `WanAnimatePlus TorchCompileSettings`
 
 ### WanAnimatePlus AnimateEmbeds
 
@@ -85,13 +102,12 @@ Other inputs are identical to the original WanVideoAnimateEmbeds: `vae`, `width`
 ```text
 ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo core model code
-├─ nodes.py                  # Main nodes (includes WanAnimatePlus AnimateEmbeds)
-├─ nodes_sampler.py          # Sampler nodes
-├─ nodes_model_loading.py    # Model loading nodes
-├─ nodes_utility.py          # Utility nodes
-├─ utils.py                  # Shared utilities
+├─ nodes.py                  # Core WanAnimatePlus embeds / encode / decode nodes
+├─ nodes_sampler.py          # Core WanAnimatePlus sampler / scheduler nodes
+├─ nodes_model_loading.py    # Core WanAnimatePlus model / VAE / LoRA / block swap nodes
+├─ context_windows/          # Context-window scheduling
 ├─ cache_methods/            # Cache acceleration
-├─ <other model dirs>        # Imported but not exposed to ComfyUI
+├─ utils.py                  # Shared utilities
 ├─ docs/
 │  └─ images/                # Documentation images
 ├─ example_workflows/        # Example workflows
