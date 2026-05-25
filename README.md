@@ -154,9 +154,14 @@ Modified from [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-W
 
 ## Sponsorship
 
-If you find this project helpful, consider buying me a coffee!
+If you find this project helpful, consider supporting me! Your support is what keeps this project going and motivates me to continue improving it.
 
-<p align="center"><img src="docs/images/image_003.png" alt="WeChat Sponsor QR" width="400"/></p>
+Every contribution, no matter how small, means a lot and helps me dedicate more time to development and new features. Thank you!
+
+<p align="center">
+  <img src="docs/images/image_003.png" alt="WeChat Sponsor QR" width="400"/>
+  <img src="docs/images/image_002.jpg" alt="Alipay Sponsor QR" width="400"/>
+</p>
 
 ## License
 
