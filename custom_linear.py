@@ -3,42 +3,41 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
-@torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
-def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
-    patch_diff = torch.mm(
-        lora_diff_0.flatten(start_dim=1),
-        lora_diff_1.flatten(start_dim=1)
-    ).reshape(weight.shape)
+if not hasattr(torch.ops.wanvideo, 'apply_lora'):
+    @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
+    def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
+        patch_diff = torch.mm(
+            lora_diff_0.flatten(start_dim=1),
+            lora_diff_1.flatten(start_dim=1)
+        ).reshape(weight.shape)
 
-    alpha = lora_diff_2 / lora_diff_1.shape[0] if lora_diff_2 != 0.0 else 1.0
-    scale = lora_strength * alpha
+        alpha = lora_diff_2 / lora_diff_1.shape[0] if lora_diff_2 != 0.0 else 1.0
+        scale = lora_strength * alpha
 
-    return weight + patch_diff * scale
+        return weight + patch_diff * scale
 
-@apply_lora.register_fake
-def _(weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength):
-    # Return weight with same metadata
-    return weight.clone()
+    @apply_lora.register_fake
+    def _(weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength):
+        return weight.clone()
 
-@torch.library.custom_op("wanvideo::apply_single_lora", mutates_args=())
-def apply_single_lora(weight: torch.Tensor, lora_diff: torch.Tensor, lora_strength: torch.Tensor) -> torch.Tensor:
-    return weight + lora_diff * lora_strength
+if not hasattr(torch.ops.wanvideo, 'apply_single_lora'):
+    @torch.library.custom_op("wanvideo::apply_single_lora", mutates_args=())
+    def apply_single_lora(weight: torch.Tensor, lora_diff: torch.Tensor, lora_strength: torch.Tensor) -> torch.Tensor:
+        return weight + lora_diff * lora_strength
 
-@apply_single_lora.register_fake
-def _(weight, lora_diff, lora_strength):
-    # Return weight with same metadata
-    return weight.clone()
+    @apply_single_lora.register_fake
+    def _(weight, lora_diff, lora_strength):
+        return weight.clone()
 
-@torch.library.custom_op("wanvideo::linear_forward", mutates_args=())
-def linear_forward(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    return torch.nn.functional.linear(input, weight, bias)
+if not hasattr(torch.ops.wanvideo, 'linear_forward'):
+    @torch.library.custom_op("wanvideo::linear_forward", mutates_args=())
+    def linear_forward(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        return torch.nn.functional.linear(input, weight, bias)
 
-@linear_forward.register_fake
-def _(input, weight, bias):
-    # Calculate output shape: (..., out_features)
-    out_features = weight.shape[0]
-    output_shape = list(input.shape[:-1]) + [out_features]
-    return input.new_empty(output_shape)
+    @linear_forward.register_fake
+    def _(input, weight, bias):
+        output_shape = list(input.shape[:-1]) + [weight.shape[0]]
+        return input.new_empty(output_shape)
 
 #based on https://github.com/huggingface/diffusers/blob/main/src/diffusers/quantizers/gguf/utils.py
 def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, scale_weights=None, compile_args=None, modules_to_not_convert=[]):
