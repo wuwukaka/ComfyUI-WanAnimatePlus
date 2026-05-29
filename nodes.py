@@ -1271,7 +1271,7 @@ class WanVideoAnimateEmbeds:
                 log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
         # ============ Prefix frames: expand canvas and shift control signals ============
         if prefix_frames is not None:
-            # Expand canvas: always 37 = 17 prefix + 20 reserve (for optional transition)
+            # Expand canvas: always 37 = 17 prefix + 12 transition + 8 reserve
             extra = 37
             num_frames += extra
             # Trim 1-3 frames from end to keep num_frames % 4 == 1 (required by repeat_interleave + view)
@@ -1385,15 +1385,15 @@ class WanVideoAnimateEmbeds:
                 if transition_video is not None:
                     tv = transition_video  # [B, H, W, C]
                     b_tv = tv.shape[0]
-                    if b_tv >= 20:
-                        tv = tv[-20:]
+                    if b_tv >= 12:
+                        tv = tv[-12:]
                     else:
-                        tv = torch.cat([tv[0:1].repeat(20 - b_tv, 1, 1, 1), tv], dim=0)
+                        tv = torch.cat([tv[0:1].repeat(12 - b_tv, 1, 1, 1), tv], dim=0)
                     if tv.shape[1] != H or tv.shape[2] != W:
                         tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
-                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 20, H, W]
-                    resized_bg_images[:, 17:37] = tv.to(device, dtype=resized_bg_images.dtype)
-                    log.info("Prefix+Transition: embedded last 20 transition frames into canvas positions 17-37")
+                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 12, H, W]
+                    resized_bg_images[:, 25:37] = tv.to(device, dtype=resized_bg_images.dtype)
+                    log.info("Prefix+Transition: embedded last 12 transition frames into canvas positions 25-37")
             # ==========================================================================
 
             # ============ Transition (no prefix): embed into canvas first 21 frames ============
@@ -1470,7 +1470,7 @@ class WanVideoAnimateEmbeds:
             if prefix_frames is not None:
                 bg_mask[:, :actual_prefix_px] = 1.0  # only actual prefix pixel frames
                 if transition_video is not None:
-                    bg_mask[:, 17:37] = 1.0
+                    bg_mask[:, 25:37] = 1.0
             # ======= Transition (no prefix): set mask=1 for first 21 pixel frames =======
             elif transition_video is not None:
                 bg_mask[:, :21] = 1.0
