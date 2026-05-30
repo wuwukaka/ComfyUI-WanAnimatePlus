@@ -1447,7 +1447,7 @@ class WanVideoAnimateEmbeds:
             prefix_T = 0
             if prefix_frames is not None and looping:
                 vae.to(device)
-                prefix_latent = vae.encode([prefix_pixel_data.to(device, vae.dtype).unsqueeze(0)], device, tiled=tiled_vae)[0]
+                prefix_latent = vae.encode([prefix_pixel_data.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
                 prefix_T = prefix_latent.shape[1]
                 prefix_msk = torch.ones(4, prefix_T, lat_h, lat_w, device=offload_device, dtype=vae.dtype)
                 prefix_latent_masked = torch.cat([prefix_msk, prefix_latent.to(offload_device)], dim=0)  # [20, prefix_T, ...]
