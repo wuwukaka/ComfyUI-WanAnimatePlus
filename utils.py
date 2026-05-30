@@ -16,7 +16,7 @@ from comfy.lora import calculate_weight
 
 try:
     from comfy.utils import string_to_seed
-except:
+except Exception:
     from comfy.model_patcher import string_to_seed
 
 from comfy.float import stochastic_rounding
@@ -31,7 +31,7 @@ offload_device = mm.unet_offload_device()
 
 try:
     from .gguf.gguf import GGUFParameter
-except:
+except Exception:
     pass
 
 COLOR_CODES = {
@@ -313,7 +313,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                     key = f"{name.replace('diffusion_model.', '')}.{param}"
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[key])
-                    except:
+                    except Exception:
                         continue
                 key = f"{name}.{param}"
                 if scale_weights is not None:
@@ -327,7 +327,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                 if low_mem_load:
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=model.model.diffusion_model.state_dict()[key])
-                    except:
+                    except Exception:
                         continue
             m.comfy_patched_weights = True
             cnt += 1
@@ -356,7 +356,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                         dtype_to_use = torch.float32
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, name, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[name])
-                    except:
+                    except Exception:
                         continue
         return model
 

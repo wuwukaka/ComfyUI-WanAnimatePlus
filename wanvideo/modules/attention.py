@@ -65,16 +65,16 @@ try:
         def _(q, k, v, q_lens, k_lens, max_seqlen_q, max_seqlen_k, dropout_p=0.0, is_causal=False):
             return q.clone()
     sageattn_varlen_func = torch.ops.wananimateplus.sageattn_varlen
-except:
+except Exception:
     sageattn_varlen_func = attention_func_error
 
 # sage3
 try:
     from sageattn3 import sageattn3_blackwell as sageattn_blackwell
-except:
+except Exception:
     try:
         from sageattn import sageattn_blackwell
-    except:
+    except Exception:
         sageattn_blackwell = attention_func_error
 
 try:
@@ -89,7 +89,7 @@ try:
         def _(qkv, attn_mask=None, dropout_p=0.0, is_causal=False, multi_factor=0.9):
             return torch.empty_like(qkv[0]).contiguous()
     sageattn_func_ultravico = torch.ops.wananimateplus.sageattn_ultravico
-except:
+except Exception:
     sageattn_func_ultravico = attention_func_error
 
 
