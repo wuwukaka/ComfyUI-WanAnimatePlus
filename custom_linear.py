@@ -253,10 +253,16 @@ class CustomLinear(nn.Linear):
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
+            sw = self.scale_weight
+            # MXFP8 block-wise scale: expand from [out, in//block] to [out, in]
+            if sw.ndim > 1 and sw.shape[-1] != weight.shape[-1]:
+                block_size = weight.shape[-1] // sw.shape[-1]
+                if block_size > 1:
+                    sw = sw.repeat_interleave(block_size, dim=-1)
             if weight.numel() < input.numel():
-                weight = weight * self.scale_weight
+                weight = weight * sw
             else:
-                input = input * self.scale_weight
+                input = input * sw
 
         weight = self._get_weight_with_lora(weight)
         out = self._linear_forward_impl(input, weight, bias)

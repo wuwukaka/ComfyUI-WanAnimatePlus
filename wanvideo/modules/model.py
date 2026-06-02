@@ -1724,6 +1724,27 @@ class AudioInjector_WAN(nn.Module):
                 self.injector_adain_output_layers = nn.ModuleList(
                     [nn.Linear(dim, dim) for _ in range(audio_injector_id)])
 
+def _rope_rotation(pos, dim, theta=10000.0):
+    """Generate 2x2 RoPE rotation matrices for spatial position encoding.
+    Returns tensor of shape [..., dim//2, 2, 2]."""
+    assert dim % 2 == 0
+    compute_dev = torch.device("cpu") if str(pos.device).startswith("cuda") else pos.device
+    half = dim // 2
+    # Frequency exponents: 0, 2/dim, 4/dim, ..., (dim-2)/dim
+    exponents = (torch.arange(half, dtype=torch.float64, device=compute_dev) * 2) / dim
+    omega = 1.0 / (theta ** exponents)  # [half]
+    pos_f = pos.to(dtype=torch.float32, device=compute_dev)
+    angles = pos_f.unsqueeze(-1) * omega  # [..., half]
+    c = torch.cos(angles)
+    s = torch.sin(angles)
+    rot = torch.zeros(*pos.shape, half, 2, 2, dtype=torch.float32, device=compute_dev)
+    rot[..., 0, 0] = c
+    rot[..., 0, 1] = -s
+    rot[..., 1, 0] = s
+    rot[..., 1, 1] = c
+    return rot.to(pos.device)
+
+
 class WanModel(torch.nn.Module):
     def __init__(self,
                 model_type='t2v',
@@ -2206,7 +2227,8 @@ class WanModel(torch.nn.Module):
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
                           steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
-                          ref_frame_index=10, longcat_num_ref_latents=0, num_memory_frames=3, rope_negative_offset=0):
+                          ref_frame_index=10, longcat_num_ref_latents=0, num_memory_frames=3, rope_negative_offset=0,
+                          context_frame_shapes=None, context_window_start=0):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
@@ -2301,6 +2323,32 @@ class WanModel(torch.nn.Module):
 
             freqs = torch.cat([main_freqs, pose_freqs], dim=1)
 
+        # In-context reference (Bernini): per-stream RoPE segments with source_id rotation
+        if context_frame_shapes is not None:
+            d = self.dim // self.num_heads
+            ctx_freqs_list = []
+            for i, (ctx_t, ctx_h, ctx_w) in enumerate(context_frame_shapes):
+                ctx_t_len = ((ctx_t + (self.patch_size[0] // 2)) // self.patch_size[0])
+                ctx_h_len = ((ctx_h + (self.patch_size[1] // 2)) // self.patch_size[1])
+                ctx_w_len = ((ctx_w + (self.patch_size[2] // 2)) // self.patch_size[2])
+                ctx_ids = torch.zeros((ctx_t_len, ctx_h_len, ctx_w_len, 3), device=device, dtype=dtype)
+                ctx_ids[:, :, :, 0] = ctx_ids[:, :, :, 0] + torch.linspace(
+                    context_window_start, context_window_start + (ctx_t_len - 1),
+                    steps=ctx_t_len, device=device, dtype=dtype).reshape(-1, 1, 1)
+                ctx_ids[:, :, :, 1] = ctx_ids[:, :, :, 1] + torch.linspace(0, ctx_h_len - 1, steps=ctx_h_len, device=device, dtype=dtype).reshape(1, -1, 1)
+                ctx_ids[:, :, :, 2] = ctx_ids[:, :, :, 2] + torch.linspace(0, ctx_w_len - 1, steps=ctx_w_len, device=device, dtype=dtype).reshape(1, 1, -1)
+                ctx_ids = ctx_ids.reshape(1, -1, ctx_ids.shape[-1])
+                ctx_freqs = self.rope_embedder(ctx_ids, ntk_alphas).movedim(1, 2)
+
+                # Source ID rotation: distinguish context streams from the main content
+                source_id = i + 1
+                pos = torch.tensor([[float(source_id)]], device=ctx_freqs.device, dtype=torch.float32)
+                id_rot = _rope_rotation(pos, d, self.rope_embedder.theta).reshape(1, 1, 1, d // 2, 2, 2).to(ctx_freqs.dtype)
+                ctx_freqs = torch.einsum('...ij,...jk->...ik', ctx_freqs, id_rot)
+
+                ctx_freqs_list.append(ctx_freqs)
+            freqs = torch.cat([freqs] + ctx_freqs_list, dim=1)
+
         return freqs
 
 
@@ -2350,6 +2398,7 @@ class WanModel(torch.nn.Module):
         transformer_options={},
         rope_negative_offset=0,
         num_memory_frames=0,
+        **kwargs,
     ):
         r"""
         Forward pass through the diffusion model
@@ -2372,6 +2421,11 @@ class WanModel(torch.nn.Module):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        # In-context reference (Bernini): extract optional context_latents from kwargs
+        context_latents = kwargs.get("context_latents", None)
+        context_frame_shapes = None
+        context_window_start = kwargs.get("context_window_start", 0)
+
         # Stand-In only used on first positive pass, then cached in kv_cache
         if is_uncond or current_step > 0:
             standin_input = None
@@ -2576,6 +2630,17 @@ class WanModel(torch.nn.Module):
         x = [u.flatten(2).transpose(1, 2) for u in x]
         self.original_seq_len = x[0].shape[1]
 
+        # In-context reference (Bernini): patch-embed context_latents and append as extra tokens
+        if context_latents is not None and len(context_latents) > 0:
+            context_frame_shapes = []
+            for lat in context_latents:
+                lat = lat.to(device=x[0].device, dtype=x[0].dtype)
+                cl = self.original_patch_embedding(lat.unsqueeze(0).float()).to(x[0].dtype)
+                cl = cl.flatten(2).transpose(1, 2)
+                x = [torch.cat([u, cl], dim=1) for u in x]
+                seq_len = max(seq_len, x[0].shape[1])
+                context_frame_shapes.append(lat.shape[1:4])  # (F, H, W)
+
         prev_latent = None
         if dual_control_input is not None:
             prev_latent = dual_control_input.get("prev_latent", None)
@@ -2675,6 +2740,7 @@ class WanModel(torch.nn.Module):
                 longcat_num_ref_latents,
                 rope_negative_offset,
                 num_memory_frames,
+                tuple(tuple(s) for s in context_frame_shapes) if context_frame_shapes is not None else None,
             )
 
             # Check cache using key comparison
@@ -2692,6 +2758,8 @@ class WanModel(torch.nn.Module):
                     longcat_num_ref_latents=longcat_num_ref_latents,
                     rope_negative_offset=rope_negative_offset,
                     num_memory_frames=num_memory_frames,
+                    context_frame_shapes=context_frame_shapes,
+                    context_window_start=context_window_start,
                     device=x.device,
                     dtype=x.dtype
                 )

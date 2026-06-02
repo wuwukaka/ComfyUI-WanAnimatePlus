@@ -496,6 +496,7 @@ class WanVideoSampler:
         # ================================================================
         has_prefix = image_embeds.get("has_prefix", False)
         canvas_expansion_px = image_embeds.get("canvas_expansion_px", 0)
+        context_latents = image_embeds.get("context_latents", None)
         if has_prefix:
             log.info("Prefix frames: detected, will prepend indices 0-5 to each window (except first)")
         if wananimate_loop and context_options is not None:
@@ -1202,7 +1203,8 @@ class WanVideoSampler:
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
-                             wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,):
+                             wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
+                             context_latents=None, context_window_start=0,):
             nonlocal transformer
             nonlocal audio_cfg_scale
 
@@ -1524,6 +1526,8 @@ class WanVideoSampler:
                     "one_to_all_controlnet_strength": one_to_all_data["controlnet_strength"] if one_to_all_data is not None else 0.0,
                     "scail_input": scail_data_in, # SCAIL input
                     "dual_control_input": dual_control_in, # LongVie2 dual control input
+                    "context_latents": context_latents, # Bernini in-context reference
+                    "context_window_start": context_window_start, # Context window start frame index for temporal RoPE alignment
                     "transformer_options": transformer_options,
                     "rope_negative_offset": image_embeds.get("rope_negative_offset_frames", 0), # StoryMem rope negative offset
                     "num_memory_frames": story_mem_latents.shape[1] if story_mem_latents is not None else 0, # StoryMem memory frames
@@ -2122,6 +2126,15 @@ class WanVideoSampler:
                             original_seq_len = seq_len
                             if has_prefix and c[0] != 0:
                                 seq_len = original_seq_len + 6 * base_patches_per_frame
+                            # Slice context_latents for current context window
+                            sliced_context_latents = None
+                            if context_latents is not None:
+                                sliced_context_latents = []
+                                for lat in context_latents:
+                                    if lat.shape[1] > 1 and lat.shape[1] == noise.shape[1]:
+                                        sliced_context_latents.append(lat[:, c].to(device))
+                                    else:
+                                        sliced_context_latents.append(lat.to(device))
                             noise_pred_context, _, new_teacache = predict_with_cfg(
                                 partial_latent_model_input,
                                 cfg[idx], positive,
@@ -2131,7 +2144,8 @@ class WanVideoSampler:
                                 mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                                 wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
-                                uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent)
+                                uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent, context_latents=sliced_context_latents,
+                                context_window_start=c[0])
 
                             seq_len = original_seq_len  # restore seq_len
 
@@ -2251,6 +2265,7 @@ class WanVideoSampler:
                                     text_embeds["negative_prompt_embeds"],
                                     timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
                                     cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,
+                                    context_latents=context_latents,
                                     s2v_audio_input=s2v_audio_input_slice, s2v_ref_motion=input_motion_latents, s2v_motion_frames=s2v_motion_frames, s2v_pose=s2v_pose_slice)
 
                                 latent = sample_scheduler.step(
@@ -2567,6 +2582,7 @@ class WanVideoSampler:
                                     latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
                                     timestep, i, cache_state=self.cache_state, image_cond=image_cond_in, clip_fea=clip_fea, wananim_face_pixels=face_images_in,
                                     wananim_pose_latents=pose_input_slice, uni3c_data=uni3c_data_input,
+                                    context_latents=context_latents,
                                  )
                                 if prefix_T > 0:
                                     noise_pred = noise_pred[:, prefix_T:]
@@ -2666,13 +2682,15 @@ class WanVideoSampler:
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
                             humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                             wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
+                            context_latents=context_latents,
                         )
                         if bidirectional_sampling:
                             noise_pred_flipped, _,self.cache_state = predict_with_cfg(
                             latent_model_input_flipped,
                             cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
                             timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
-                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,reverse_time=True)
+                            cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,reverse_time=True,
+                            context_latents=context_latents,)
 
                     if latent_shift_loop:
                         #reverse latent shift

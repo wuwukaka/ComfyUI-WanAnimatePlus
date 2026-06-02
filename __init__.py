@@ -16,6 +16,7 @@ except Exception:
     pass
 
 from .nodes import (
+    WanAnimatePlusBernini,
     WanVideoAnimateEmbeds,
     WanVideoClipVisionEncode,
     WanVideoContextOptions,
@@ -31,9 +32,11 @@ from .nodes_sampler import (
     WanVideoSchedulerv2,
     WanVideoSamplerSettings,
     WanVideoSamplerFromSettings,
+    WanVideoSamplerExtraArgs,
 )
 from .nodes_model_loading import (
     WanVideoBlockSwap,
+    WanVideoLoraSelect,
     WanVideoLoraSelectMulti,
     WanVideoModelLoader,
     WanVideoSetLoRAs,
@@ -57,6 +60,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus ContextOptions": WanVideoContextOptions,
     "WanAnimatePlus TextEncodeCached": WanVideoTextEncodeCached,
     "WanAnimatePlus ClipVisionEncode": WanVideoClipVisionEncode,
+    "WanAnimatePlus LoraSelect": WanVideoLoraSelect,
     "WanAnimatePlus LoraSelectMulti": WanVideoLoraSelectMulti,
     "WanAnimatePlus SetLoRAs": WanVideoSetLoRAs,
     "WanAnimatePlus BlockSwap": WanVideoBlockSwap,
@@ -64,6 +68,8 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus TorchCompileSettings": WanVideoTorchCompileSettings,
     "WanAnimatePlus Uni3C ControlnetLoader": WanVideoUni3C_ControlnetLoader,
     "WanAnimatePlus Uni3C Embeds": WanVideoUni3C_embeds,
+    "WanAnimatePlus SamplerExtraArgs": WanVideoSamplerExtraArgs,
+    "WanAnimatePlus Bernini": WanAnimatePlusBernini,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: k for k in NODE_CLASS_MAPPINGS}

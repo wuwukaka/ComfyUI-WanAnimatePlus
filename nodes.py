@@ -2533,6 +2533,92 @@ class WanVideoEncode:
 
         return ({"samples": latents, "noise_mask": mask},)
 
+class WanAnimatePlusBernini:
+    """Bernini in-context conditioning for WanAnimatePlus.
+
+    VAE-encodes source video / reference images / reference video and attaches
+    them as extra in-context tokens (context_latents) to the image embeds.
+    The Wan model appends these tokens with per-stream source_id RoPE.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "width": ("INT", {"default": 832, "min": 16, "max": 8192, "step": 16}),
+                "height": ("INT", {"default": 480, "min": 16, "max": 8192, "step": 16}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 8192, "step": 4}),
+            },
+            "optional": {
+                "source_video": ("IMAGE", {"tooltip": "Source video to edit/restyle (v2v/rv2v). Resized to width/height. Acts as the edit base."}),
+                "reference_video": ("IMAGE", {"tooltip": "Moving content to composite into the source (video insertion), kept at native aspect."}),
+                "reference_images": ("IMAGE", {"tooltip": "Reference image(s) injected as in-context tokens (r2v/rv2v). Native aspect preserved."}),
+                "ref_max_size": ("INT", {"default": 848, "min": 16, "max": 8192, "step": 16, "tooltip": "Max long-edge size for reference_video and reference_images."}),
+                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
+                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+
+    def process(self, vae, width, height, num_frames,
+                source_video=None, reference_video=None, reference_images=None, ref_max_size=848,
+                force_offload=True, tiled_vae=False):
+
+        def _resize_long_edge(image, max_size, stride=16):
+            """Resize keeping aspect ratio so long edge ≤ max_size, snapped to stride."""
+            h, w = image.shape[1], image.shape[2]
+            if max(h, w) <= max_size:
+                return image[:, :, :, :3]
+            ratio = max_size / max(h, w)
+            nh = max(stride, round(h * ratio / stride) * stride)
+            nw = max(stride, round(w * ratio / stride) * stride)
+            return common_upscale(image[:, :, :, :3].movedim(-1, 1), nw, nh, "area", "disabled").movedim(1, -1)
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        # Ordered context list: source_video (1), reference_video (2), reference_images (3,4,...)
+        context = []
+
+        if source_video is not None:
+            vid = common_upscale(source_video[:num_frames, :, :, :3].movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
+            vae.to(device)
+            context.append(vae.encode([(vid.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+            if force_offload:
+                vae.to(offload_device)
+
+        if reference_video is not None:
+            ref_vid = _resize_long_edge(reference_video[:num_frames], ref_max_size)
+            vae.to(device)
+            context.append(vae.encode([(ref_vid.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+            if force_offload:
+                vae.to(offload_device)
+
+        if reference_images is not None:
+            for i in range(reference_images.shape[0]):
+                img = _resize_long_edge(reference_images[i:i + 1], ref_max_size)
+                vae.to(device)
+                context.append(vae.encode([(img.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+                if force_offload:
+                    vae.to(offload_device)
+
+        if context:
+            log.info(f"Bernini: attached {len(context)} context streams")
+
+        target_shape = (16, (num_frames - 1) // 4 + 1, height // 8, width // 8)
+        image_embeds = {
+            "target_shape": target_shape,
+            "num_frames": num_frames,
+            "context_latents": list(context) if context else None,
+        }
+        return (image_embeds,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
