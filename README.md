@@ -6,18 +6,26 @@ Multi-reference image injection and seamless video connection for ComfyUI's WanA
 
 ## Overview
 
-`ComfyUI-WanAnimatePlus` adds two core inputs to the original WanVideoWrapper's WanAnimate workflow:
+`ComfyUI-WanAnimatePlus` adds three major feature groups to the WanVideo workflow:
+
+### prefix_frames & transition_video
 
 - **prefix_frames**: allows passing 1–5 additional reference images for multi-reference guided generation
 - **transition_video**: allows passing the last 21 frames of the previous video segment for seamless video connection
 
 When used together, canvas layout and frame offsets are automatically coordinated without conflicts.
 
+### Bernini
+
+Supports Bernini models. Allows passing source video, reference video, or reference images as generation conditions. Supports v2v, rv2v, r2v, and t2v tasks.
+
 Use cases:
 
 - Multi-shot video sequence generation
 - Video continuation / extension
 - Motion transfer with multi-reference control
+- Video editing with source video + reference images
+- Reference-to-video generation
 
 ## Demo
 
@@ -49,6 +57,13 @@ Allows passing the last 21 frames of the previous video segment. Writes these pi
 
 - Automatically coordinates with prefix when both are used
 
+### Bernini
+
+Generates condition latents from source video, reference video, and/or reference images via VAE encoding. Supports v2v, rv2v, r2v, and t2v — task is auto-detected from connected inputs.
+
+- Reference images kept at native aspect ratio
+- Compatible with context windows
+
 ## Installation
 
 Place this repository into ComfyUI's `custom_nodes` directory:
@@ -60,7 +75,7 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 Restart ComfyUI after installation.
 
-> **Important**: To use `prefix_frames` and `transition_video`, you **must** replace the full workflow chain with WanAnimatePlus nodes. Mixing WanAnimatePlus nodes with original WanVideoWrapper nodes in the same workflow will result in degraded output.
+> **Important**: To use `prefix_frames`, `transition_video`, or `Bernini`, you **must** replace the full workflow chain with WanAnimatePlus nodes. Mixing WanAnimatePlus nodes with original WanVideoWrapper nodes in the same workflow will result in degraded output.
 
 ## Quick Start
 
@@ -85,10 +100,12 @@ Core nodes:
 - `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
 - `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
 - `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
-- `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
+- `WanAnimatePlus LoraSelect` / `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
 - `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
 - `WanAnimatePlus TorchCompileSettings`
+- `WanAnimatePlus SamplerExtraArgs`
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
+- `WanAnimatePlus Bernini`
 
 ### WanAnimatePlus AnimateEmbeds
 
@@ -102,6 +119,25 @@ Core node, replaces the original `WanVideoAnimateEmbeds`.
 | `transition_video` | Last 21 frames of the previous video segment for seamless video connection |
 
 Other inputs are identical to the original WanVideoAnimateEmbeds: `vae`, `width`, `height`, `num_frames`, `ref_images`, `pose_images`, `face_images`, `bg_images`, `mask`, `start_ref_image`, `clip_embeds`, etc.
+
+### WanAnimatePlus Bernini
+
+Generates condition latents from source video, reference video, and/or reference images for Bernini models.
+
+**Inputs:**
+
+| Input | Description |
+|------|------|
+| `vae` | VAE model for encoding |
+| `width` / `height` / `num_frames` | Output dimensions |
+| `source_video` | Source video to edit/restyle (v2v/rv2v). Resized to width/height |
+| `reference_video` | Moving content to composite (video insertion), native aspect |
+| `reference_images` | Reference image(s) as in-context tokens (r2v/rv2v). Native aspect |
+| `ref_max_size` | Max long-edge size for reference media (default 848) |
+| `force_offload` | Offload VAE after encoding to save VRAM |
+| `tiled_vae` | Use tiled VAE encoding for memory savings |
+
+The task (v2v, rv2v, r2v, t2v) is automatically inferred from which inputs are connected.
 
 ## Project Structure
 

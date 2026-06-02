@@ -6,18 +6,26 @@
 
 ## 项目简介
 
-`ComfyUI-WanAnimatePlus` 在原版 WanVideoWrapper 的 WanAnimate 流程上新增了两大核心输入：
+`ComfyUI-WanAnimatePlus` 在 WanVideo 工作流上新增了三大功能：
+
+### prefix_frames 与 transition_video
 
 - **prefix_frames**：允许用户传入 1~5 张额外参考图，实现多参考图引导生成
 - **transition_video**：允许用户传入上一段视频的最后 21 帧，实现无缝视频衔接
 
 同时使用时，两者自动协调画布布局和帧偏移，互不干扰。
 
+### Bernini
+
+支持 Bernini 模型，允许用户传入源视频、参考视频或参考图像作为生成条件，支持 v2v、rv2v、r2v 和 t2v 任务。
+
 适用场景：
 
 - 多镜头视频串联生成
 - 视频续写 / 延长
 - 需要多参考图控制的动作迁移流程
+- 视频编辑（源视频 + 参考图）
+- 参考图生视频
 
 ## 效果展示
 
@@ -49,6 +57,13 @@
 
 - 与 prefix 同时使用时自动协调画布布局，两者互不干扰
 
+### Bernini
+
+通过 VAE 编码将源视频、参考视频和/或参考图像作为生成条件注入。支持 v2v、rv2v、r2v 和 t2v 任务，任务类型根据接入的输入自动推断。
+
+- 参考图像保持原始宽高比
+- 兼容 context window
+
 ## 安装方式
 
 将本仓库放入 ComfyUI 的 `custom_nodes` 目录：
@@ -60,7 +75,7 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 安装完成后重启 ComfyUI。
 
-> **重要**：要使用 `prefix_frames` 和 `transition_video`，**必须**全链路替换为 WanAnimatePlus 版本节点。在同一个工作流中混用 WanAnimatePlus 节点和原版 WanVideoWrapper 节点会导致输出异常。
+> **重要**：要使用 `prefix_frames`、`transition_video` 或 `Bernini`，**必须**全链路替换为 WanAnimatePlus 版本节点。在同一个工作流中混用 WanAnimatePlus 节点和原版 WanVideoWrapper 节点会导致输出异常。
 
 ## 快速开始
 
@@ -85,10 +100,12 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
 - `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
 - `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
-- `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
+- `WanAnimatePlus LoraSelect` / `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
 - `WanAnimatePlus BlockSwap` / `WanAnimatePlus SetBlockSwap`
 - `WanAnimatePlus TorchCompileSettings`
+- `WanAnimatePlus SamplerExtraArgs`
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
+- `WanAnimatePlus Bernini`
 
 ### WanAnimatePlus AnimateEmbeds
 
@@ -102,6 +119,25 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 | `transition_video` | 允许用户传入上一段视频的最后 21 帧，实现无缝视频衔接 |
 
 其他输入与原版 WanVideoAnimateEmbeds 一致：`vae`、`width`、`height`、`num_frames`、`ref_images`、`pose_images`、`face_images`、`bg_images`、`mask`、`start_ref_image`、`clip_embeds` 等。
+
+### WanAnimatePlus Bernini
+
+为 Bernini 模型生成条件 latents，支持源视频、参考视频和参考图像。
+
+**输入：**
+
+| 输入 | 说明 |
+|------|------|
+| `vae` | 用于编码的 VAE 模型 |
+| `width` / `height` / `num_frames` | 输出尺寸 |
+| `source_video` | 待编辑/重建的源视频（v2v/rv2v），缩放到 width/height |
+| `reference_video` | 要合成到源视频中的动态内容（视频插入），保持原始宽高比 |
+| `reference_images` | 作为上下文 token 注入的参考图像（r2v/rv2v），保持原始宽高比 |
+| `ref_max_size` | 参考媒体长边最大尺寸（默认 848） |
+| `force_offload` | 编码后将 VAE 卸载以节省显存 |
+| `tiled_vae` | 使用分块 VAE 编码以节省显存 |
+
+任务类型（v2v、rv2v、r2v、t2v）根据连接的输入自动推断。
 
 ## 项目结构
 
