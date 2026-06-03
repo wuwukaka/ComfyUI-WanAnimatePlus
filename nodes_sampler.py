@@ -38,6 +38,57 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 
+# --- APG (Adaptive Projected Guidance) helpers, adapted from Bernini ---
+
+class MomentumBuffer:
+    """EMA buffer for smoothing guidance differences across timesteps."""
+
+    def __init__(self, momentum: float = -0.5):
+        self.momentum = momentum
+        self.running_average = 0
+
+    def update(self, value: torch.Tensor):
+        self.running_average = value + self.momentum * self.running_average
+
+
+def _normalize_diff(diff: torch.Tensor, base_pred: torch.Tensor,
+                    momentum_buffer: MomentumBuffer | None = None,
+                    eta: float = 1.0, norm_threshold: float = 0.0) -> torch.Tensor:
+    """Project diff onto/off base_pred and recombine with weight eta.
+
+    Operates on 4-D tensors [C, F, H, W] (spatial latent format).
+    Norm is computed over the spatio-temporal dims [-1, -2, -3] = [F, H, W].
+    """
+    # Momentum
+    if momentum_buffer is not None:
+        momentum_buffer.update(diff)
+        diff = momentum_buffer.running_average
+
+    # Norm clipping
+    if norm_threshold > 0:
+        diff_n = diff.norm(p=2, dim=[-1, -2, -3], keepdim=True)
+        scale = torch.minimum(torch.ones_like(diff_n), norm_threshold / diff_n)
+        diff = diff * scale
+
+    # Parallel / orthogonal projection in double precision
+    v0 = diff.double()
+    v1 = base_pred.double()
+    v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3])
+    v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3], keepdim=True) * v1
+    v0_orthogonal = v0 - v0_parallel
+    return (v0_orthogonal + eta * v0_parallel).to(diff.dtype)
+
+
+def _normalized_guidance(pred_cond: torch.Tensor, pred_uncond: torch.Tensor,
+                         guidance_scale: float,
+                         momentum_buffer: MomentumBuffer | None = None,
+                         eta: float = 1.0, norm_threshold: float = 0.0) -> torch.Tensor:
+    """Single-condition APG: project (cond - uncond) onto cond with eta weight."""
+    nd = _normalize_diff(pred_cond - pred_uncond, pred_cond,
+                         momentum_buffer, eta, norm_threshold)
+    return pred_uncond + guidance_scale * nd
+
+
 class WanVideoSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -75,6 +126,10 @@ class WanVideoSampler:
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
+                "guidance_mode": (["none", "apg"], {"default": "none", "tooltip": "Guidance mode: none (standard CFG) or apg (Adaptive Projected Guidance)"}),
+                "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
+                "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
+                "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
             }
         }
 
@@ -86,7 +141,8 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False,
+        guidance_mode="none", apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
@@ -1197,6 +1253,9 @@ class WanVideoSampler:
                 prev_ones = torch.ones(20, *prev_latents.shape[1:], device=device, dtype=dtype)
                 dual_control_input["prev_latent"] = torch.cat([prev_ones, prev_latents]).unsqueeze(0)
 
+        # APG momentum buffer (persists across sampling steps)
+        _momentum_buf = MomentumBuffer(apg_momentum) if guidance_mode == "apg" else None
+
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None,
@@ -1724,6 +1783,12 @@ class WanVideoSampler:
                 if use_fresca:
                     filtered_cond = fourier_filter(noise_pred_cond - noise_pred_uncond_text, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
                     noise_pred = noise_pred_uncond_text + cfg_scale * filtered_cond * alpha
+                elif guidance_mode == "apg":
+                    sigma = sample_scheduler.sigmas[idx]
+                    x_cond = z - sigma * noise_pred_cond
+                    x_uncond = z - sigma * noise_pred_uncond_text
+                    x_guided = _normalized_guidance(x_cond, x_uncond, cfg_scale, _momentum_buf, apg_eta, apg_norm_threshold)
+                    noise_pred = (z - x_guided) / sigma
                 else:
                     noise_pred = noise_pred_uncond_text + cfg_scale * (noise_pred_cond - noise_pred_uncond_text)
                 del noise_pred_uncond_text, noise_pred_cond
@@ -2873,6 +2938,10 @@ class WanVideoSamplerExtraArgs():
                 "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
                 "uni3c_embeds": ("UNI3C_EMBEDS", ),
                 "multitalk_embeds": ("MULTITALK_EMBEDS", ),
+                "guidance_mode": (["none", "apg"], {"default": "none", "tooltip": "Guidance mode: none (standard CFG) or apg (Adaptive Projected Guidance)"}),
+                "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
+                "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
+                "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
             }
         }
     RETURN_TYPES = ("WANVIDSAMPLEREXTRAARGS",)

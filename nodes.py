@@ -2596,7 +2596,7 @@ class WanAnimatePlusBernini:
         context = []
 
         if source_video is not None:
-            vid = common_upscale(source_video[:num_frames, :, :, :3].movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
+            vid = common_upscale(source_video[:num_frames, :, :, :3].movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
             vae.to(device)
             context.append(vae.encode([(vid.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
             if force_offload:
