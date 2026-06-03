@@ -2635,11 +2635,18 @@ class WanModel(torch.nn.Module):
             context_frame_shapes = []
             for lat in context_latents:
                 lat = lat.to(device=x[0].device, dtype=x[0].dtype)
+                # Pad spatial dims to patch_size so RoPE token count matches Conv3d output
+                p_t, p_h, p_w = self.patch_size
+                pad_t = (p_t - (lat.shape[1] % p_t)) % p_t
+                pad_h = (p_h - (lat.shape[2] % p_h)) % p_h
+                pad_w = (p_w - (lat.shape[3] % p_w)) % p_w
+                if pad_t or pad_h or pad_w:
+                    lat = F.pad(lat, (0, pad_w, 0, pad_h, 0, pad_t))
                 cl = self.original_patch_embedding(lat.unsqueeze(0).float()).to(x[0].dtype)
                 cl = cl.flatten(2).transpose(1, 2)
                 x = [torch.cat([u, cl], dim=1) for u in x]
                 seq_len = max(seq_len, x[0].shape[1])
-                context_frame_shapes.append(lat.shape[1:4])  # (F, H, W)
+                context_frame_shapes.append(lat.shape[1:4])  # (F, H, W) — padded
 
         prev_latent = None
         if dual_control_input is not None:
