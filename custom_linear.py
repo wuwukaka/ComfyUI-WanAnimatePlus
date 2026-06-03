@@ -22,7 +22,9 @@ if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
 
     @torch.library.impl("wananimateplus::apply_lora", "CUDA")
     def _apply_lora_cuda(weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength):
-        return apply_lora(weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength)
+        patch_diff = torch.mm(lora_diff_0.flatten(start_dim=1), lora_diff_1.flatten(start_dim=1)).reshape(weight.shape)
+        alpha = lora_diff_2 / lora_diff_1.shape[0] if lora_diff_2 != 0.0 else 1.0
+        return weight + patch_diff * lora_strength * alpha
 
 if not hasattr(torch.ops.wananimateplus, 'apply_single_lora'):
     @torch.library.custom_op("wananimateplus::apply_single_lora", mutates_args=())
@@ -35,7 +37,7 @@ if not hasattr(torch.ops.wananimateplus, 'apply_single_lora'):
 
     @torch.library.impl("wananimateplus::apply_single_lora", "CUDA")
     def _apply_single_lora_cuda(weight, lora_diff, lora_strength):
-        return apply_single_lora(weight, lora_diff, lora_strength)
+        return weight + lora_diff * lora_strength
 
 if not hasattr(torch.ops.wananimateplus, 'linear_forward'):
     @torch.library.custom_op("wananimateplus::linear_forward", mutates_args=())
@@ -49,7 +51,7 @@ if not hasattr(torch.ops.wananimateplus, 'linear_forward'):
 
     @torch.library.impl("wananimateplus::linear_forward", "CUDA")
     def _linear_forward_cuda(input, weight, bias):
-        return linear_forward(input, weight, bias)
+        return torch.nn.functional.linear(input, weight, bias)
 
 #based on https://github.com/huggingface/diffusers/blob/main/src/diffusers/quantizers/gguf/utils.py
 def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, scale_weights=None, compile_args=None, modules_to_not_convert=[]):
