@@ -2553,10 +2553,20 @@ class WanAnimatePlusBernini:
             "optional": {
                 "source_video": ("IMAGE", {"tooltip": "Source video to edit/restyle (v2v/rv2v). Resized to width/height. Acts as the edit base."}),
                 "reference_video": ("IMAGE", {"tooltip": "Moving content to composite into the source (video insertion), kept at native aspect."}),
-                "reference_images": ("IMAGE", {"tooltip": "Reference image(s) injected as in-context tokens (r2v/rv2v). Native aspect preserved."}),
+                "reference_image_1": ("IMAGE", {"tooltip": "Reference image 1, native aspect preserved."}),
+                "reference_image_2": ("IMAGE", {"tooltip": "Reference image 2, native aspect preserved."}),
+                "reference_image_3": ("IMAGE", {"tooltip": "Reference image 3, native aspect preserved."}),
+                "reference_image_4": ("IMAGE", {"tooltip": "Reference image 4, native aspect preserved."}),
+                "reference_image_5": ("IMAGE", {"tooltip": "Reference image 5, native aspect preserved."}),
+                "reference_image_6": ("IMAGE", {"tooltip": "Reference image 6, native aspect preserved."}),
+                "reference_image_7": ("IMAGE", {"tooltip": "Reference image 7, native aspect preserved."}),
+                "reference_image_8": ("IMAGE", {"tooltip": "Reference image 8, native aspect preserved."}),
+                "reference_image_9": ("IMAGE", {"tooltip": "Reference image 9, native aspect preserved."}),
+                "reference_image_10": ("IMAGE", {"tooltip": "Reference image 10, native aspect preserved."}),
                 "ref_max_size": ("INT", {"default": 848, "min": 16, "max": 8192, "step": 16, "tooltip": "Max long-edge size for reference_video and reference_images."}),
                 "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+                "by wuwukasi(bilibili)": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON", "tooltip": "Follow wuwukasi on bilibili"}),
             },
         }
 
@@ -2566,8 +2576,8 @@ class WanAnimatePlusBernini:
     CATEGORY = "WanAnimatePlus"
 
     def process(self, vae, width, height, num_frames,
-                source_video=None, reference_video=None, reference_images=None, ref_max_size=848,
-                force_offload=True, tiled_vae=False):
+                source_video=None, reference_video=None, ref_max_size=848,
+                force_offload=True, tiled_vae=False, **kwargs):
 
         def _resize_long_edge(image, max_size, stride=16):
             """Resize keeping aspect ratio so long edge ≤ max_size, snapped to stride."""
@@ -2599,9 +2609,11 @@ class WanAnimatePlusBernini:
             if force_offload:
                 vae.to(offload_device)
 
-        if reference_images is not None:
-            for i in range(reference_images.shape[0]):
-                img = _resize_long_edge(reference_images[i:i + 1], ref_max_size)
+        # Collect reference images from named slots (reference_image_1 to reference_image_10)
+        for i in range(1, 11):
+            ref_img = kwargs.get(f"reference_image_{i}", None)
+            if ref_img is not None:
+                img = _resize_long_edge(ref_img[0:1], ref_max_size)  # each slot is 1 image
                 vae.to(device)
                 context.append(vae.encode([(img.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
                 if force_offload:
