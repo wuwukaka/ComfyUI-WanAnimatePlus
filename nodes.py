@@ -2587,7 +2587,7 @@ class WanAnimatePlusBernini:
             ratio = max_size / max(h, w)
             nh = max(stride, round(h * ratio / stride) * stride)
             nw = max(stride, round(w * ratio / stride) * stride)
-            return common_upscale(image[:, :, :, :3].movedim(-1, 1), nw, nh, "area", "disabled").movedim(1, -1)
+            return common_upscale(image[:, :, :, :3].movedim(-1, 1), nw, nh, "bicubic", "disabled").movedim(1, -1)
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
