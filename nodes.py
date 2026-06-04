@@ -2546,6 +2546,7 @@ class WanAnimatePlusBernini:
         return {
             "required": {
                 "vae": ("WANVAE",),
+                "task_type": (["t2v", "v2v", "r2v", "rv2v"], {"default": "t2v", "tooltip": "Select your task type to see the recommended sampler guidance settings"}),
                 "width": ("INT", {"default": 832, "min": 16, "max": 8192, "step": 16}),
                 "height": ("INT", {"default": 480, "min": 16, "max": 8192, "step": 16}),
                 "num_frames": ("INT", {"default": 81, "min": 1, "max": 8192, "step": 4}),
@@ -2584,8 +2585,10 @@ class WanAnimatePlusBernini:
         "Shared APG params: apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
         "Note: for dual-expert Bernini models, multiply all omega values by 0.75 when the low-noise expert is active."
     )
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", "STRING",)
+    RETURN_NAMES = ("image_embeds", "recommended_guidance",)
 
-    def process(self, vae, width, height, num_frames,
+    def process(self, vae, task_type, width, height, num_frames,
                 source_video=None, reference_video=None, ref_max_size=848,
                 force_offload=True, tiled_vae=False, **kwargs):
 
@@ -2633,12 +2636,22 @@ class WanAnimatePlusBernini:
             log.info(f"Bernini: attached {len(context)} context streams")
 
         target_shape = (16, (num_frames - 1) // 4 + 1, height // 8, width // 8)
+        recommendations = {
+            "t2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0",
+            "v2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg_chain, chain_omega_V=3.0, chain_omega_TI=4.0",
+            "r2v":    "guidance_mode=apg_chain, apg_omega_I=3.0, apg_omega_TI=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg_chain, chain_omega_I=3.0, chain_omega_TI=4.0",
+            "rv2v":   "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg_chain, chain_omega_V=3.0, chain_omega_I=3.0, chain_omega_TI=4.0",
+        }
+        rec = recommendations.get(task_type, "")
         image_embeds = {
             "target_shape": target_shape,
             "num_frames": num_frames,
             "context_latents": list(context) if context else None,
         }
-        return (image_embeds,)
+        return (image_embeds, rec)
 
 
 NODE_CLASS_MAPPINGS = {
