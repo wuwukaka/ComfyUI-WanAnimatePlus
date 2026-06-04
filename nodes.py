@@ -2574,6 +2574,16 @@ class WanAnimatePlusBernini:
     RETURN_NAMES = ("image_embeds",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = (
+        "Bernini in-context conditioning for Wan2.x models. "
+        "Recommended sampler guidance_mode by task:\n"
+        "  t2v (no media): apg, apg_omega=4.0\n"
+        "  v2v (source_video): apg, apg_omega=4.0 | or cfg_chain, chain_omega_V=3.0 chain_omega_TI=4.0\n"
+        "  r2v (ref_images): apg_chain, apg_omega_I=3.0 apg_omega_TI=4.0 | or cfg_chain, chain_omega_I=3.0 chain_omega_TI=4.0\n"
+        "  rv2v (src+ref): apg, apg_omega=4.0 | or cfg_chain, chain_omega_V=3.0 chain_omega_I=3.0 chain_omega_TI=4.0\n"
+        "Shared APG params: apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
+        "Note: for dual-expert Bernini models, multiply all omega values by 0.75 when the low-noise expert is active."
+    )
 
     def process(self, vae, width, height, num_frames,
                 source_video=None, reference_video=None, ref_max_size=848,

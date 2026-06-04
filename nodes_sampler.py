@@ -140,13 +140,16 @@ class WanVideoSampler:
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
-                "guidance_mode": (["cfg", "apg", "apg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
+                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
                 "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
                 "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
                 "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
                 "apg_omega": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG: guidance strength (equivalent to CFG scale, replaces cfg when APG is active)"}),
                 "apg_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
                 "apg_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: text+image guidance strength"}),
+                "chain_omega_V": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
+                "chain_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: image guidance strength (rv2v only)"}),
+                "chain_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: text+image guidance strength"}),
             }
         }
 
@@ -160,7 +163,8 @@ class WanVideoSampler:
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
         experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False,
         guidance_mode="cfg", apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0,
-        apg_omega=4.0, apg_omega_I=3.0, apg_omega_TI=4.0):
+        apg_omega=4.0, apg_omega_I=3.0, apg_omega_TI=4.0,
+        chain_omega_V=3.0, chain_omega_I=3.0, chain_omega_TI=4.0):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
@@ -1809,6 +1813,53 @@ class WanVideoSampler:
                     x_uncond = z - sigma * noise_pred_uncond_text
                     x_guided = _normalized_guidance(x_cond, x_uncond, apg_omega, _momentum_buf, apg_eta, apg_norm_threshold)
                     noise_pred = (z - x_guided) / sigma
+                elif guidance_mode == "cfg_chain":
+                    saved_ctx = base_params.pop("context_latents", None)
+                    V_ctx = [l for l in (saved_ctx or []) if l.shape[1] > 1]
+                    I_ctx = [l for l in (saved_ctx or []) if l.shape[1] == 1]
+                    has_images = len(I_ctx) > 0
+
+                    # Forward 1: ∅ + uncond text
+                    base_params["context_latents"] = None
+                    eps_uncond, _, _ = transformer(
+                        context=negative_embeds,
+                        pred_id=cache_state[1] if cache_state else None, **base_params)
+                    eps_uncond = eps_uncond[0]
+
+                    # Forward 2: V + uncond text
+                    base_params["context_latents"] = V_ctx if V_ctx else None
+                    eps_V, _, _ = transformer(
+                        context=negative_embeds, pred_id=None, **base_params)
+                    eps_V = eps_V[0]
+
+                    if has_images:
+                        # rv2v: V+I + uncond text
+                        base_params["context_latents"] = saved_ctx
+                        eps_VI, _, _ = transformer(
+                            context=negative_embeds, pred_id=None, **base_params)
+                        eps_VI = eps_VI[0]
+
+                    # Final forward: all context + cond text
+                    base_params["context_latents"] = saved_ctx
+                    base_params['is_uncond'] = False
+                    eps_VTI, npo, cache_state_cond = transformer(
+                        context=positive_embeds, pred_id=None, **base_params)
+                    eps_VTI = eps_VTI[0]
+                    noise_pred_ovi = npo[0] if npo is not None else None
+
+                    base_params["context_latents"] = saved_ctx
+                    noise_pred_cond = eps_VTI
+                    noise_pred_uncond_text = eps_uncond
+
+                    if has_images:
+                        noise_pred = (eps_uncond
+                                      + chain_omega_V * (eps_V - eps_uncond)
+                                      + chain_omega_I * (eps_VI - eps_V)
+                                      + chain_omega_TI * (eps_VTI - eps_VI))
+                    else:
+                        noise_pred = (eps_uncond
+                                      + chain_omega_V * (eps_V - eps_uncond)
+                                      + chain_omega_TI * (eps_VTI - eps_V))
                 elif guidance_mode == "apg_chain":
                     sigma = sample_scheduler.sigmas[idx]
 
@@ -1817,7 +1868,7 @@ class WanVideoSampler:
                     base_params["context_latents"] = None
                     noise_pred_0, _, _ = transformer(
                         context=negative_embeds,
-                        pred_id=cache_state[0] if cache_state else None,
+                        pred_id=cache_state[1] if cache_state else None,
                         **base_params)
                     noise_pred_0 = noise_pred_0[0]
 
@@ -1828,6 +1879,7 @@ class WanVideoSampler:
                     noise_pred_I = noise_pred_I[0]
 
                     # I+T combo: image context, cond text
+                    base_params['is_uncond'] = False
                     noise_pred_TI, npo, cache_state_cond = transformer(
                         context=positive_embeds, pred_id=None, **base_params)
                     noise_pred_TI = noise_pred_TI[0]
@@ -3023,13 +3075,16 @@ class WanVideoSamplerv2(WanVideoSampler):
                 "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
                 "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"} ),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
-                "guidance_mode": (["cfg", "apg", "apg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
+                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
                 "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
                 "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
                 "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
                 "apg_omega": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG: guidance strength"}),
                 "apg_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
                 "apg_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: text+image guidance strength"}),
+                "chain_omega_V": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
+                "chain_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: image guidance strength (rv2v only)"}),
+                "chain_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: text+image guidance strength"}),
                 "extra_args": ("WANVIDSAMPLEREXTRAARGS", ),
             }
         }
