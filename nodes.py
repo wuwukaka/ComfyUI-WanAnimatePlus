@@ -1216,7 +1216,7 @@ class WanVideoAnimateEmbeds:
                 "mask": ("MASK", {"tooltip": "mask"}),
                 "start_ref_image": ("IMAGE", {"tooltip": "start ref image"}),
                 "transition_video": ("IMAGE", {"default": None, "tooltip": "Transition video frames (32 images, encoded to 8 latent frames). Acts as hard conditioning guide for seamless connection."}),
-                "prefix_frames": ("IMAGE", {"default": None, "tooltip": "3 reference images. Expands canvas by 17 pixel frames, encoded together with bg frames. Image 0 ×5, image 1 ×4, image 2 ×4, image 0 ×4. Shifts pose/face by 17 frames."}),
+                "prefix_frames": ("IMAGE", {"default": None, "tooltip": "3 reference images. When enabled, expands canvas by 45 pixel frames: 17 prefix, 8 reserve, 20 transition. Image 0 ×5, image 1 ×4, image 2 ×4, image 0 ×4."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
                 "Prefix & Transition Video by wuwukasi(bilibili)": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON"}),
             }
@@ -1271,8 +1271,8 @@ class WanVideoAnimateEmbeds:
                 log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
         # ============ Prefix frames: expand canvas and shift control signals ============
         if prefix_frames is not None:
-            # Expand canvas: always 37 = 17 prefix + 16 transition + 4 reserve
-            extra = 37
+            # Expand canvas: always 45 = 17 prefix + 8 reserve + 20 transition
+            extra = 45
             num_frames += extra
             # Trim 1-3 frames from end to keep num_frames % 4 == 1 (required by repeat_interleave + view)
             trim = (num_frames - 1) % 4
@@ -1299,7 +1299,7 @@ class WanVideoAnimateEmbeds:
         # -----------------------------------------------------------------
 
         if prefix_frames is not None:
-            effective_frames = num_frames - 37
+            effective_frames = num_frames - 45
         elif transition_video is not None:
             effective_frames = num_frames - 21
         else:
@@ -1381,19 +1381,19 @@ class WanVideoAnimateEmbeds:
             if prefix_pixel_data is not None:
                 resized_bg_images[:, :actual_prefix_px] = prefix_pixel_data.to(device, dtype=resized_bg_images.dtype)
                 log.info(f"Prefix: replaced first {actual_prefix_px} pixel frames of black canvas")
-                # If transition_video also present, embed last 20 frames into canvas positions 17-37
+                # If transition_video also present, embed last 20 frames into canvas positions 25-45
                 if transition_video is not None:
                     tv = transition_video  # [B, H, W, C]
                     b_tv = tv.shape[0]
-                    if b_tv >= 16:
-                        tv = tv[-16:]
+                    if b_tv >= 20:
+                        tv = tv[-20:]
                     else:
-                        tv = torch.cat([tv[0:1].repeat(16 - b_tv, 1, 1, 1), tv], dim=0)
+                        tv = torch.cat([tv[0:1].repeat(20 - b_tv, 1, 1, 1), tv], dim=0)
                     if tv.shape[1] != H or tv.shape[2] != W:
                         tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
-                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 16, H, W]
-                    resized_bg_images[:, 21:37] = tv.to(device, dtype=resized_bg_images.dtype)
-                    log.info("Prefix+Transition: embedded last 16 transition frames into canvas positions 21-37")
+                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 20, H, W]
+                    resized_bg_images[:, 25:45] = tv.to(device, dtype=resized_bg_images.dtype)
+                    log.info("Prefix+Transition: embedded last 20 transition frames into canvas positions 25-45")
             # ==========================================================================
 
             # ============ Transition (no prefix): embed into canvas first 21 frames ============
@@ -1421,13 +1421,26 @@ class WanVideoAnimateEmbeds:
             if transition_video is not None:
                 tv = transition_video  # [B, H, W, C]
                 b_tv = tv.shape[0]
-                if b_tv >= 21:
-                    tv = tv[-21:]
+                if prefix_frames is not None:
+                    if b_tv >= 20:
+                        tv = tv[-20:]
+                    else:
+                        tv = torch.cat([tv[0:1].repeat(20 - b_tv, 1, 1, 1), tv], dim=0)
+                    if tv.shape[1] != H or tv.shape[2] != W:
+                        tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 20, H, W]
+                    resized_bg_images[:, 25:45] = tv.to(offload_device, dtype=resized_bg_images.dtype)
+                    log.info("Prefix+Transition (loop): embedded last 20 transition frames into canvas positions 25-45")
                 else:
-                    tv = torch.cat([tv[0:1].repeat(21 - b_tv, 1, 1, 1), tv], dim=0)
-                tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 21, H, W]
-                resized_bg_images[:, :21] = tv.to(offload_device, dtype=resized_bg_images.dtype)
-                log.info("Transition (loop): embedded first 21 pixel frames of canvas")
+                    if b_tv >= 21:
+                        tv = tv[-21:]
+                    else:
+                        tv = torch.cat([tv[0:1].repeat(21 - b_tv, 1, 1, 1), tv], dim=0)
+                    if tv.shape[1] != H or tv.shape[2] != W:
+                        tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+                    tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 21, H, W]
+                    resized_bg_images[:, :21] = tv.to(offload_device, dtype=resized_bg_images.dtype)
+                    log.info("Transition (loop): embedded first 21 pixel frames of canvas")
             # Prefix NOT embedded in canvas for looping — handled via prefix_ctx prepend later
 
         if ref_images is not None:
@@ -1470,7 +1483,7 @@ class WanVideoAnimateEmbeds:
             if prefix_frames is not None:
                 bg_mask[:, :actual_prefix_px] = 1.0  # only actual prefix pixel frames
                 if transition_video is not None:
-                    bg_mask[:, 21:37] = 1.0
+                    bg_mask[:, 25:45] = 1.0
             # ======= Transition (no prefix): set mask=1 for first 21 pixel frames =======
             elif transition_video is not None:
                 bg_mask[:, :21] = 1.0
@@ -1587,7 +1600,7 @@ class WanVideoAnimateEmbeds:
             "transition_latent": transition_latent,
             "transition_mask_values": transition_mask_values,
             "has_prefix": prefix_frames is not None,
-            "canvas_expansion_px": 37 if prefix_frames is not None else (21 if transition_video is not None else 0),
+            "canvas_expansion_px": 45 if prefix_frames is not None else (21 if transition_video is not None else 0),
             "prefix_ctx": prefix_ctx,
             "prefix_T": prefix_T,
             "face_pixels": resized_face_images if face_images is not None else None,
@@ -2407,7 +2420,7 @@ class WanVideoDecode:
         if end_image is not None:
             images = images[:, 0:-1]
 
-        if canvas_expansion_px and not is_looped:
+        if canvas_expansion_px:
             images = images[:, canvas_expansion_px:]
 
 
@@ -2571,19 +2584,16 @@ class WanAnimatePlusBernini:
             },
         }
 
-    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
-    RETURN_NAMES = ("image_embeds",)
     FUNCTION = "process"
     CATEGORY = "WanAnimatePlus"
     DESCRIPTION = (
         "Bernini in-context conditioning for Wan2.x models. "
         "Recommended sampler guidance_mode by task:\n"
         "  t2v (no media): apg, apg_omega=4.0\n"
-        "  v2v (source_video): apg, apg_omega=4.0 | or cfg_chain, chain_omega_V=3.0 chain_omega_TI=4.0\n"
-        "  r2v (ref_images): apg_chain, apg_omega_I=3.0 apg_omega_TI=4.0 | or cfg_chain, chain_omega_I=3.0 chain_omega_TI=4.0\n"
-        "  rv2v (src+ref): apg, apg_omega=4.0 | or cfg_chain, chain_omega_V=3.0 chain_omega_I=3.0 chain_omega_TI=4.0\n"
-        "Shared APG params: apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
-        "Note: for dual-expert Bernini models, multiply all omega values by 0.75 when the low-noise expert is active."
+        "  v2v (source_video): apg, apg_omega=4.0 | or cfg_chain, chain_omega_V=1.25 chain_omega_TI=4.0\n"
+        "  r2v (ref_images): apg_chain, apg_omega_I=4.5 apg_omega_TI=4.0 | or cfg_chain, chain_omega_I=4.5 chain_omega_TI=4.0\n"
+        "  rv2v (src+ref): cfg_chain, chain_omega_V=1.25 chain_omega_I=4.5 chain_omega_TI=4.0 | alt apg, apg_omega=4.0\n"
+        "Shared APG params: apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0"
     )
     RETURN_TYPES = ("WANVIDIMAGE_EMBEDS", "STRING",)
     RETURN_NAMES = ("image_embeds", "recommended_guidance",)
@@ -2598,8 +2608,14 @@ class WanAnimatePlusBernini:
             if max(h, w) <= max_size:
                 return image[:, :, :, :3]
             ratio = max_size / max(h, w)
-            nh = max(stride, round(h * ratio / stride) * stride)
-            nw = max(stride, round(w * ratio / stride) * stride)
+            # Snap long edge to stride, then derive short edge proportionally
+            # to preserve aspect ratio (independent rounding destroys it for extreme ratios)
+            if h >= w:
+                nh = max(stride, round(h * ratio / stride) * stride)
+                nw = max(stride, round(nh * w / h / stride) * stride)
+            else:
+                nw = max(stride, round(w * ratio / stride) * stride)
+                nh = max(stride, round(nw * h / w / stride) * stride)
             return common_upscale(image[:, :, :, :3].movedim(-1, 1), nw, nh, "bicubic", "disabled").movedim(1, -1)
 
         device = mm.get_torch_device()
@@ -2607,11 +2623,13 @@ class WanAnimatePlusBernini:
 
         # Ordered context list: source_video (1), reference_video (2), reference_images (3,4,...)
         context = []
+        context_roles = []
 
         if source_video is not None:
             vid = common_upscale(source_video[:num_frames, :, :, :3].movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
             vae.to(device)
             context.append(vae.encode([(vid.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+            context_roles.append("source_video")
             if force_offload:
                 vae.to(offload_device)
 
@@ -2619,6 +2637,7 @@ class WanAnimatePlusBernini:
             ref_vid = _resize_long_edge(reference_video[:num_frames], ref_max_size)
             vae.to(device)
             context.append(vae.encode([(ref_vid.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+            context_roles.append("reference_video")
             if force_offload:
                 vae.to(offload_device)
 
@@ -2629,6 +2648,7 @@ class WanAnimatePlusBernini:
                 img = _resize_long_edge(ref_img[0:1], ref_max_size)  # each slot is 1 image
                 vae.to(device)
                 context.append(vae.encode([(img.permute(3, 0, 1, 2) * 2 - 1).to(device=device, dtype=vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device))
+                context_roles.append("reference_image")
                 if force_offload:
                     vae.to(offload_device)
 
@@ -2637,19 +2657,21 @@ class WanAnimatePlusBernini:
 
         target_shape = (16, (num_frames - 1) // 4 + 1, height // 8, width // 8)
         recommendations = {
-            "t2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0",
-            "v2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
-                      "  alt: guidance_mode=cfg_chain, chain_omega_V=3.0, chain_omega_TI=4.0",
-            "r2v":    "guidance_mode=apg_chain, apg_omega_I=3.0, apg_omega_TI=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
-                      "  alt: guidance_mode=cfg_chain, chain_omega_I=3.0, chain_omega_TI=4.0",
-            "rv2v":   "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0\n"
-                      "  alt: guidance_mode=cfg_chain, chain_omega_V=3.0, chain_omega_I=3.0, chain_omega_TI=4.0",
+            "t2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg, cfg=4.0",
+            "v2v":    "guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg_chain, chain_omega_V=1.25, chain_omega_TI=4.0",
+            "r2v":    "guidance_mode=apg_chain, apg_omega_I=4.5, apg_omega_TI=4.0, apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0\n"
+                      "  alt: guidance_mode=cfg_chain, chain_omega_I=4.5, chain_omega_TI=4.0",
+            "rv2v":   "guidance_mode=cfg_chain, chain_omega_V=1.25, chain_omega_I=4.5, chain_omega_TI=4.0\n"
+                      "  alt: guidance_mode=apg, apg_omega=4.0, apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0",
         }
         rec = recommendations.get(task_type, "")
         image_embeds = {
             "target_shape": target_shape,
             "num_frames": num_frames,
             "context_latents": list(context) if context else None,
+            "context_roles": list(context_roles) if context else None,
         }
         return (image_embeds, rec)
 

@@ -140,15 +140,15 @@ class WanVideoSampler:
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
-                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
+                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (single-condition APG), apg_chain (image-reference APG chain), or cfg_chain (Bernini chained CFG)"}),
                 "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
-                "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
+                "apg_momentum": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
                 "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
                 "apg_omega": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG: guidance strength (equivalent to CFG scale, replaces cfg when APG is active)"}),
-                "apg_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
+                "apg_omega_I": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
                 "apg_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: text+image guidance strength"}),
-                "chain_omega_V": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
-                "chain_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: image guidance strength (rv2v only)"}),
+                "chain_omega_V": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
+                "chain_omega_I": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: extra reference context strength (VI - V; reference video/images)"}),
                 "chain_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: text+image guidance strength"}),
             }
         }
@@ -162,9 +162,9 @@ class WanVideoSampler:
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
         experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False,
-        guidance_mode="cfg", apg_eta=0.5, apg_momentum=-0.5, apg_norm_threshold=50.0,
-        apg_omega=4.0, apg_omega_I=3.0, apg_omega_TI=4.0,
-        chain_omega_V=3.0, chain_omega_I=3.0, chain_omega_TI=4.0):
+        guidance_mode="cfg", apg_eta=0.5, apg_momentum=0.0, apg_norm_threshold=50.0,
+        apg_omega=4.0, apg_omega_I=4.5, apg_omega_TI=4.0,
+        chain_omega_V=1.25, chain_omega_I=4.5, chain_omega_TI=4.0):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
@@ -575,6 +575,7 @@ class WanVideoSampler:
         has_prefix = image_embeds.get("has_prefix", False)
         canvas_expansion_px = image_embeds.get("canvas_expansion_px", 0)
         context_latents = image_embeds.get("context_latents", None)
+        context_roles = image_embeds.get("context_roles", None)
         if has_prefix:
             log.info("Prefix frames: detected, will prepend indices 0-5 to each window (except first)")
         if wananimate_loop and context_options is not None:
@@ -946,10 +947,11 @@ class WanVideoSampler:
             uni3c_data = uni3c_embeds.copy()
             if render_latent.shape != noise.shape:
                 # If temporal is shorter (prefix/transition expansion), pad with first frame at beginning
-                if has_prefix:
-                    pad_len = 10  # 37 pixel frames → 10 latent frames
+                if has_prefix and render_latent.shape[2] < noise.shape[1]:
+                    pad_len = noise.shape[1] - render_latent.shape[2]
                     first_frame = render_latent[:, :, :1].repeat(1, 1, pad_len, 1, 1)
                     render_latent = torch.cat([first_frame, render_latent], dim=2)
+                    log.info(f"Uni3C: padded render_latent by {pad_len} latent frames for prefix canvas expansion")
                 if render_latent.shape != noise.shape:
                     render_latent = torch.nn.functional.interpolate(render_latent, size=(noise.shape[1], noise.shape[2], noise.shape[3]), mode='trilinear', align_corners=False)
             uni3c_data["render_latent"] = render_latent
@@ -1067,6 +1069,9 @@ class WanVideoSampler:
         standin_input = image_embeds.get("standin_input", None)
         if standin_input is not None:
             rope_function = "comfy" # only works with this currently
+        if context_latents is not None and "comfy" not in rope_function:
+            log.info("Bernini context requires comfy RoPE; overriding rope_function to comfy")
+            rope_function = "comfy"
 
         freqs = None
 
@@ -1077,7 +1082,7 @@ class WanVideoSampler:
         transformer.rope_embedder.num_frames = None
         d = transformer.dim // transformer.num_heads
 
-        if mocha_embeds is not None:
+        if mocha_embeds is not None and context_latents is None:
             from .mocha.nodes import rope_params_mocha
             log.info("Using Mocha RoPE")
             rope_function = 'mocha'
@@ -1088,7 +1093,7 @@ class WanVideoSampler:
                 rope_params_mocha(1024, 2 * (d // 6), start=-1)
             ],
             dim=1)
-        elif "default" in rope_function or bidirectional_sampling: # original RoPE
+        elif context_latents is None and ("default" in rope_function or bidirectional_sampling): # original RoPE
             freqs = torch.cat([
                 rope_params(1024, d - 4 * (d // 6), L_test=latent_video_length, k=riflex_freq_index),
                 rope_params(1024, 2 * (d // 6)),
@@ -1265,6 +1270,7 @@ class WanVideoSampler:
 
         # LongVie2 dual control
         dual_control_embeds = image_embeds.get("dual_control", None)
+        dual_control_input = None
         if dual_control_embeds is not None and context_options is None:
             dual_control_input = dict_to_device(dual_control_embeds.copy(), device, dtype) if dual_control_embeds is not None else None
             prev_latents = dual_control_input.get("prev_latent", None)
@@ -1287,7 +1293,7 @@ class WanVideoSampler:
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
                              wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
-                             context_latents=None, context_window_start=0,):
+                             context_latents=None, context_roles=None, context_window_start=0,):
             nonlocal transformer
             nonlocal audio_cfg_scale
 
@@ -1611,10 +1617,78 @@ class WanVideoSampler:
                     "dual_control_input": dual_control_in, # LongVie2 dual control input
                     "context_latents": context_latents, # Bernini in-context reference
                     "context_window_start": context_window_start, # Context window start frame index for temporal RoPE alignment
+                    "simple_t2v": False, # enabled below for Bernini context or strict plain T2V
                     "transformer_options": transformer_options,
                     "rope_negative_offset": image_embeds.get("rope_negative_offset_frames", 0), # StoryMem rope negative offset
                     "num_memory_frames": story_mem_latents.shape[1] if story_mem_latents is not None else 0, # StoryMem memory frames
                 }
+
+                fast_path_no_extra_conditions = (
+                    base_params['y'] is None
+                    and base_params['clip_fea'] is None
+                    and not reverse_time
+                    and not enhance_enabled
+                    and cache_args is None
+                    and slg_args is None
+                    and not batched_cfg
+                    and not bidirectional_sampling
+                    and control_latents is None
+                    and vace_data is None
+                    and unianim_data is None
+                    and audio_proj is None
+                    and control_camera_latents is None
+                    and add_cond is None
+                    and multitalk_audio_embeds is None
+                    and fantasy_portrait_input is None
+                    and mtv_motion_tokens is None
+                    and s2v_audio_input is None
+                    and s2v_ref_motion is None
+                    and s2v_pose is None
+                    and humo_image_cond is None
+                    and humo_audio is None
+                    and wananim_pose_latents is None
+                    and wananim_face_pixels is None
+                    and uni3c_data is None
+                    and latent_model_input_ovi is None
+                    and flashvsr_LQ_latent is None
+                    and base_params['fun_ref'] is None
+                    and base_params['fun_camera'] is None
+                    and base_params['audio_proj'] is None
+                    and base_params['uni3c_data'] is None
+                    and base_params['controlnet'] is None
+                    and base_params['add_cond'] is None
+                    and not base_params['nag_params']
+                    and base_params['nag_context'] is None
+                    and base_params['multitalk_audio'] is None
+                    and base_params['ref_target_masks'] is None
+                    and base_params['inner_t'] is None
+                    and base_params['standin_input'] is None
+                    and base_params['fantasy_portrait_input'] is None
+                    and base_params['phantom_ref'] is None
+                    and base_params['mtv_motion_tokens'] is None
+                    and base_params['mtv_motion_rotary_emb'] is None
+                    and base_params['s2v_audio_input'] is None
+                    and base_params['s2v_ref_latent'] is None
+                    and base_params['s2v_ref_motion'] is None
+                    and base_params['s2v_pose'] is None
+                    and base_params['humo_audio'] is None
+                    and base_params['wananim_pose_latents'] is None
+                    and base_params['wananim_face_pixel_values'] is None
+                    and base_params['lynx_embeds'] is None
+                    and base_params['x_ovi'] is None
+                    and base_params['flashvsr_LQ_latent'] is None
+                    and base_params['longcat_num_cond_latents'] == 0
+                    and base_params['longcat_num_ref_latents'] == 0
+                    and base_params['longcat_avatar_options'] is None
+                    and base_params['sdancer_input'] is None
+                    and base_params['one_to_all_input'] is None
+                    and base_params['scail_input'] is None
+                    and base_params['dual_control_input'] is None
+                    and base_params['rope_negative_offset'] == 0
+                    and base_params['num_memory_frames'] == 0
+                )
+                strict_plain_t2v_fast_path = context_latents is None and context_window is None and fast_path_no_extra_conditions
+                base_params["simple_t2v"] = context_latents is not None or strict_plain_t2v_fast_path
 
                 batch_size = 1
 
@@ -1625,7 +1699,7 @@ class WanVideoSampler:
                         negative_embeds = negative_embeds * len(positive_embeds)
 
                 try:
-                    if not batched_cfg:
+                    if not batched_cfg and guidance_mode not in ("cfg_chain", "apg_chain"):
                         #conditional (positive) pass
                         if pos_latent is not None: # for humo
                             base_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
@@ -1768,7 +1842,7 @@ class WanVideoSampler:
                             return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_ref]
 
                     #batched
-                    else:
+                    elif guidance_mode not in ("cfg_chain", "apg_chain"):
                         base_params['z'] = [z] * 2
                         base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
                         base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
@@ -1785,26 +1859,28 @@ class WanVideoSampler:
                             offload_transformer(transformer)
                     raise e
 
-                #https://github.com/WeichenFan/CFG-Zero-star/
-                alpha = 1.0
-                if use_cfg_zero_star:
-                    alpha = optimized_scale(
-                        noise_pred_cond.view(batch_size, -1),
-                        noise_pred_uncond_text.view(batch_size, -1)
-                    ).view(batch_size, 1, 1, 1)
+                # Post-processing (standard CFG only; chain modes use their own formulas)
+                if guidance_mode not in ("cfg_chain", "apg_chain"):
+                    #https://github.com/WeichenFan/CFG-Zero-star/
+                    alpha = 1.0
+                    if use_cfg_zero_star:
+                        alpha = optimized_scale(
+                            noise_pred_cond.view(batch_size, -1),
+                            noise_pred_uncond_text.view(batch_size, -1)
+                        ).view(batch_size, 1, 1, 1)
 
-                noise_pred_uncond_text = noise_pred_uncond_text * alpha
+                    noise_pred_uncond_text = noise_pred_uncond_text * alpha
 
-                if use_tangential:
-                    noise_pred_uncond_text = tangential_projection(noise_pred_cond, noise_pred_uncond_text)
+                    if use_tangential:
+                        noise_pred_uncond_text = tangential_projection(noise_pred_cond, noise_pred_uncond_text)
 
-                # RAAG (RATIO-aware Adaptive Guidance)
-                if raag_alpha > 0.0:
-                    cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_text, cfg_scale, raag_alpha)
-                    log.info(f"RAAG modified cfg: {cfg_scale}")
+                    # RAAG (RATIO-aware Adaptive Guidance)
+                    if raag_alpha > 0.0:
+                        cfg_scale = get_raag_guidance(noise_pred_cond, noise_pred_uncond_text, cfg_scale, raag_alpha)
+                        log.info(f"RAAG modified cfg: {cfg_scale}")
 
                 #https://github.com/WikiChao/FreSca
-                if use_fresca:
+                if use_fresca and guidance_mode not in ("cfg_chain", "apg_chain"):
                     filtered_cond = fourier_filter(noise_pred_cond - noise_pred_uncond_text, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
                     noise_pred = noise_pred_uncond_text + cfg_scale * filtered_cond * alpha
                 elif guidance_mode == "apg":
@@ -1815,33 +1891,68 @@ class WanVideoSampler:
                     noise_pred = (z - x_guided) / sigma
                 elif guidance_mode == "cfg_chain":
                     saved_ctx = base_params.pop("context_latents", None)
-                    V_ctx = [l for l in (saved_ctx or []) if l.shape[1] > 1]
-                    I_ctx = [l for l in (saved_ctx or []) if l.shape[1] == 1]
-                    has_images = len(I_ctx) > 0
+                    noise_pred_ovi_uncond = None  # not used in chain modes; prevents NameError
+                    saved_clip_fea = base_params.get('clip_fea', None)
+                    saved_add_text_emb = base_params.get("add_text_emb", None)
+                    saved_y = base_params.get('y', None)
+                    saved_x = base_params.get('x', None)
+                    saved_wananim_face = base_params.get('wananim_face_pixel_values', None)
+                    saved_humo_audio = base_params.get('humo_audio', None)
+                    saved_ctx_list = list(saved_ctx or [])
+                    if context_roles is not None and len(context_roles) == len(saved_ctx_list):
+                        role_pairs = list(zip(saved_ctx_list, context_roles))
+                        V_ctx = [lat for lat, role in role_pairs if role == "source_video"]
+                        I_ctx = [lat for lat, role in role_pairs if role == "reference_image"]
+                        VI_ctx = saved_ctx_list
+                    else:
+                        # Backward compatibility for old Bernini outputs without roles.
+                        V_ctx = [lat for lat in saved_ctx_list if lat.shape[1] > 1]
+                        I_ctx = [lat for lat in saved_ctx_list if lat.shape[1] == 1]
+                        VI_ctx = saved_ctx_list
+                    has_extra_context = len(VI_ctx) > len(V_ctx)
 
                     # Forward 1: ∅ + uncond text
+                    base_params['is_uncond'] = True
+                    base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                    base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None
+                    base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                    if wananim_face_pixels is not None:
+                        base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                    if humo_audio_input_neg is not None:
+                        base_params['humo_audio'] = humo_audio_input_neg
+                    if neg_latent is not None:
+                        base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
                     base_params["context_latents"] = None
-                    eps_uncond, _, _ = transformer(
+                    eps_uncond, _, cache_state_uncond = transformer(
                         context=negative_embeds,
                         pred_id=cache_state[1] if cache_state else None, **base_params)
                     eps_uncond = eps_uncond[0]
 
-                    # Forward 2: V + uncond text
-                    base_params["context_latents"] = V_ctx if V_ctx else None
-                    eps_V, _, _ = transformer(
-                        context=negative_embeds, pred_id=None, **base_params)
-                    eps_V = eps_V[0]
+                    # Forward 2: V + uncond text. If V is empty, this equals eps_uncond.
+                    if V_ctx:
+                        base_params["context_latents"] = V_ctx
+                        eps_V, _, _ = transformer(
+                            context=negative_embeds, pred_id=None, **base_params)
+                        eps_V = eps_V[0]
+                    else:
+                        eps_V = eps_uncond
 
-                    if has_images:
-                        # rv2v: V+I + uncond text
-                        base_params["context_latents"] = saved_ctx
+                    if has_extra_context:
+                        # VI combo: source video + reference video/images, uncond text
+                        base_params["context_latents"] = VI_ctx if VI_ctx else None
                         eps_VI, _, _ = transformer(
                             context=negative_embeds, pred_id=None, **base_params)
                         eps_VI = eps_VI[0]
 
-                    # Final forward: all context + cond text
-                    base_params["context_latents"] = saved_ctx
+                    # Final forward: VI + cond text
+                    base_params["context_latents"] = VI_ctx if VI_ctx else None
                     base_params['is_uncond'] = False
+                    base_params['clip_fea'] = saved_clip_fea
+                    base_params["add_text_emb"] = saved_add_text_emb
+                    base_params['y'] = saved_y
+                    base_params['x'] = saved_x
+                    base_params['wananim_face_pixel_values'] = saved_wananim_face
+                    base_params['humo_audio'] = saved_humo_audio
                     eps_VTI, npo, cache_state_cond = transformer(
                         context=positive_embeds, pred_id=None, **base_params)
                     eps_VTI = eps_VTI[0]
@@ -1851,7 +1962,7 @@ class WanVideoSampler:
                     noise_pred_cond = eps_VTI
                     noise_pred_uncond_text = eps_uncond
 
-                    if has_images:
+                    if has_extra_context:
                         noise_pred = (eps_uncond
                                       + chain_omega_V * (eps_V - eps_uncond)
                                       + chain_omega_I * (eps_VI - eps_V)
@@ -1865,21 +1976,53 @@ class WanVideoSampler:
 
                     # ∅ combo: no context, uncond text
                     saved_ctx = base_params.pop("context_latents", None)
+                    noise_pred_ovi_uncond = None  # not used in chain modes; prevents NameError
+                    saved_clip_fea = base_params.get('clip_fea', None)
+                    saved_add_text_emb = base_params.get("add_text_emb", None)
+                    saved_y = base_params.get('y', None)
+                    saved_x = base_params.get('x', None)
+                    saved_wananim_face = base_params.get('wananim_face_pixel_values', None)
+                    saved_humo_audio = base_params.get('humo_audio', None)
+                    saved_ctx_list = list(saved_ctx or [])
+                    if context_roles is not None and len(context_roles) == len(saved_ctx_list):
+                        I_ctx = [lat for lat, role in zip(saved_ctx_list, context_roles) if role == "reference_image"]
+                    else:
+                        # Backward compatibility for old Bernini outputs without roles.
+                        I_ctx = [lat for lat in saved_ctx_list if lat.shape[1] == 1]
+                        if not I_ctx:
+                            I_ctx = saved_ctx_list
+                    base_params['is_uncond'] = True
+                    base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                    base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None
+                    base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                    if wananim_face_pixels is not None:
+                        base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                    if humo_audio_input_neg is not None:
+                        base_params['humo_audio'] = humo_audio_input_neg
+                    if neg_latent is not None:
+                        base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
                     base_params["context_latents"] = None
-                    noise_pred_0, _, _ = transformer(
+                    noise_pred_0, _, cache_state_uncond = transformer(
                         context=negative_embeds,
                         pred_id=cache_state[1] if cache_state else None,
                         **base_params)
                     noise_pred_0 = noise_pred_0[0]
 
-                    # I combo: image context, uncond text
-                    base_params["context_latents"] = saved_ctx
+                    # I combo: reference images only, uncond text
+                    base_params["context_latents"] = I_ctx if I_ctx else None
                     noise_pred_I, _, _ = transformer(
                         context=negative_embeds, pred_id=None, **base_params)
                     noise_pred_I = noise_pred_I[0]
 
-                    # I+T combo: image context, cond text
+                    # I+T combo: reference images only, cond text
+                    base_params["context_latents"] = I_ctx if I_ctx else None
                     base_params['is_uncond'] = False
+                    base_params['clip_fea'] = saved_clip_fea
+                    base_params["add_text_emb"] = saved_add_text_emb
+                    base_params['y'] = saved_y
+                    base_params['x'] = saved_x
+                    base_params['wananim_face_pixel_values'] = saved_wananim_face
+                    base_params['humo_audio'] = saved_humo_audio
                     noise_pred_TI, npo, cache_state_cond = transformer(
                         context=positive_embeds, pred_id=None, **base_params)
                     noise_pred_TI = noise_pred_TI[0]
@@ -1903,7 +2046,7 @@ class WanVideoSampler:
                     noise_pred = noise_pred_uncond_text + cfg_scale * (noise_pred_cond - noise_pred_uncond_text)
                 del noise_pred_uncond_text, noise_pred_cond
 
-                if latent_model_input_ovi is not None:
+                if latent_model_input_ovi is not None and guidance_mode not in ("cfg_chain", "apg_chain"):
                     if ovi_audio_cfg is None:
                         audio_cfg_scale = cfg_scale - 1.0 if cfg_scale > 4.0 else cfg_scale
                     else:
@@ -2320,7 +2463,7 @@ class WanVideoSampler:
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                                 wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
                                 uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent, context_latents=sliced_context_latents,
-                                context_window_start=c[0])
+                                context_roles=context_roles, context_window_start=c[0])
 
                             seq_len = original_seq_len  # restore seq_len
 
@@ -2440,7 +2583,7 @@ class WanVideoSampler:
                                     text_embeds["negative_prompt_embeds"],
                                     timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
                                     cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,
-                                    context_latents=context_latents,
+                                    context_latents=context_latents, context_roles=context_roles,
                                     s2v_audio_input=s2v_audio_input_slice, s2v_ref_motion=input_motion_latents, s2v_motion_frames=s2v_motion_frames, s2v_pose=s2v_pose_slice)
 
                                 latent = sample_scheduler.step(
@@ -2757,7 +2900,7 @@ class WanVideoSampler:
                                     latent_model_input, cfg[min(i, len(timesteps)-1)], positive, text_embeds["negative_prompt_embeds"],
                                     timestep, i, cache_state=self.cache_state, image_cond=image_cond_in, clip_fea=clip_fea, wananim_face_pixels=face_images_in,
                                     wananim_pose_latents=pose_input_slice, uni3c_data=uni3c_data_input,
-                                    context_latents=context_latents,
+                                    context_latents=context_latents, context_roles=context_roles,
                                  )
                                 if prefix_T > 0:
                                     noise_pred = noise_pred[:, prefix_T:]
@@ -2857,7 +3000,7 @@ class WanVideoSampler:
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
                             humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                             wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
-                            context_latents=context_latents,
+                            context_latents=context_latents, context_roles=context_roles,
                         )
                         if bidirectional_sampling:
                             noise_pred_flipped, _,self.cache_state = predict_with_cfg(
@@ -2865,7 +3008,7 @@ class WanVideoSampler:
                             cfg[idx], text_embeds["prompt_embeds"], text_embeds["negative_prompt_embeds"],
                             timestep, idx, image_cond, clip_fea, control_latents, vace_data, unianim_data, audio_proj, control_camera_latents, add_cond,
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,reverse_time=True,
-                            context_latents=context_latents,)
+                            context_latents=context_latents, context_roles=context_roles,)
 
                     if latent_shift_loop:
                         #reverse latent shift
@@ -3075,15 +3218,15 @@ class WanVideoSamplerv2(WanVideoSampler):
                 "text_embeds": ("WANVIDEOTEXTEMBEDS", ),
                 "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"} ),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
-                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (Adaptive Projected Guidance), or apg_chain (chained APG)"}),
+                "guidance_mode": (["cfg", "apg", "apg_chain", "cfg_chain"], {"default": "cfg", "tooltip": "Guidance mode: cfg (standard CFG), apg (single-condition APG), apg_chain (image-reference APG chain), or cfg_chain (Bernini chained CFG)"}),
                 "apg_eta": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "APG: parallel/orthogonal balance (0=orthogonal only, 1=full)"}),
-                "apg_momentum": ("FLOAT", {"default": -0.5, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
+                "apg_momentum": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "APG: EMA momentum for smoothing guidance differences"}),
                 "apg_norm_threshold": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 1000.0, "step": 1.0, "tooltip": "APG: L2 norm clipping threshold (0=disabled)"}),
                 "apg_omega": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG: guidance strength"}),
-                "apg_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
+                "apg_omega_I": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: image-only guidance strength"}),
                 "apg_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "APG chain: text+image guidance strength"}),
-                "chain_omega_V": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
-                "chain_omega_I": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: image guidance strength (rv2v only)"}),
+                "chain_omega_V": ("FLOAT", {"default": 1.25, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: video-only guidance strength"}),
+                "chain_omega_I": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: extra reference context strength (VI - V; reference video/images)"}),
                 "chain_omega_TI": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.01, "tooltip": "Chain CFG: text+image guidance strength"}),
                 "extra_args": ("WANVIDSAMPLEREXTRAARGS", ),
             }

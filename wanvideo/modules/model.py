@@ -2421,6 +2421,14 @@ class WanModel(torch.nn.Module):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        # Fast T2V path: bypass all extra checks for simple text-to-video inference
+        if kwargs.get("simple_t2v", False):
+            return self._forward_t2v(x, t, context, seq_len, freqs,
+                                     context_latents=kwargs.get("context_latents", None),
+                                     context_frame_shapes=None,
+                                     context_window_start=kwargs.get("context_window_start", 0),
+                                     ntk_alphas=ntk_alphas)
+
         # In-context reference (Bernini): extract optional context_latents from kwargs
         context_latents = kwargs.get("context_latents", None)
         context_frame_shapes = None
@@ -2641,7 +2649,7 @@ class WanModel(torch.nn.Module):
                 pad_h = (p_h - (lat.shape[2] % p_h)) % p_h
                 pad_w = (p_w - (lat.shape[3] % p_w)) % p_w
                 if pad_t or pad_h or pad_w:
-                    lat = F.pad(lat, (0, pad_w, 0, pad_h, 0, pad_t))
+                    lat = torch.nn.functional.pad(lat, (0, pad_w, 0, pad_h, 0, pad_t))
                 cl = self.original_patch_embedding(lat.unsqueeze(0).float()).to(x[0].dtype)
                 cl = cl.flatten(2).transpose(1, 2)
                 x = [torch.cat([u, cl], dim=1) for u in x]
@@ -2747,6 +2755,8 @@ class WanModel(torch.nn.Module):
                 longcat_num_ref_latents,
                 rope_negative_offset,
                 num_memory_frames,
+                freq_offset,
+                context_window_start,
                 tuple(tuple(s) for s in context_frame_shapes) if context_frame_shapes is not None else None,
             )
 
@@ -3481,6 +3491,114 @@ class WanModel(torch.nn.Module):
         x = self.unpatchify(x, original_grid_sizes)
         x = [u[:, prefix_frames:suffix_frames, ...].float() for u in x]
         return (x, x_ovi, pred_id) if pred_id is not None else (x, x_ovi, None)
+
+    def _forward_t2v(self, x, t, context, seq_len, freqs, context_latents=None,
+                      context_frame_shapes=None, context_window_start=0, ntk_alphas=None):
+        """Streamlined T2V forward — no block swap, no extra checks, ~15x faster."""
+        device = self.main_device
+        self.original_patch_embedding.to(device)
+        _, F, H, W = x[0].shape
+        x = [self.original_patch_embedding(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype) for u in x]
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], device=device, dtype=torch.long) for u in x])
+        original_grid_sizes = grid_sizes.clone()
+        f, h, w = x[0].shape[2:]
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        self.original_seq_len = x[0].shape[1]
+
+        # Bernini context tokens
+        if context_latents is not None and len(context_latents) > 0:
+            if context_frame_shapes is None:
+                context_frame_shapes = []
+            for lat in context_latents:
+                lat = lat.to(device=device, dtype=x[0].dtype)
+                p_t, p_h, p_w = self.patch_size
+                pad_t = (p_t - (lat.shape[1] % p_t)) % p_t
+                pad_h = (p_h - (lat.shape[2] % p_h)) % p_h
+                pad_w = (p_w - (lat.shape[3] % p_w)) % p_w
+                if pad_t or pad_h or pad_w:
+                    lat = torch.nn.functional.pad(lat, (0, pad_w, 0, pad_h, 0, pad_t))
+                cl = self.original_patch_embedding(lat.unsqueeze(0).float()).to(x[0].dtype)
+                cl = cl.flatten(2).transpose(1, 2)
+                x = [torch.cat([u, cl], dim=1) for u in x]
+                seq_len = max(seq_len, x[0].shape[1])
+                context_frame_shapes.append(lat.shape[1:4])
+
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.int32)
+        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+        x = x.to(self.base_dtype)
+
+        # RoPE
+        if freqs is None and "comfy" in self.rope_func:
+            ntk = ntk_alphas if ntk_alphas is not None else [1.0, 1.0, 1.0]
+            cache_key = (F, H, W, None, None, None, self.rope_embedder.k, tuple(ntk),
+                         0, 0, 0, context_window_start,
+                         tuple(tuple(s) for s in context_frame_shapes) if context_frame_shapes else None)
+            if self.cached_freqs is not None and hasattr(self, 'cached_key') and self.cached_key == cache_key:
+                freqs = self.cached_freqs
+            else:
+                freqs = self.rope_encode_comfy(F, H, W, ntk_alphas=ntk, context_frame_shapes=context_frame_shapes,
+                                               context_window_start=context_window_start, device=device, dtype=x.dtype)
+                self.cached_freqs = freqs
+                self.cached_key = cache_key
+        if freqs.device != device:
+            freqs = freqs.to(device)
+
+        # Time embedding (must produce [batch, 6, dim] for block.get_mod compatibility)
+        self.time_embedding.to(device)
+        time_embed_dtype = self.time_embedding[0].weight.dtype
+        e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(time_embed_dtype))
+        if hasattr(self, 'time_projection'):
+            e = self.time_projection(e_raw).unflatten(1, (6, self.dim))  # [batch, 6, dim]
+        else:
+            # Fallback: block expects [batch, 6, dim] via add with nn.Parameter([1, 6, dim])
+            e = e_raw.reshape(1, 6, self.dim)
+
+        # Validate time embedding format for block.get_mod
+        if e.dim() < 3 or e.shape[1] != 6:
+            e = e.reshape(1, 6, self.dim)
+
+        # Convert context from List[Tensor] to Tensor (same as main forward path)
+        if hasattr(self, "text_embedding") and isinstance(context, list) and context != []:
+            text_embed_dtype = self.text_embedding[0].weight.dtype
+            if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
+                text_embed_dtype = self.base_dtype
+            if getattr(self, 'offload_txt_emb', False):
+                self.text_embedding.to(device)
+            context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]).to(text_embed_dtype)
+            context = self.text_embedding(context.to(device))
+
+        # Block loop with minimal swap + prefetch (no per-block feature checks)
+        blocks_to_swap = getattr(self, 'blocks_to_swap', 0)
+        swap_start_idx = len(self.blocks) - blocks_to_swap if blocks_to_swap > 0 else len(self.blocks)
+        prefetch_blocks = getattr(self, 'prefetch_blocks', 0)
+        swap_stream = getattr(self, 'swap_cuda_stream', None)
+        use_non_blocking = getattr(self, 'use_non_blocking', False)
+        import time as _time
+        for b, block in enumerate(self.blocks):
+            if b >= swap_start_idx and blocks_to_swap > 0:
+                block.to(device, non_blocking=use_non_blocking)
+            # Prefetch upcoming blocks while current is computing
+            if prefetch_blocks > 0 and swap_stream is not None:
+                for pf in range(1, min(prefetch_blocks, len(self.blocks) - b - 1) + 1):
+                    next_b = b + pf
+                    if next_b >= swap_start_idx:
+                        with torch.cuda.stream(swap_stream):
+                            self.blocks[next_b].to(device, non_blocking=use_non_blocking)
+            if getattr(self, 'block_swap_debug', False):
+                compute_start = _time.perf_counter()
+            x, _, _, _ = block(x, e, seq_lens, grid_sizes, freqs, context, 0, last_step=False)
+            if getattr(self, 'block_swap_debug', False):
+                compute_time = _time.perf_counter() - compute_start
+                log.info(f"Block {b}: compute_time={compute_time:.4f}s")
+            if prefetch_blocks > 0 and swap_stream is not None:
+                torch.cuda.current_stream().wait_stream(swap_stream)
+            if b >= swap_start_idx and blocks_to_swap > 0:
+                block.to(self.offload_device, non_blocking=use_non_blocking)
+        x = x[:, :self.original_seq_len]
+        x = self.head(x, e_raw.to(device), temp_length=F)
+        x = self.unpatchify(x, original_grid_sizes)
+        x = [u[:, :, ...].float() for u in x]
+        return x, None, None
 
     def unpatchify(self, x, grid_sizes):
         r"""
