@@ -158,6 +158,7 @@ class WanVideoSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
+    @torch.no_grad()
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
@@ -229,9 +230,12 @@ class WanVideoSampler:
             transformer = compile_model(transformer, model["compile_args"])
 
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
+        everanimate_sampling = image_embeds.get("everanimate", False)
 
         if multitalk_sampling and context_options is not None:
             raise Exception("context_options are not compatible or necessary with 'WanVideoImageToVideoMultiTalk' node, since it's already an alternative method that creates the video in a loop.")
+        if everanimate_sampling and context_options is not None:
+            raise Exception("context_options are not compatible with EverAnimate sampling, since it creates the video in internal segments.")
 
         if not multitalk_sampling and scheduler == "multitalk":
             raise Exception("multitalk scheduler is only for multitalk sampling when using ImagetoVideoMultiTalk -node")
@@ -819,7 +823,7 @@ class WanVideoSampler:
 
         # vid2vid
         noise_mask=original_image=None
-        if samples is not None and not multitalk_sampling and not wananimate_loop:
+        if samples is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling:
             saved_generator_state = samples.get("generator_state", None)
             if saved_generator_state is not None:
                 seed_g.set_state(saved_generator_state)
@@ -1293,7 +1297,7 @@ class WanVideoSampler:
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
-                             wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
+                             wananim_face_pixels=None, wananim_num_anchor_latents=1, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
                              context_latents=None, context_roles=None, context_window_start=0,):
             nonlocal transformer
             nonlocal audio_cfg_scale
@@ -1602,6 +1606,7 @@ class WanVideoSampler:
                     "wananim_face_pixel_values": wananim_face_pixels.to(device, torch.float32) if wananim_face_pixels is not None else None, # WanAnimate face images
                     "wananim_pose_strength": wananim_pose_strength,
                     "wananim_face_strength": wananim_face_strength,
+                    "wananim_num_anchor_latents": wananim_num_anchor_latents,
                     "lynx_embeds": lynx_embeds, # Lynx face and reference embeddings
                     "x_ovi": [latent_model_input_ovi.to(z)] if latent_model_input_ovi is not None else None, # Audio latent model input for Ovi
                     "seq_len_ovi": seq_len_ovi, # Audio latent model sequence length for Ovi
@@ -2062,7 +2067,7 @@ class WanVideoSampler:
             from .latent_preview import prepare_callback #custom for tiny VAE previews
         callback = prepare_callback(patcher, len(timesteps))
 
-        if not multitalk_sampling and not framepack and not wananimate_loop:
+        if not multitalk_sampling and not framepack and not wananimate_loop and not everanimate_sampling:
             log.info("-" * 10 + " Sampling start " + "-" * 10)
             log.info(f"{(latent_video_length-1) * 4 + 1} frames at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} (Input sequence length: {seq_len}) with {steps-ttm_start_step} steps")
 
@@ -2089,6 +2094,403 @@ class WanVideoSampler:
             torch.cuda.reset_peak_memory_stats(device)
         except Exception:
             pass
+
+        if everanimate_sampling:
+            if freeinit_args is not None:
+                raise ValueError("FreeInit is not supported with EverAnimate sampling")
+            if samples is not None:
+                raise ValueError("Input latent samples are not supported with EverAnimate sampling yet")
+            if vae is None:
+                raise ValueError("EverAnimate sampling requires a VAE in image_embeds")
+
+            segment_frames = int(image_embeds.get("frame_window_size", 77))
+            overlap_frames = int(image_embeds.get("num_overlap_frame", 0))
+            num_anchor_latents = int(image_embeds.get("num_video_anchor_latents", 4))
+            num_motion_latents_ea = int(image_embeds.get("num_motion_latents", 1))
+            total_output_frames = int(num_frames)
+            if (segment_frames - 1) % 4 != 0:
+                raise ValueError("frame_window_size must be 1 mod 4 for EverAnimate, e.g. 77, 81, 85")
+            if overlap_frames >= segment_frames:
+                raise ValueError("num_overlap_frame must be smaller than frame_window_size")
+            if num_anchor_latents <= 0:
+                raise ValueError("num_video_anchor_latents must be positive")
+
+            stride_frames = segment_frames - overlap_frames
+            num_segments = int(image_embeds.get(
+                "everanimate_num_segments",
+                1 if total_output_frames <= segment_frames else math.ceil((total_output_frames - segment_frames) / stride_frames) + 1,
+            ))
+            segment_latent_frames = int(image_embeds.get(
+                "everanimate_segment_latent_frames",
+                ((segment_frames + 4 * num_anchor_latents - 1) // 4) + 1,
+            ))
+            target_latent_frames = segment_latent_frames - num_anchor_latents
+            if target_latent_frames <= 0:
+                raise ValueError("EverAnimate segment latent length must be larger than the anchor latent count")
+
+            # EverAnimate does not use CLIP Vision conditioning; "segment" is temporal-window terminology only.
+            clip_fea = None
+            clip_fea_neg = None
+
+            outer_freqs = freqs
+            outer_rope_num_frames = getattr(transformer.rope_embedder, "num_frames", None)
+            outer_cached_freqs = getattr(transformer, "cached_freqs", None)
+            outer_cached_key = getattr(transformer, "cached_key", None)
+
+            def _ea_restore_rope_state():
+                nonlocal freqs
+                freqs = outer_freqs
+                transformer.rope_embedder.num_frames = outer_rope_num_frames
+                transformer.cached_freqs = outer_cached_freqs
+                if hasattr(transformer, "cached_key"):
+                    transformer.cached_key = outer_cached_key
+
+            if context_latents is None and ("default" in rope_function or bidirectional_sampling):
+                freqs = torch.cat([
+                    rope_params(1024, d - 4 * (d // 6), L_test=segment_latent_frames, k=riflex_freq_index),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6))
+                ], dim=1)
+            elif "comfy" in rope_function:
+                transformer.rope_embedder.num_frames = segment_latent_frames
+                transformer.cached_freqs = None
+                if hasattr(transformer, "cached_key"):
+                    transformer.cached_key = None
+
+            try:
+                lat_h = int(image_embeds.get("lat_h", noise.shape[2]))
+                lat_w = int(image_embeds.get("lat_w", noise.shape[3]))
+                pose_pixels = image_embeds.get("pose_images", None)
+                face_pixels = wananim_face_pixels
+                bg_pixels = image_embeds.get("bg_images", None)
+                mask_pixels = image_embeds.get("mask", None)
+                if pose_pixels is None or face_pixels is None:
+                    raise ValueError("EverAnimate sampling requires pose_images and face_images")
+
+                anchor_latents = image_embeds.get("anchor_latents", None)
+                if anchor_latents is None:
+                    raise ValueError("EverAnimate sampling requires anchor_latents")
+                manual_anchor_latents = image_embeds.get("manual_anchor_latents", anchor_latents)
+                user_first_anchor_latent = image_embeds.get("user_first_anchor_latent", manual_anchor_latents[:, :1])
+                use_image_anchor = bool(image_embeds.get("use_image_anchor", True))
+                use_random_frame_anchor = bool(image_embeds.get("use_random_frame_anchor", True))
+                random_anchor_with_user_first = bool(image_embeds.get("random_anchor_with_user_first", True))
+                use_repeat_anchor = bool(image_embeds.get("use_repeat_anchor", False))
+
+                def _ea_slice(tensor, start, length, dim):
+                    if tensor is None:
+                        return None
+                    if tensor.shape[dim] <= 0:
+                        raise ValueError("EverAnimate input sequence contains no frames")
+                    take = max(min(length, tensor.shape[dim] - start), 0)
+                    if take > 0:
+                        out = tensor.narrow(dim, start, take)
+                    else:
+                        out = tensor.narrow(dim, tensor.shape[dim] - 1, 1).narrow(dim, 0, 0)
+                    if out.shape[dim] < length:
+                        pad_shape = [1] * tensor.ndim
+                        pad_shape[dim] = length - out.shape[dim]
+                        last = tensor.narrow(dim, tensor.shape[dim] - 1, 1).repeat(*pad_shape)
+                        out = torch.cat([out, last], dim=dim)
+                    return out
+
+                def _ea_fit_latents(lat, count, repeat_sequence=False):
+                    if count <= 0:
+                        return lat[:, :0]
+                    if lat.shape[1] > count:
+                        return lat[:, :count]
+                    if lat.shape[1] < count:
+                        if repeat_sequence:
+                            repeats = math.ceil(count / lat.shape[1])
+                            lat = lat.repeat(1, repeats, 1, 1)[:, :count]
+                        else:
+                            lat = torch.cat([lat, lat[:, -1:].repeat(1, count - lat.shape[1], 1, 1)], dim=1)
+                    return lat
+
+                def _ea_encode_video_latents(video_cthw):
+                    vae.to(device)
+                    return vae.encode([video_cthw.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+
+                def _ea_encode_pose_latents(pose_cthw):
+                    vae.to(device)
+                    return vae.encode([pose_cthw.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False).to(device, dtype)
+
+                def _ea_mask_latents(mask_thw):
+                    mask_thw = (1.0 - mask_thw.to(device, vae.dtype)).clamp(0.0, 1.0)
+                    mask_thw = torch.nn.functional.interpolate(
+                        mask_thw.unsqueeze(0).unsqueeze(0),
+                        size=(mask_thw.shape[0], lat_h, lat_w),
+                        mode="nearest",
+                    ).squeeze(0).squeeze(0)
+                    expanded = torch.cat([mask_thw[:1].repeat(4, 1, 1), mask_thw[1:]], dim=0)
+                    latent_count = expanded.shape[0] // 4
+                    expanded = expanded[:latent_count * 4]
+                    mask_lat = expanded.view(latent_count, 4, lat_h, lat_w).permute(1, 0, 2, 3).contiguous()
+                    if mask_lat.shape[1] < target_latent_frames:
+                        mask_lat = torch.cat([mask_lat, mask_lat[:, -1:].repeat(1, target_latent_frames - mask_lat.shape[1], 1, 1)], dim=1)
+                    return mask_lat[:, :target_latent_frames].to(device, dtype)
+
+                def _ea_make_condition(current_anchor_latents, motion_latents, bg_latents=None, mask_latents=None):
+                    cond_mask = torch.zeros(4, segment_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
+                    cond_latents = torch.zeros(16, segment_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
+                    current_anchor_latents = _ea_fit_latents(current_anchor_latents.to(device, dtype), num_anchor_latents)
+                    cond_mask[:, :num_anchor_latents] = 1
+                    cond_latents[:, :num_anchor_latents] = current_anchor_latents
+
+                    target_start = num_anchor_latents
+                    if bg_latents is not None:
+                        bg_latents = _ea_fit_latents(bg_latents.to(device, dtype), target_latent_frames)
+                        cond_latents[:, target_start:target_start + bg_latents.shape[1]] = bg_latents
+                        if mask_latents is not None:
+                            cond_mask[:, target_start:target_start + mask_latents.shape[1]] = mask_latents[:, :bg_latents.shape[1]]
+
+                    if motion_latents is not None and motion_latents.shape[1] > 0:
+                        motion_latents = _ea_fit_latents(motion_latents.to(device, dtype), min(num_motion_latents_ea, target_latent_frames))
+                        cond_latents[:, target_start:target_start + motion_latents.shape[1]] = motion_latents
+                    return torch.cat([cond_mask, cond_latents], dim=0)
+
+                def _ea_pick_random_frame_indices(frame_count, count):
+                    if count <= 0:
+                        return []
+                    if frame_count <= 1:
+                        return [0] * count
+                    if random_anchor_with_user_first:
+                        candidates = torch.arange(1, frame_count, dtype=torch.long)
+                        sample_count = min(count, candidates.numel())
+                        if sample_count > 0:
+                            perm = torch.randperm(candidates.numel(), generator=seed_g)[:sample_count]
+                            indices = sorted(int(candidates[i]) for i in perm)
+                        else:
+                            indices = []
+                    else:
+                        candidates = torch.arange(1, frame_count, dtype=torch.long)
+                        sample_count = min(max(count - 1, 0), candidates.numel())
+                        if sample_count > 0:
+                            perm = torch.randperm(candidates.numel(), generator=seed_g)[:sample_count]
+                            indices = [0] + sorted(int(candidates[i]) for i in perm)
+                        else:
+                            indices = [0]
+                    while len(indices) < count:
+                        indices.append(indices[-1] if indices else 0)
+                    return indices[:count]
+
+                def _ea_pose_difference_score(pose_01, masks, i, j):
+                    union = masks[i] | masks[j]
+                    if not bool(union.any()):
+                        return 0.0
+                    xor_ratio = float((masks[i] ^ masks[j]).sum().item()) / float(union.sum().item())
+                    color_diff = (pose_01[i] - pose_01[j]).abs().mean(dim=0)
+                    fg_color_diff = float(color_diff[union].mean().item())
+                    return xor_ratio + 0.25 * fg_color_diff
+
+                def _ea_select_pose_triangle_indices(pose_cthw):
+                    frame_count = int(pose_cthw.shape[1])
+                    if frame_count <= 0:
+                        return []
+                    if frame_count == 1:
+                        return [0, 0, 0]
+                    if frame_count == 2:
+                        return [0, 1, 1]
+
+                    pose = pose_cthw[:, :frame_count].detach().to(torch.float32).clamp(-1, 1).cpu().movedim(0, 1)
+                    max_side = max(int(pose.shape[-2]), int(pose.shape[-1]))
+                    if max_side > 128:
+                        scale = 128.0 / max_side
+                        new_h = max(1, int(round(pose.shape[-2] * scale)))
+                        new_w = max(1, int(round(pose.shape[-1] * scale)))
+                        pose = torch.nn.functional.interpolate(pose, size=(new_h, new_w), mode="area")
+                    pose_01 = (pose + 1.0) * 0.5
+                    masks = torch.any(pose_01 > (20.0 / 255.0), dim=1)
+
+                    best_pair = None
+                    best_score = -1.0
+                    diff_cache = {}
+
+                    def diff(i, j):
+                        key = (min(i, j), max(i, j))
+                        if key not in diff_cache:
+                            diff_cache[key] = _ea_pose_difference_score(pose_01, masks, key[0], key[1])
+                        return diff_cache[key]
+
+                    for i in range(1, frame_count):
+                        diff_0_i = diff(0, i)
+                        for j in range(i + 1, frame_count):
+                            pairwise_sum = diff_0_i + diff(0, j) + diff(i, j)
+                            if pairwise_sum > best_score:
+                                best_score = pairwise_sum
+                                best_pair = (i, j)
+
+                    if best_pair is None:
+                        fallback = min(2, frame_count - 1)
+                        return [0, 1, fallback]
+                    return [0, best_pair[0], best_pair[1]]
+
+                def _ea_encode_anchor_frames(video_cthw, frame_indices):
+                    encoded = []
+                    vae.to(device)
+                    for frame_idx in frame_indices:
+                        frame = video_cthw[:, frame_idx:frame_idx + 1].to(device, vae.dtype)
+                        encoded.append(vae.encode([frame], device, tiled=tiled_vae, pbar=False)[0][:, :1].to(device, dtype))
+                    return encoded
+
+                def _ea_build_generated_anchor(video_cthw, pose_cthw):
+                    if use_random_frame_anchor:
+                        random_slots = num_anchor_latents - 1 if random_anchor_with_user_first else num_anchor_latents
+                        frame_indices = _ea_pick_random_frame_indices(video_cthw.shape[1], random_slots)
+                        encoded = _ea_encode_anchor_frames(video_cthw, frame_indices)
+                        if random_anchor_with_user_first:
+                            encoded.append(user_first_anchor_latent.to(device, dtype))
+                        if not encoded:
+                            encoded.append(user_first_anchor_latent.to(device, dtype))
+                        return _ea_fit_latents(torch.cat(encoded, dim=1), num_anchor_latents, repeat_sequence=use_repeat_anchor)
+
+                    num_user_slots = min(2, num_anchor_latents)
+                    num_sample_slots = max(num_anchor_latents - num_user_slots, 0)
+                    selected_triplet = _ea_select_pose_triangle_indices(pose_cthw)
+                    sample_indices = selected_triplet[1:1 + num_sample_slots]
+                    encoded = _ea_encode_anchor_frames(video_cthw, sample_indices)
+                    if num_sample_slots > 0 and encoded:
+                        sampled = _ea_fit_latents(torch.cat(encoded, dim=1), num_sample_slots)
+                        anchor_latents_out = [sampled]
+                    else:
+                        anchor_latents_out = []
+                    if num_user_slots > 0:
+                        anchor_latents_out.append(user_first_anchor_latent.to(device, dtype).repeat(1, num_user_slots, 1, 1))
+                    if not anchor_latents_out:
+                        anchor_latents_out.append(user_first_anchor_latent.to(device, dtype))
+                    return _ea_fit_latents(torch.cat(anchor_latents_out, dim=1), num_anchor_latents, repeat_sequence=use_repeat_anchor)
+
+                log.info(
+                    f"EverAnimate sampling: {total_output_frames} requested frames, {num_segments} segments, "
+                    f"{segment_frames} frames/segment, {overlap_frames} overlap frames, {num_anchor_latents} anchor latents"
+                )
+
+                callback = prepare_callback(patcher, num_segments * len(timesteps))
+                generated_segments = []
+                video_anchor_latent = None
+                prev_segment_latents = None
+                step_iteration_count = 0
+
+                for segment_idx in range(num_segments):
+                    segment_start = segment_idx * stride_frames
+                    current_anchor = anchor_latents if segment_idx == 0 or video_anchor_latent is None else video_anchor_latent
+                    if segment_idx == 0 or prev_segment_latents is None or num_motion_latents_ea <= 0:
+                        motion_latents = torch.zeros(16, max(num_motion_latents_ea, 0), lat_h, lat_w, device=device, dtype=dtype)
+                    else:
+                        motion_latents = _ea_fit_latents(prev_segment_latents[:, -num_motion_latents_ea:], num_motion_latents_ea)
+
+                    pose_window = _ea_slice(pose_pixels, segment_start, segment_frames, 1)
+                    face_window = _ea_slice(face_pixels, segment_start, segment_frames, 2).to(device, torch.float32)
+                    pose_latents = _ea_encode_pose_latents(pose_window)
+
+                    bg_latents = mask_latents = None
+                    if bg_pixels is not None and mask_pixels is not None:
+                        bg_window = _ea_slice(bg_pixels, segment_start, segment_frames, 1)
+                        bg_latents = _ea_fit_latents(_ea_encode_video_latents(bg_window), target_latent_frames)
+                        mask_window = _ea_slice(mask_pixels, segment_start, segment_frames, 0)
+                        mask_latents = _ea_mask_latents(mask_window)
+
+                    image_cond_in = _ea_make_condition(current_anchor, motion_latents, bg_latents, mask_latents)
+                    latent = torch.randn(
+                        16,
+                        segment_latent_frames,
+                        lat_h,
+                        lat_w,
+                        dtype=torch.float32,
+                        generator=seed_g,
+                        device=torch.device("cpu"),
+                    ).to(device)
+                    seq_len = math.ceil((latent.shape[2] * latent.shape[3]) / 4 * latent.shape[1])
+
+                    if isinstance(scheduler, dict):
+                        sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                        segment_timesteps = scheduler["timesteps"]
+                    else:
+                        sample_scheduler, segment_timesteps, _, _ = get_scheduler(
+                            scheduler, total_steps, start_step, end_step, shift, device,
+                            transformer.dim, denoise_strength, sigmas=sigmas,
+                        )
+                    if hasattr(sample_scheduler, "timesteps"):
+                        sample_scheduler.timesteps = segment_timesteps
+
+                    self.cache_state = [None, None]
+                    sampling_pbar = tqdm(total=len(segment_timesteps), desc=f"EverAnimate segment {segment_idx + 1}/{num_segments}", position=0, leave=True)
+                    for i, t in enumerate(segment_timesteps):
+                        timestep = torch.tensor([t]).to(device)
+                        latent_model_input = latent.to(device)
+                        noise_pred, _, self.cache_state = predict_with_cfg(
+                            latent_model_input,
+                            cfg[min(i, len(cfg) - 1)],
+                            text_embeds["prompt_embeds"],
+                            text_embeds["negative_prompt_embeds"],
+                            timestep,
+                            i,
+                            image_cond_in,
+                            clip_fea,
+                            cache_state=self.cache_state,
+                            wananim_face_pixels=face_window,
+                            wananim_pose_latents=pose_latents,
+                            wananim_num_anchor_latents=num_anchor_latents,
+                        )
+
+                        if use_tsr:
+                            noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
+                        latent = sample_scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            timestep,
+                            latent.unsqueeze(0).to(noise_pred.device),
+                            **scheduler_step_args,
+                        )[0].squeeze(0).detach()
+
+                        if callback is not None:
+                            callback_latent = (latent_model_input - noise_pred.to(device) * timestep.to(device) / 1000).detach()
+                            callback(step_iteration_count, callback_latent.permute(1, 0, 2, 3), None, num_segments * len(segment_timesteps))
+                            del callback_latent
+                        sampling_pbar.update(1)
+                        step_iteration_count += 1
+                        del noise_pred, latent_model_input, timestep
+                    sampling_pbar.close()
+
+                    segment_latents = latent[:, num_anchor_latents:].detach()
+                    prev_segment_latents = segment_latents
+                    vae.to(device)
+                    segment_video = vae.decode(
+                        segment_latents.unsqueeze(0).to(device, vae.dtype),
+                        device=device,
+                        tiled=tiled_vae,
+                        pbar=False,
+                    )[0].detach().cpu()
+                    if segment_video.shape[1] > segment_frames:
+                        segment_video = segment_video[:, :segment_frames]
+
+                    if segment_idx == 0:
+                        generated_segments.append(segment_video)
+                        if use_image_anchor:
+                            video_anchor_latent = _ea_build_generated_anchor(segment_video, pose_window)
+                        else:
+                            video_anchor_latent = segment_latents.to(device, dtype)
+                    else:
+                        generated_segments.append(segment_video[:, overlap_frames:])
+
+                    del latent, segment_video, segment_latents, pose_latents, face_window, image_cond_in
+                    mm.soft_empty_cache()
+                    gc.collect()
+
+                gen_video_samples = torch.cat(generated_segments, dim=1)
+                if gen_video_samples.shape[1] > total_output_frames:
+                    gen_video_samples = gen_video_samples[:, :total_output_frames]
+                if force_offload:
+                    vae.to(offload_device)
+                    if not model["auto_cpu_offload"]:
+                        offload_transformer(transformer)
+                try:
+                    print_memory(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                except Exception:
+                    pass
+                return {"video": gen_video_samples.permute(1, 2, 3, 0)},
+            finally:
+                _ea_restore_rope_state()
 
         # Main sampling loop with FreeInit iterations
         iterations = freeinit_args.get("freeinit_num_iters", 3) if freeinit_args is not None else 1
@@ -2591,7 +2993,7 @@ class WanVideoSampler:
 
                                 latent = sample_scheduler.step(
                                         noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0),
-                                        **scheduler_step_args)[0].squeeze(0)
+                                        **scheduler_step_args)[0].squeeze(0).detach()
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                                     callback(step_iteration_count, callback_latent, None, s2v_num_repeat*(len(timesteps)))
@@ -2742,7 +3144,7 @@ class WanVideoSampler:
                                         temporal_ref_latents = vae.encode([image_concat.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0]
                                     else:
                                         temporal_ref_latents = None
-                                    
+
                                     # 4. Initialize mask
                                     msk = torch.zeros(4, latent_window_size, lat_h, lat_w, device=device, dtype=dtype)
                                     
@@ -2919,7 +3321,7 @@ class WanVideoSampler:
                                 if use_tsr:
                                     noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
-                                latent = sample_scheduler.step(noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0).to(noise_pred.device), **scheduler_step_args)[0].squeeze(0)
+                                latent = sample_scheduler.step(noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0).to(noise_pred.device), **scheduler_step_args)[0].squeeze(0).detach()
                                 del noise_pred, latent_model_input, timestep
 
                                 # differential diffusion inpaint
@@ -3041,7 +3443,7 @@ class WanVideoSampler:
                     if len(timestep.shape) != 1 and clean_latent_indices and not is_pusa: #5b and longcat, skip clean latents for scheduler step
                         step_process_indices = [i for i in range(latent.shape[1]) if i not in clean_latent_indices]
                         latent[:, step_process_indices] = sample_scheduler.step(noise_pred[:, step_process_indices].unsqueeze(0), orig_timestep,
-                                                        latent[:, step_process_indices].unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                                                        latent[:, step_process_indices].unsqueeze(0), **scheduler_step_args)[0].squeeze(0).detach()
                     else:
                         if latents_to_not_step > 0:
                             raw_latent = latent[:, :latents_to_not_step]
@@ -3052,16 +3454,18 @@ class WanVideoSampler:
                             latent = latent[:, :orig_noise_len]
                         else:
                             noise_pred_in = noise_pred
-                        latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                        latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0).detach()
                         if noise_pred_flipped is not None:
-                            latent_backwards = sample_scheduler_flipped.step(noise_pred_flipped.unsqueeze(0), timestep, latent_flipped.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                            latent_backwards = sample_scheduler_flipped.step(noise_pred_flipped.unsqueeze(0), timestep, latent_flipped.unsqueeze(0), **scheduler_step_args)[0].squeeze(0).detach()
                             latent_backwards = torch.flip(latent_backwards, dims=[1])
                             latent = latent * 0.5 + latent_backwards * 0.5
                         if latents_to_not_step > 0:
                             latent = torch.cat([raw_latent, latent], dim=1)
 
+                    latent = latent.detach()
+
                     if latent_ovi is not None:
-                        latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
+                        latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0).detach()
 
                     #InfiniteTalk first frame handling
                     if (extra_latents is not None

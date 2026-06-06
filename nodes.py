@@ -1626,6 +1626,230 @@ class WanVideoAnimateEmbeds:
 
         return (image_embeds,)
 
+
+class WanAnimatePlusEverAnimateEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "vae": ("WANVAE",),
+            "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 8, "tooltip": "Width of the video to generate"}),
+            "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 8, "tooltip": "Height of the video to generate"}),
+            "num_frames": ("INT", {"default": 734, "min": 1, "max": 10000, "step": 1, "tooltip": "Total output frames. Segment count is computed from this, frame_window_size, and num_overlap_frame."}),
+            "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
+            "frame_window_size": ("INT", {"default": 77, "min": 1, "max": 10000, "step": 4, "tooltip": "Effective output frames per EverAnimate segment. Must be 1 mod 4, e.g. 77, 81, 85."}),
+            "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional multiplier for the pose adapter"}),
+            "face_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional multiplier for the face adapter"}),
+            "pose_images": ("IMAGE", {"tooltip": "Pose control video"}),
+            "face_images": ("IMAGE", {"tooltip": "Face control video. Resized to 512x512 internally."}),
+            "num_video_anchor_latents": ("INT", {"default": 4, "min": 1, "max": 4, "step": 1, "tooltip": "Number of anchor latent slots prepended to each EverAnimate segment"}),
+            "num_motion_latents": ("INT", {"default": 1, "min": 0, "max": 4, "step": 1, "tooltip": "Number of previous-segment motion latents used for continuity"}),
+            "num_overlap_frame": ("INT", {"default": 4, "min": 0, "max": 10000, "step": 1, "tooltip": "Overlapping output frames between adjacent segments"}),
+            "use_pingpong": ("BOOLEAN", {"default": True, "tooltip": "Ping-pong extend pose, face, bg, and mask sequences when more frames are needed"}),
+            "use_image_anchor": ("BOOLEAN", {"default": True, "tooltip": "Use generated frames from the first segment to build later video anchors"}),
+            "use_random_frame_anchor": ("BOOLEAN", {"default": True, "tooltip": "Randomly sample generated segment-0 frames for later video anchors"}),
+            "random_anchor_with_user_first": ("BOOLEAN", {"default": True, "tooltip": "In random-anchor mode, reserve the first manual anchor frame as the user anchor"}),
+            "use_repeat_anchor": ("BOOLEAN", {"default": False, "tooltip": "When fewer manual anchor frames are provided than anchor slots, repeat the provided sequence to fill the missing slots"}),
+            "anchor_images": ("IMAGE", {"tooltip": "Manual identity/anchor image frames. Video inputs are treated as an anchor-frame sequence, not as source-video conditioning."}),
+            },
+            "optional": {
+                "bg_images": ("IMAGE", {"tooltip": "Optional background/inpaint video"}),
+                "mask": ("MASK", {"tooltip": "Optional mask paired with bg_images"}),
+                "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = "EverAnimate conditioning bundle for segmented WanAnimatePlus sampling."
+
+    @staticmethod
+    def _fit_sequence(seq, target_len, use_pingpong):
+        if seq is None:
+            return None
+        if target_len <= 0:
+            return seq[:0]
+        frames = seq.shape[0]
+        if frames == target_len:
+            return seq
+        if frames > target_len:
+            return seq[:target_len]
+        if frames == 0:
+            raise ValueError("Input sequence contains no frames")
+        if frames == 1 or not use_pingpong:
+            return torch.cat([seq, seq[-1:].repeat(target_len - frames, *([1] * (seq.ndim - 1)))], dim=0)
+
+        indices = []
+        idx = 0
+        step = 1
+        while len(indices) < target_len:
+            indices.append(idx)
+            idx += step
+            if idx == frames - 1 or idx == 0:
+                step *= -1
+        return seq.index_select(0, torch.tensor(indices, device=seq.device))
+
+    @staticmethod
+    def _resize_video_bhwc(images, width, height, mode="lanczos", crop="disabled"):
+        if images.shape[1] == height and images.shape[2] == width:
+            return images[:, :, :, :3]
+        return common_upscale(images[:, :, :, :3].movedim(-1, 1), width, height, mode, crop).movedim(1, -1)
+
+    @staticmethod
+    def _to_cthw_pixels(images):
+        return images.permute(3, 0, 1, 2)[:3] * 2 - 1
+
+    @staticmethod
+    def _encode_single_frame_latents(vae, images, width, height, tiled_vae):
+        if images is None or images.shape[0] == 0:
+            raise ValueError("At least one anchor_images frame is required")
+
+        latents = []
+        for i in range(images.shape[0]):
+            frame = WanAnimatePlusEverAnimateEmbeds._resize_video_bhwc(images[i:i + 1], width, height)
+            frame = WanAnimatePlusEverAnimateEmbeds._to_cthw_pixels(frame).to(device=device, dtype=vae.dtype)
+            lat = vae.encode([frame], device, tiled=tiled_vae)[0][:, :1].to(offload_device)
+            latents.append(lat)
+        return torch.cat(latents, dim=1)
+
+    @staticmethod
+    def _normalize_anchor_slots(anchor_latents, target_count, repeat_sequence=False):
+        if anchor_latents.shape[1] == target_count:
+            return anchor_latents
+        if anchor_latents.shape[1] > target_count:
+            return anchor_latents[:, :target_count]
+        if repeat_sequence:
+            repeats = math.ceil(target_count / anchor_latents.shape[1])
+            return anchor_latents.repeat(1, repeats, 1, 1)[:, :target_count]
+        pad = anchor_latents[:, -1:].repeat(1, target_count - anchor_latents.shape[1], 1, 1)
+        return torch.cat([anchor_latents, pad], dim=1)
+
+    def process(self, vae, width, height, num_frames, force_offload, frame_window_size, pose_strength, face_strength,
+                pose_images, face_images, num_video_anchor_latents, num_motion_latents, num_overlap_frame,
+                use_pingpong, use_image_anchor, use_random_frame_anchor, random_anchor_with_user_first,
+                use_repeat_anchor, anchor_images, bg_images=None, mask=None, tiled_vae=False):
+
+        W = (width // 16) * 16
+        H = (height // 16) * 16
+        if (frame_window_size - 1) % 4 != 0:
+            raise ValueError("frame_window_size must be 1 mod 4 for EverAnimate, e.g. 77, 81, 85")
+        if num_overlap_frame >= frame_window_size:
+            raise ValueError("num_overlap_frame must be smaller than frame_window_size")
+        if (bg_images is None) != (mask is None):
+            raise ValueError("bg_images and mask must be connected together")
+
+        stride = frame_window_size - num_overlap_frame
+        if num_frames <= frame_window_size:
+            num_segments = 1
+        else:
+            num_segments = math.ceil((num_frames - frame_window_size) / stride) + 1
+        generated_frames = frame_window_size + (num_segments - 1) * stride
+
+        manual_images = anchor_images
+        anchor_source = "anchor_images"
+        if manual_images is None:
+            raise ValueError("EverAnimate requires anchor_images")
+
+        manual_images = manual_images[:, :, :, :3]
+        manual_count = min(manual_images.shape[0], num_video_anchor_latents)
+        if manual_count <= 0:
+            raise ValueError(f"{anchor_source} contains no frames")
+
+        mm.soft_empty_cache()
+        gc.collect()
+        vae.to(device)
+
+        manual_anchor_latents = self._encode_single_frame_latents(
+            vae, manual_images[:manual_count], W, H, tiled_vae
+        )
+        user_first_anchor_latent = manual_anchor_latents[:, :1].clone()
+        anchor_latents = self._normalize_anchor_slots(
+            manual_anchor_latents,
+            num_video_anchor_latents,
+            repeat_sequence=use_repeat_anchor,
+        )
+
+        pose_images = self._fit_sequence(pose_images[:, :, :, :3], generated_frames, use_pingpong)
+        pose_images = self._resize_video_bhwc(pose_images, W, H)
+        pose_pixels = self._to_cthw_pixels(pose_images).to(offload_device, dtype=vae.dtype)
+
+        face_images = self._fit_sequence(face_images[:, :, :, :3], generated_frames, use_pingpong)
+        face_images = self._resize_video_bhwc(face_images, 512, 512, crop="center")
+        face_pixels = self._to_cthw_pixels(face_images).unsqueeze(0).to(offload_device, dtype=vae.dtype)
+
+        bg_pixels = None
+        mask_pixels = None
+        if bg_images is not None:
+            bg_images = self._fit_sequence(bg_images[:, :, :, :3], generated_frames, use_pingpong)
+            bg_images = self._resize_video_bhwc(bg_images, W, H)
+            bg_pixels = self._to_cthw_pixels(bg_images).to(offload_device, dtype=vae.dtype)
+
+            mask = self._fit_sequence(mask, generated_frames, use_pingpong)
+            if mask.shape[1] != H or mask.shape[2] != W:
+                mask_pixels = common_upscale(mask.unsqueeze(1), W, H, "nearest", "disabled").squeeze(1)
+            else:
+                mask_pixels = mask
+            mask_pixels = mask_pixels.to(offload_device, dtype=vae.dtype)
+
+        lat_h = H // vae.upsampling_factor
+        lat_w = W // vae.upsampling_factor
+        target_shape = (16, (num_frames - 1) // 4 + 1, lat_h, lat_w)
+        segment_latent_frames = (frame_window_size + 4 * num_video_anchor_latents - 1) // 4 + 1
+
+        if force_offload:
+            vae.to(offload_device)
+            mm.soft_empty_cache()
+            gc.collect()
+
+        image_embeds = {
+            "target_shape": target_shape,
+            "num_frames": num_frames,
+            "vae": vae,
+            "tiled_vae": tiled_vae,
+            "force_offload": force_offload,
+
+            "everanimate": True,
+            "everanimate_num_segments": num_segments,
+            "everanimate_generated_frames": generated_frames,
+            "everanimate_segment_latent_frames": segment_latent_frames,
+            "frame_window_size": frame_window_size,
+            "num_overlap_frame": num_overlap_frame,
+            "num_video_anchor_latents": num_video_anchor_latents,
+            "num_motion_latents": num_motion_latents,
+            "use_pingpong": use_pingpong,
+            "use_image_anchor": use_image_anchor,
+            "use_random_frame_anchor": use_random_frame_anchor,
+            "random_anchor_with_user_first": random_anchor_with_user_first,
+            "use_repeat_anchor": use_repeat_anchor,
+
+            "anchor_source": anchor_source,
+            "manual_anchor_count": manual_count,
+            "manual_anchor_latents": manual_anchor_latents,
+            "anchor_latents": anchor_latents,
+            "user_first_anchor_latent": user_first_anchor_latent,
+            "random_user_anchor_latent": user_first_anchor_latent,
+            "manual_random_user_anchor_index": 0 if random_anchor_with_user_first else None,
+
+            "pose_images": pose_pixels,
+            "face_pixels": face_pixels,
+            "bg_images": bg_pixels,
+            "mask": mask_pixels,
+            "is_masked": mask_pixels is not None,
+            "pose_strength": pose_strength,
+            "face_strength": face_strength,
+            "lat_h": lat_h,
+            "lat_w": lat_w,
+            "looping": False,
+        }
+
+        log.info(
+            f"EverAnimate Embeds: {num_frames} output frames, {num_segments} segments, "
+            f"{generated_frames} generated frames before trim, anchors={anchor_latents.shape[1]} from {anchor_source}"
+        )
+
+        return (image_embeds,)
+
 # region UniLumos
 class WanVideoUniLumosEmbeds:
     @classmethod
@@ -2717,6 +2941,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoRoPEFunction": WanVideoRoPEFunction,
     "WanVideoAddPusaNoise": WanVideoAddPusaNoise,
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
+    "WanAnimatePlusEverAnimateEmbeds": WanAnimatePlusEverAnimateEmbeds,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
     "WanVideoAddBindweaveEmbeds": WanVideoAddBindweaveEmbeds,
     "TextImageEncodeQwenVL": TextImageEncodeQwenVL,
@@ -2760,6 +2985,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoRoPEFunction": "WanVideo RoPE Function",
     "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
     "WanVideoAnimateEmbeds": "WanVideo Animate Embeds",
+    "WanAnimatePlusEverAnimateEmbeds": "WanAnimatePlus EverAnimate Embeds",
     "WanVideoAddLucyEditLatents": "WanVideo Add LucyEdit Latents",
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",
     "WanVideoUniLumosEmbeds": "WanVideo UniLumos Embeds",

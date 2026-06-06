@@ -17,6 +17,7 @@ except Exception:
 
 from .nodes import (
     WanAnimatePlusBernini,
+    WanAnimatePlusEverAnimateEmbeds,
     WanVideoAnimateEmbeds,
     WanVideoClipVisionEncode,
     WanVideoContextOptions,
@@ -70,6 +71,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Uni3C Embeds": WanVideoUni3C_embeds,
     "WanAnimatePlus SamplerExtraArgs": WanVideoSamplerExtraArgs,
     "WanAnimatePlus Bernini": WanAnimatePlusBernini,
+    "WanAnimatePlus EverAnimate Embeds": WanAnimatePlusEverAnimateEmbeds,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: k for k in NODE_CLASS_MAPPINGS}
