@@ -574,10 +574,11 @@ class WanVideoSampler:
         # ================================================================
         has_prefix = image_embeds.get("has_prefix", False)
         canvas_expansion_px = image_embeds.get("canvas_expansion_px", 0)
+        prefix_prepend_latents = image_embeds.get("prefix_prepend_latents", 6 if has_prefix else 0)
         context_latents = image_embeds.get("context_latents", None)
         context_roles = image_embeds.get("context_roles", None)
         if has_prefix:
-            log.info("Prefix frames: detected, will prepend indices 0-5 to each window (except first)")
+            log.info(f"Prefix frames: detected, will prepend {prefix_prepend_latents} latent frames to each non-first context window")
         if wananimate_loop and context_options is not None:
             raise Exception("context_options are not compatible or necessary with WanAnim looping, since it creates the video in a loop.")
         wananim_pose_latents = image_embeds.get("pose_latents", None)
@@ -2267,11 +2268,11 @@ class WanVideoSampler:
                                         window_msk[:, window_trans_start:window_trans_end] = mask_slice.view(1, -1, 1, 1)
                                 # ================================================================
 
-                                # ============ Prefix: prepend indices 0-5 to non-first windows ============
-                                if has_prefix and c[0] != 0:
-                                    prefix_ctx = image_cond[:, :6].to(device, dtype)
+                                # ============ Prefix: prepend cached prefix context to non-first windows ============
+                                if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
+                                    prefix_ctx = image_cond[:, :prefix_prepend_latents].to(device, dtype)
                                     partial_img_emb = torch.cat([prefix_ctx, partial_img_emb], dim=1)
-                                    prefix_msk = image_cond[:4, :6].to(device, dtype)
+                                    prefix_msk = image_cond[:4, :prefix_prepend_latents].to(device, dtype)
                                     window_msk = torch.cat([prefix_msk, window_msk], dim=1)
                                 # ======================================================================
 
@@ -2346,9 +2347,9 @@ class WanVideoSampler:
                             if latents_to_insert is not None and c[0] != 0:
                                 partial_latent_model_input[:, :1] = latents_to_insert
 
-                            # ============ Prefix: prepend noise for indices 0-5 ============
-                            if has_prefix and c[0] != 0:
-                                prefix_noise = latent_model_input[:, :6].to(device)
+                            # ============ Prefix: prepend noise for cached prefix context ============
+                            if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
+                                prefix_noise = latent_model_input[:, :prefix_prepend_latents].to(device)
                                 partial_latent_model_input = torch.cat([prefix_noise, partial_latent_model_input], dim=1)
                             # =============================================================
 
@@ -2403,13 +2404,13 @@ class WanVideoSampler:
                                 pose_limit = context_frames - 1
                                 partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :pose_limit].to(device, dtype)
 
-                            # ============ Prefix: prepend face/pose for indices 0-5 ============
-                            if has_prefix and c[0] != 0:
+                            # ============ Prefix: prepend face/pose for cached prefix context ============
+                            if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
                                 if partial_wananim_face_pixels is not None:
-                                    prefix_face = wananim_face_pixels[:, :, :24].to(device, dtype)
+                                    prefix_face = wananim_face_pixels[:, :, :prefix_prepend_latents * 4].to(device, dtype)
                                     partial_wananim_face_pixels = torch.cat([prefix_face, partial_wananim_face_pixels], dim=2)
                                 if partial_wananim_pose_latents is not None:
-                                    prefix_pose = wananim_pose_latents[:, :, :6].to(device, dtype)
+                                    prefix_pose = wananim_pose_latents[:, :, :prefix_prepend_latents].to(device, dtype)
                                     partial_wananim_pose_latents = torch.cat([prefix_pose, partial_wananim_pose_latents], dim=2)
                             # ================================================================
 
@@ -2442,8 +2443,8 @@ class WanVideoSampler:
                                 image_cond_in = None
                             # ========================================
                             original_seq_len = seq_len
-                            if has_prefix and c[0] != 0:
-                                seq_len = original_seq_len + 6 * base_patches_per_frame
+                            if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
+                                seq_len = original_seq_len + prefix_prepend_latents * base_patches_per_frame
                             # Slice context_latents for current context window
                             sliced_context_latents = None
                             if context_latents is not None:
@@ -2453,6 +2454,8 @@ class WanVideoSampler:
                                         sliced_context_latents.append(lat[:, c].to(device))
                                     else:
                                         sliced_context_latents.append(lat.to(device))
+                            # Context latents are already sliced to this local window. The target
+                            # window RoPE also starts at 0, so keep Bernini context RoPE local.
                             noise_pred_context, _, new_teacache = predict_with_cfg(
                                 partial_latent_model_input,
                                 cfg[idx], positive,
@@ -2463,13 +2466,13 @@ class WanVideoSampler:
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                                 wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
                                 uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent, context_latents=sliced_context_latents,
-                                context_roles=context_roles, context_window_start=c[0])
+                                context_roles=context_roles, context_window_start=0)
 
                             seq_len = original_seq_len  # restore seq_len
 
                             # ============ Prefix: slice off prepended predictions ============
-                            if has_prefix and c[0] != 0:
-                                noise_pred_context = noise_pred_context[:, 6:]
+                            if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
+                                noise_pred_context = noise_pred_context[:, prefix_prepend_latents:]
                             # ==============================================================
 
                             if cache_args is not None:
@@ -2977,6 +2980,14 @@ class WanVideoSampler:
 
                         if not output_path:
                             gen_video_samples = torch.cat(gen_video_list, dim=1)
+                            if canvas_expansion_px:
+                                if gen_video_samples.shape[1] > canvas_expansion_px:
+                                    gen_video_samples = gen_video_samples[:, canvas_expansion_px:]
+                                    log.info(f"WanAnimate loop: trimmed {canvas_expansion_px} canvas expansion pixel frames from output")
+                                else:
+                                    log.warning(
+                                        f"WanAnimate loop: canvas_expansion_px={canvas_expansion_px} is not smaller than output length {gen_video_samples.shape[1]}, skipping trim"
+                                    )
                         else:
                             gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 

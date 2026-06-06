@@ -28,6 +28,14 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 
+def _sample_reversed_prefix_frames(frames, count):
+    if count <= 0:
+        return frames[:0]
+    indices = torch.arange(count, device=frames.device) * 2
+    indices = torch.clamp(indices, max=frames.shape[0] - 1)
+    return torch.flip(frames.index_select(0, indices), [0])
+
+
 class WanVideoEnhanceAVideo:
     @classmethod
     def INPUT_TYPES(s):
@@ -1216,8 +1224,9 @@ class WanVideoAnimateEmbeds:
                 "mask": ("MASK", {"tooltip": "mask"}),
                 "start_ref_image": ("IMAGE", {"tooltip": "start ref image"}),
                 "transition_video": ("IMAGE", {"default": None, "tooltip": "Transition video frames (32 images, encoded to 8 latent frames). Acts as hard conditioning guide for seamless connection."}),
-                "prefix_frames": ("IMAGE", {"default": None, "tooltip": "3 reference images. When enabled, expands canvas by 45 pixel frames: 17 prefix, 8 reserve, 20 transition. Image 0 ×5, image 1 ×4, image 2 ×4, image 0 ×4."}),
+                "prefix_frames": ("IMAGE", {"default": None, "tooltip": "Up to 5 prefix images. Image 0 is used once; images 1-4 are repeated 4 times each, for a max 17-frame prefix."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
+                "transition mode": ("BOOLEAN", {"default": True, "label_on": "Transition mode", "label_off": "Outfit mode", "tooltip": "Transition mode: 37-frame layout (17 prefix + 20 transition). Outfit mode: 45-frame layout (17 prefix + 8 reserve + 20 transition)."}),
                 "Prefix & Transition Video by wuwukasi(bilibili)": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON"}),
             }
         }
@@ -1239,6 +1248,10 @@ class WanVideoAnimateEmbeds:
 
         num_refs = ref_images.shape[0] if ref_images is not None else 0
         num_frames = ((num_frames - 1) // 4) * 4 + 1
+        transition_mode = kwargs.get("transition mode", True)
+        prefix_canvas_extra = 37 if transition_mode else 45
+        prefix_transition_start = 17 if transition_mode else 25
+        prefix_transition_end = prefix_canvas_extra
 
         if transition_video is not None and prefix_frames is None:
 
@@ -1250,20 +1263,16 @@ class WanVideoAnimateEmbeds:
 
             # 2. Shift control signals by 21 pixel frames with sampled+reversed padding
             if pose_images is not None:
-                sampled = pose_images[0:42:2]               # 21 frames from indices 0,2,...,40
-                sampled = torch.flip(sampled, [0])           # reverse order
+                sampled = _sample_reversed_prefix_frames(pose_images, 21)
                 pose_images = torch.cat([sampled, pose_images], dim=0)
             if face_images is not None:
-                sampled = face_images[0:42:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(face_images, 21)
                 face_images = torch.cat([sampled, face_images], dim=0)
             if bg_images is not None:
-                sampled = bg_images[0:42:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(bg_images, 21)
                 bg_images = torch.cat([sampled, bg_images], dim=0)
             if mask is not None:
-                sampled = mask[0:42:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(mask, 21)
                 mask = torch.cat([sampled, mask], dim=0)
             # ----------------------------------------------------
 
@@ -1271,35 +1280,31 @@ class WanVideoAnimateEmbeds:
                 log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
         # ============ Prefix frames: expand canvas and shift control signals ============
         if prefix_frames is not None:
-            # Expand canvas: always 45 = 17 prefix + 8 reserve + 20 transition
-            extra = 45
+            # Expand canvas: transition mode 37 = 17 prefix + 20 transition; outfit mode 45 = 17 prefix + 8 reserve + 20 transition
+            extra = prefix_canvas_extra
             num_frames += extra
             # Trim 1-3 frames from end to keep num_frames % 4 == 1 (required by repeat_interleave + view)
             trim = (num_frames - 1) % 4
             num_frames -= trim
 
             # Pad beginning with sampled+reversed frames for pose/face (sparse temporal context),
-            # repeat frame 0 for bg/mask
+            # clamping to the last available frame if the source is shorter than the sampled range.
             if pose_images is not None:
-                sampled = pose_images[0:extra*2:2]        # indices 0,2,4,... (extra frames)
-                sampled = torch.flip(sampled, [0])         # reverse order
+                sampled = _sample_reversed_prefix_frames(pose_images, extra)
                 pose_images = torch.cat([sampled, pose_images], dim=0)
             if face_images is not None:
-                sampled = face_images[0:extra*2:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(face_images, extra)
                 face_images = torch.cat([sampled, face_images], dim=0)
             if bg_images is not None:
-                sampled = bg_images[0:extra*2:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(bg_images, extra)
                 bg_images = torch.cat([sampled, bg_images], dim=0)
             if mask is not None:
-                sampled = mask[0:extra*2:2]
-                sampled = torch.flip(sampled, [0])
+                sampled = _sample_reversed_prefix_frames(mask, extra)
                 mask = torch.cat([sampled, mask], dim=0)
         # -----------------------------------------------------------------
 
         if prefix_frames is not None:
-            effective_frames = num_frames - 45
+            effective_frames = num_frames - prefix_canvas_extra
         elif transition_video is not None:
             effective_frames = num_frames - 21
         else:
@@ -1381,7 +1386,7 @@ class WanVideoAnimateEmbeds:
             if prefix_pixel_data is not None:
                 resized_bg_images[:, :actual_prefix_px] = prefix_pixel_data.to(device, dtype=resized_bg_images.dtype)
                 log.info(f"Prefix: replaced first {actual_prefix_px} pixel frames of black canvas")
-                # If transition_video also present, embed last 20 frames into canvas positions 25-45
+                # If transition_video also present, embed last 20 frames into prefix transition area
                 if transition_video is not None:
                     tv = transition_video  # [B, H, W, C]
                     b_tv = tv.shape[0]
@@ -1392,8 +1397,8 @@ class WanVideoAnimateEmbeds:
                     if tv.shape[1] != H or tv.shape[2] != W:
                         tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
                     tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 20, H, W]
-                    resized_bg_images[:, 25:45] = tv.to(device, dtype=resized_bg_images.dtype)
-                    log.info("Prefix+Transition: embedded last 20 transition frames into canvas positions 25-45")
+                    resized_bg_images[:, prefix_transition_start:prefix_transition_end] = tv.to(device, dtype=resized_bg_images.dtype)
+                    log.info(f"Prefix+Transition: embedded last 20 transition frames into canvas positions {prefix_transition_start}-{prefix_transition_end}")
             # ==========================================================================
 
             # ============ Transition (no prefix): embed into canvas first 21 frames ============
@@ -1429,8 +1434,8 @@ class WanVideoAnimateEmbeds:
                     if tv.shape[1] != H or tv.shape[2] != W:
                         tv = common_upscale(tv.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
                     tv = tv.permute(3, 0, 1, 2)[:3] * 2 - 1  # [C, 20, H, W]
-                    resized_bg_images[:, 25:45] = tv.to(offload_device, dtype=resized_bg_images.dtype)
-                    log.info("Prefix+Transition (loop): embedded last 20 transition frames into canvas positions 25-45")
+                    resized_bg_images[:, prefix_transition_start:prefix_transition_end] = tv.to(offload_device, dtype=resized_bg_images.dtype)
+                    log.info(f"Prefix+Transition (loop): embedded last 20 transition frames into canvas positions {prefix_transition_start}-{prefix_transition_end}")
                 else:
                     if b_tv >= 21:
                         tv = tv[-21:]
@@ -1442,6 +1447,10 @@ class WanVideoAnimateEmbeds:
                     resized_bg_images[:, :21] = tv.to(offload_device, dtype=resized_bg_images.dtype)
                     log.info("Transition (loop): embedded first 21 pixel frames of canvas")
             # Prefix NOT embedded in canvas for looping — handled via prefix_ctx prepend later
+
+        prefix_ctx = None
+        prefix_T = 0
+        bg_mask = None
 
         if ref_images is not None:
             if ref_images.shape[1] != H or ref_images.shape[2] != W:
@@ -1456,8 +1465,6 @@ class WanVideoAnimateEmbeds:
             ref_latent_masked = torch.cat([msk, ref_latent], dim=0).to(offload_device) # 4+C 1 H W
 
             # ============ Prefix: VAE encode for looping (prepended to each chunk like ref) ============
-            prefix_ctx = None
-            prefix_T = 0
             if prefix_frames is not None and looping:
                 vae.to(device)
                 prefix_latent = vae.encode([prefix_pixel_data.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
@@ -1483,7 +1490,7 @@ class WanVideoAnimateEmbeds:
             if prefix_frames is not None:
                 bg_mask[:, :actual_prefix_px] = 1.0  # only actual prefix pixel frames
                 if transition_video is not None:
-                    bg_mask[:, 25:45] = 1.0
+                    bg_mask[:, prefix_transition_start:prefix_transition_end] = 1.0
             # ======= Transition (no prefix): set mask=1 for first 21 pixel frames =======
             elif transition_video is not None:
                 bg_mask[:, :21] = 1.0
@@ -1600,9 +1607,10 @@ class WanVideoAnimateEmbeds:
             "transition_latent": transition_latent,
             "transition_mask_values": transition_mask_values,
             "has_prefix": prefix_frames is not None,
-            "canvas_expansion_px": 45 if prefix_frames is not None else (21 if transition_video is not None else 0),
+            "canvas_expansion_px": prefix_canvas_extra if prefix_frames is not None else (21 if transition_video is not None else 0),
             "prefix_ctx": prefix_ctx,
             "prefix_T": prefix_T,
+            "prefix_prepend_latents": 6 if prefix_frames is not None else 0,
             "face_pixels": resized_face_images if face_images is not None else None,
             "num_frames": num_frames,
             "target_shape": target_shape,
