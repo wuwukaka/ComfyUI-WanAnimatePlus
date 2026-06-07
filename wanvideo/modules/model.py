@@ -6,6 +6,7 @@
 #   - Added context window start/context shape entries to Comfy RoPE generation and cache keys.
 #   - Added variable WanAnimate anchor count support for pose and face embedding offsets.
 #   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
+#   - Added simple T2V text/time embedding caches and guarded no-op device moves.
 # Licensed under the Apache License, Version 2.0
 import math
 import torch
@@ -38,6 +39,18 @@ from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
 
 __all__ = ['WanModel']
+
+def _module_first_device(module):
+    for tensor in module.parameters(recurse=True):
+        return tensor.device
+    for tensor in module.buffers(recurse=True):
+        return tensor.device
+    return None
+
+def _module_to_if_needed(module, device, **kwargs):
+    target_device = torch.device(device)
+    if _module_first_device(module) != target_device:
+        module.to(target_device, **kwargs)
 
 def apply_rotary_emb_split(hidden_states, freqs_cis, t_dim):
     """Apply rotary embedding only to the spatial (H/W) dimensions, leaving temporal (T) unchanged."""
@@ -3516,7 +3529,7 @@ class WanModel(torch.nn.Module):
                       context_frame_shapes=None, context_window_start=0, ntk_alphas=None):
         """Streamlined T2V forward — no block swap, no extra checks, ~15x faster."""
         device = self.main_device
-        self.original_patch_embedding.to(device)
+        _module_to_if_needed(self.original_patch_embedding, device)
         _, F, H, W = x[0].shape
         x = [self.original_patch_embedding(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], device=device, dtype=torch.long) for u in x])
@@ -3564,28 +3577,50 @@ class WanModel(torch.nn.Module):
             freqs = freqs.to(device)
 
         # Time embedding (must produce [batch, 6, dim] for block.get_mod compatibility)
-        self.time_embedding.to(device)
+        _module_to_if_needed(self.time_embedding, device)
         time_embed_dtype = self.time_embedding[0].weight.dtype
-        e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(time_embed_dtype))
-        if hasattr(self, 'time_projection'):
-            e = self.time_projection(e_raw).unflatten(1, (6, self.dim))  # [batch, 6, dim]
+        time_projection_enabled = hasattr(self, 'time_projection')
+        if time_projection_enabled:
+            _module_to_if_needed(self.time_projection, device)
+        cached_time = getattr(self, "_t2v_time_embed_cache", None)
+        if (cached_time is not None and cached_time[0] is t and cached_time[1] == device
+                and cached_time[2] == time_embed_dtype and cached_time[3] == time_projection_enabled):
+            e_raw, e = cached_time[4], cached_time[5]
         else:
-            # Fallback: block expects [batch, 6, dim] via add with nn.Parameter([1, 6, dim])
-            e = e_raw.reshape(1, 6, self.dim)
-
-        # Validate time embedding format for block.get_mod
-        if e.dim() < 3 or e.shape[1] != 6:
-            e = e.reshape(1, 6, self.dim)
+            e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(time_embed_dtype))
+            if time_projection_enabled:
+                e = self.time_projection(e_raw).unflatten(1, (6, self.dim))  # [batch, 6, dim]
+            else:
+                # Fallback: block expects [batch, 6, dim] via add with nn.Parameter([1, 6, dim])
+                e = e_raw.reshape(1, 6, self.dim)
+            if e.dim() < 3 or e.shape[1] != 6:
+                e = e.reshape(1, 6, self.dim)
+            self._t2v_time_embed_cache = (t, device, time_embed_dtype, time_projection_enabled, e_raw, e)
 
         # Convert context from List[Tensor] to Tensor (same as main forward path)
         if hasattr(self, "text_embedding") and isinstance(context, list) and context != []:
             text_embed_dtype = self.text_embedding[0].weight.dtype
             if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
                 text_embed_dtype = self.base_dtype
-            if getattr(self, 'offload_txt_emb', False):
-                self.text_embedding.to(device)
-            context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]).to(text_embed_dtype)
-            context = self.text_embedding(context.to(device))
+            text_cache_key = (
+                tuple((id(u), u.data_ptr(), tuple(u.shape), u.dtype, u.device, getattr(u, "_version", 0)) for u in context),
+                text_embed_dtype,
+                device,
+                self.text_len,
+            )
+            text_cache = getattr(self, "_t2v_text_embed_cache", None)
+            if text_cache is None:
+                text_cache = {}
+                self._t2v_text_embed_cache = text_cache
+            cached_context = text_cache.get(text_cache_key)
+            if cached_context is None:
+                _module_to_if_needed(self.text_embedding, device)
+                padded_context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]).to(text_embed_dtype)
+                cached_context = self.text_embedding(padded_context.to(device))
+                if len(text_cache) >= 4:
+                    text_cache.clear()
+                text_cache[text_cache_key] = cached_context
+            context = cached_context
 
         # Block loop with minimal swap + prefetch (no per-block feature checks)
         blocks_to_swap = getattr(self, 'blocks_to_swap', 0)
@@ -3593,7 +3628,9 @@ class WanModel(torch.nn.Module):
         prefetch_blocks = getattr(self, 'prefetch_blocks', 0)
         swap_stream = getattr(self, 'swap_cuda_stream', None)
         use_non_blocking = getattr(self, 'use_non_blocking', False)
-        import time as _time
+        block_swap_debug = getattr(self, 'block_swap_debug', False)
+        if block_swap_debug:
+            import time as _time
         for b, block in enumerate(self.blocks):
             if b >= swap_start_idx and blocks_to_swap > 0:
                 block.to(device, non_blocking=use_non_blocking)
@@ -3604,10 +3641,10 @@ class WanModel(torch.nn.Module):
                     if next_b >= swap_start_idx:
                         with torch.cuda.stream(swap_stream):
                             self.blocks[next_b].to(device, non_blocking=use_non_blocking)
-            if getattr(self, 'block_swap_debug', False):
+            if block_swap_debug:
                 compute_start = _time.perf_counter()
             x, _, _, _ = block(x, e, seq_lens, grid_sizes, freqs, context, 0, last_step=False)
-            if getattr(self, 'block_swap_debug', False):
+            if block_swap_debug:
                 compute_time = _time.perf_counter() - compute_start
                 log.info(f"Block {b}: compute_time={compute_time:.4f}s")
             if prefetch_blocks > 0 and swap_stream is not None:
