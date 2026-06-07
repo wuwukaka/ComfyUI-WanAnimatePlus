@@ -1,4 +1,12 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Modified from wanvideo/modules/model.py in ComfyUI-WanVideoWrapper.
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Added Bernini in-context latent tokens with patch-size padding.
+#   - Added Bernini source_id RoPE rotation matrix helper and context RoPE segments.
+#   - Added context window start/context shape entries to Comfy RoPE generation and cache keys.
+#   - Added variable WanAnimate anchor count support for pose and face embedding offsets.
+#   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
+# Licensed under the Apache License, Version 2.0
 import math
 import torch
 import torch.nn as nn

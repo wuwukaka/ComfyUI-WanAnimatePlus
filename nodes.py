@@ -1,9 +1,14 @@
 # Copyright (c) 2025 kijai
-# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
-#   - Added prefix_frames support to WanVideoAnimateEmbeds for multi-reference guidance
-#   - Added transition_video canvas embedding for seamless video continuation
-#   - Added canvas_expansion_px trimming to WanVideoDecode
-#   - Added WanAnimatePlus signature widget to the embeds node
+# Modified from nodes.py in ComfyUI-WanVideoWrapper.
+# Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Added prefix_frames support and reversed-prefix sampling for WanVideoAnimateEmbeds.
+#   - Added transition_video, transition/outfit layouts, and canvas_expansion_px output trimming.
+#   - Added prefix/transition metadata for sampler-side context-window and looping continuation.
+#   - Added WanAnimatePlusEverAnimateEmbeds with anchors, pose/face, bg/mask, pingpong, random/user-first anchors, repeat-anchor padding, and offload controls.
+#   - Added WanAnimatePlusBernini with context_latents/context_roles for source video, reference video, and reference images.
+#   - Added Bernini task guidance recommendations and native-aspect reference resizing.
+#   - Added WanAnimatePlus signature widget to the embeds node.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math
 import torch

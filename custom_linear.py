@@ -1,3 +1,10 @@
+# Modified from custom_linear.py in ComfyUI-WanVideoWrapper.
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Renamed custom torch ops from wanvideo::* to wananimateplus::* to avoid collisions.
+#   - Added guarded custom op registration for duplicate imports/stale bytecode.
+#   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
+#   - Added MXFP8/block-wise scale_weight expansion before linear forward.
+# Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights

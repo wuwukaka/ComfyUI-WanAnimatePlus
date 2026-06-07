@@ -1,8 +1,12 @@
 # Copyright (c) 2025 kijai
-# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
-#   - Registers a complete WanAnimatePlus workflow node chain with renamed node keys
-#   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility
-#   - Keeps WanAnimatePlus nodes isolated from original WanVideoWrapper node names
+# Modified from __init__.py in ComfyUI-WanVideoWrapper.
+# Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Registers a WanAnimatePlus-specific workflow node chain with renamed node keys.
+#   - Adds WanAnimatePlus Bernini and EverAnimate embeds nodes to the public mappings.
+#   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility.
+#   - Forces registered node categories to WanAnimatePlus.
+#   - Keeps WanAnimatePlus nodes isolated from original WanVideoWrapper node names.
 # Licensed under the Apache License, Version 2.0
 try:
     from .utils import check_duplicate_nodes, log, color_text

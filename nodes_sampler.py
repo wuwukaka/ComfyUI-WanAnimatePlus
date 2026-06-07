@@ -1,8 +1,15 @@
 # Copyright (c) 2025 kijai
-# Modified from the original work (https://github.com/kijai/ComfyUI-WanVideoWrapper)
-#   - Added prefix frame support in WanVideoSampler context windows
-#   - Added transition-aware context window handling
-#   - Added canvas_expansion_px awareness for Uni3C render_latent padding
+# Modified from nodes_sampler.py in ComfyUI-WanVideoWrapper.
+# Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Added APG, APG-chain, and Bernini CFG-chain guidance modes.
+#   - Added sampler no-grad protection to prevent denoising graph accumulation.
+#   - Added Bernini context_latents/context_roles propagation, RoPE override, window slicing, and simple T2V/Bernini fast-path routing.
+#   - Added prefix frame support in context windows, looping, face/pose slices, image conditions, and noise predictions.
+#   - Added transition_video hard conditioning and canvas_expansion_px-aware Uni3C/render/output handling.
+#   - Added EverAnimate segmented sampling with anchors, generated/random/user-first anchors, repeat-anchor padding, bg/mask conditioning, motion latents, and internal context-option blocking.
+#   - Added EverAnimate VAE re-encode clamp/uint8 preprocessing to match the reference path.
+#   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy
 import torch
@@ -2325,11 +2332,17 @@ class WanVideoSampler:
                         return [0, 1, fallback]
                     return [0, best_pair[0], best_pair[1]]
 
+                def _ea_preprocess_decoded_anchor_frame(frame):
+                    # Match the reference path: VAE decode -> RGB uint8/PIL -> preprocess_image [-1, 1].
+                    frame = frame.to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
+                    frame_u8 = ((frame + 1.0) * 127.5).clamp(0.0, 255.0).to(torch.uint8)
+                    return frame_u8.to(device=device, dtype=torch.float32).div(127.5).sub(1.0).to(vae.dtype)
+
                 def _ea_encode_anchor_frames(video_cthw, frame_indices):
                     encoded = []
                     vae.to(device)
                     for frame_idx in frame_indices:
-                        frame = video_cthw[:, frame_idx:frame_idx + 1].to(device, vae.dtype)
+                        frame = _ea_preprocess_decoded_anchor_frame(video_cthw[:, frame_idx:frame_idx + 1])
                         encoded.append(vae.encode([frame], device, tiled=tiled_vae, pbar=False)[0][:, :1].to(device, dtype))
                     return encoded
 
