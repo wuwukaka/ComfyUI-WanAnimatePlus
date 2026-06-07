@@ -3525,6 +3525,20 @@ class WanVideoSampler:
                     else:
                         pbar.update(1)
 
+                    # Release per-step tensor references after all scheduler/callback work is done.
+                    noise_pred = noise_pred_in = noise_pred_ovi = None
+                    noise_pred_flipped = None
+                    latent_model_input = latent_model_input_ovi = None
+                    latent_model_input_flipped = None
+                    latent_flipped = latent_backwards = raw_latent = None
+                    timestep = orig_timestep = None
+                    noise_for_cond = timestep_cond = None
+                    counter = partial_latent_model_input = prefix_noise = None
+                    partial_img_emb = partial_control_latents = partial_control_camera_latents = None
+                    partial_vace_context = partial_audio_proj = partial_s2v_audio_input = None
+                    partial_s2v_pose = partial_add_cond = None
+                    partial_wananim_face_pixels = partial_wananim_pose_latents = None
+
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
                 raise
