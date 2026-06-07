@@ -52,6 +52,12 @@ def _module_to_if_needed(module, device, **kwargs):
     if _module_first_device(module) != target_device:
         module.to(target_device, **kwargs)
 
+def _tensor_cache_version(tensor):
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
+
 def apply_rotary_emb_split(hidden_states, freqs_cis, t_dim):
     """Apply rotary embedding only to the spatial (H/W) dimensions, leaving temporal (T) unchanged."""
     t_part, hw_part = torch.split(hidden_states, [t_dim, hidden_states.shape[-1] - t_dim], dim=-1)
@@ -3603,7 +3609,7 @@ class WanModel(torch.nn.Module):
             if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
                 text_embed_dtype = self.base_dtype
             text_cache_key = (
-                tuple((id(u), u.data_ptr(), tuple(u.shape), u.dtype, u.device, getattr(u, "_version", 0)) for u in context),
+                tuple((id(u), u.data_ptr(), tuple(u.shape), u.dtype, u.device, _tensor_cache_version(u)) for u in context),
                 text_embed_dtype,
                 device,
                 self.text_len,
