@@ -6,7 +6,7 @@
 #   - Added context window start/context shape entries to Comfy RoPE generation and cache keys.
 #   - Added variable WanAnimate anchor count support for pose and face embedding offsets.
 #   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
-#   - Added simple T2V text/time embedding caches and guarded no-op device moves.
+#   - Added simple T2V text/time embedding caches, cache-key helpers, and guarded no-op device moves.
 # Licensed under the Apache License, Version 2.0
 import math
 import torch
@@ -57,6 +57,25 @@ def _tensor_cache_version(tensor):
         return tensor._version
     except RuntimeError:
         return None
+
+def _t2v_context_cache_key(context, text_embed_dtype, device, text_len):
+    """Build a stable key for the WanAnimatePlus T2V/Bernini text cache."""
+    return (
+        tuple(
+            (
+                id(u),
+                u.data_ptr(),
+                tuple(u.shape),
+                u.dtype,
+                u.device,
+                _tensor_cache_version(u),
+            )
+            for u in context
+        ),
+        text_embed_dtype,
+        device,
+        text_len,
+    )
 
 def apply_rotary_emb_split(hidden_states, freqs_cis, t_dim):
     """Apply rotary embedding only to the spatial (H/W) dimensions, leaving temporal (T) unchanged."""
@@ -3608,12 +3627,7 @@ class WanModel(torch.nn.Module):
             text_embed_dtype = self.text_embedding[0].weight.dtype
             if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
                 text_embed_dtype = self.base_dtype
-            text_cache_key = (
-                tuple((id(u), u.data_ptr(), tuple(u.shape), u.dtype, u.device, _tensor_cache_version(u)) for u in context),
-                text_embed_dtype,
-                device,
-                self.text_len,
-            )
+            text_cache_key = _t2v_context_cache_key(context, text_embed_dtype, device, self.text_len)
             text_cache = getattr(self, "_t2v_text_embed_cache", None)
             if text_cache is None:
                 text_cache = {}

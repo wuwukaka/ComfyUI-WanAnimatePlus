@@ -41,8 +41,8 @@ The wuwukasi/wuwukaka additions include, without limitation:
   native-aspect reference preprocessing.
 - EverAnimate embeds support, anchor selection and padding, pose/face/bg/mask
   conditioning, ping-pong sequence handling, and related sampling safeguards.
-- Sampler changes for WanAnimatePlus context windows, prefix handling, looping
-  continuation, cache handling, no-grad/inference tensor safeguards, and fast
-  path optimizations.
+- Sampler/model changes for WanAnimatePlus context windows, prefix handling,
+  looping continuation, cache handling, no-grad/inference tensor safeguards,
+  T2V/Bernini fast path optimizations, and fast-path cache-key helpers.
 - Custom linear operation registration safeguards and WanAnimatePlus-specific
   custom op handling.
