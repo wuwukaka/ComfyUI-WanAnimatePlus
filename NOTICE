@@ -32,7 +32,8 @@ minimum:
 
 The wuwukasi/wuwukaka additions include, without limitation:
 
-- WanAnimatePlus-specific node registration and renamed workflow node chain.
+- WanAnimatePlus-specific node registration, node renaming, and integration
+  glue for added features.
 - Prefix frame conditioning, transition video conditioning, transition/outfit
   layouts, canvas expansion trimming, and sampler-side continuation metadata.
 - Bernini in-context conditioning, context_latents/context_roles propagation,
