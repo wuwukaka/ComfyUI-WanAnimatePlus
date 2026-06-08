@@ -201,4 +201,8 @@ Every contribution, no matter how small, means a lot and helps me dedicate more 
 
 ## License
 
-Based on the original project, released under **Apache License, Version 2.0**. Modified files include copyright attribution and modification notices in their headers.
+This project is an independently maintained fork / derivative project based on [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) and is released under the **Apache License, Version 2.0**. Thanks again to kijai and the original contributors for their work.
+
+Modified portions and newly added code are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
+
+The wuwukasi/wuwukaka additions include the WanAnimatePlus node chain, prefix/transition video conditioning, Bernini in-context conditioning, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, and related custom-op handling.

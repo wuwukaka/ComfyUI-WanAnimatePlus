@@ -1,0 +1,47 @@
+ComfyUI-WanAnimatePlus
+Copyright (c) 2026 wuwukasi/wuwukaka
+
+This project is an independently maintained fork / derivative project based on
+kijai/ComfyUI-WanVideoWrapper:
+https://github.com/kijai/ComfyUI-WanVideoWrapper
+
+The original ComfyUI-WanVideoWrapper project and its original portions remain
+copyrighted by kijai and its contributors. Deep thanks to kijai for the work
+that made this project possible.
+
+This project is distributed under the Apache License, Version 2.0. See LICENSE.
+
+Modified portions and newly added code in this repository are Copyright (c)
+2026 wuwukasi/wuwukaka. Redistribution of this project, derivative works, or
+modifications that include or are based on these modified portions must retain
+this NOTICE and the copyright/modification notices in the relevant source files.
+
+Projects that use, copy, adapt, or modify the wuwukasi/wuwukaka portions must
+include a detailed modification notice in accompanying documentation, such as a
+README, NOTICE file, or equivalent attribution document. The notice should, at
+minimum:
+
+- Identify that the work includes code derived from ComfyUI-WanAnimatePlus by
+  wuwukasi/wuwukaka.
+- Identify the affected modules, files, or feature areas derived from
+  wuwukasi/wuwukaka additions.
+- Describe the downstream modifications made to those portions, if any.
+- Retain existing copyright headers and modification notices in modified source
+  files, and add new prominent notices for downstream changes.
+- Avoid implying endorsement by kijai, wuwukasi/wuwukaka, or other contributors.
+
+The wuwukasi/wuwukaka additions include, without limitation:
+
+- WanAnimatePlus-specific node registration and renamed workflow node chain.
+- Prefix frame conditioning, transition video conditioning, transition/outfit
+  layouts, canvas expansion trimming, and sampler-side continuation metadata.
+- Bernini in-context conditioning, context_latents/context_roles propagation,
+  Bernini source_id RoPE handling, context-window slicing, guidance modes, and
+  native-aspect reference preprocessing.
+- EverAnimate embeds support, anchor selection and padding, pose/face/bg/mask
+  conditioning, ping-pong sequence handling, and related sampling safeguards.
+- Sampler changes for WanAnimatePlus context windows, prefix handling, looping
+  continuation, cache handling, no-grad/inference tensor safeguards, and fast
+  path optimizations.
+- Custom linear operation registration safeguards and WanAnimatePlus-specific
+  custom op handling.
