@@ -3,7 +3,7 @@
 # Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 #   - Added APG, APG-chain, and Bernini CFG-chain guidance modes.
-#   - Added sampler no-grad protection to prevent denoising graph accumulation.
+#   - Added sampler graph-detach protection to prevent denoising graph accumulation.
 #   - Added Bernini context_latents/context_roles propagation, RoPE override, window slicing, and simple T2V/Bernini fast-path routing.
 #   - Added prefix frame support in context windows, looping, face/pose slices, image conditions, and noise predictions.
 #   - Added transition_video hard conditioning and canvas_expansion_px-aware Uni3C/render/output handling.
@@ -165,7 +165,6 @@ class WanVideoSampler:
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
-    @torch.no_grad()
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
