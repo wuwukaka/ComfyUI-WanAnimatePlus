@@ -6,7 +6,7 @@ Multi-reference image injection and seamless video connection for ComfyUI's WanA
 
 ## Overview
 
-`ComfyUI-WanAnimatePlus` adds three major feature groups to the WanVideo workflow:
+`ComfyUI-WanAnimatePlus` adds four major feature groups to the WanVideo workflow:
 
 ### prefix_frames & transition_video
 
@@ -26,6 +26,10 @@ Use cases:
 - Motion transfer with multi-reference control
 - Video editing with source video + reference images
 - Reference-to-video generation
+
+### SCAIL-2 Embeds
+
+Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. It prepares reference image, driving pose, colored pose mask, reference mask, and optional prefix/transition hard-freeze latents for the WanAnimatePlus sampler.
 
 ## Demo
 
@@ -64,6 +68,16 @@ Generates condition latents from source video, reference video, and/or reference
 - Reference images kept at native aspect ratio
 - Compatible with context windows
 
+### SCAIL-2
+
+Provides SCAIL-2 ref / pose / mask conditioning through `WanAnimatePlus SCAIL_2 Embeds`.
+
+- Encodes `ref_image`, `pose_images`, `pose_image_mask`, and `reference_image_mask`
+- Aligns SCAIL-2 inputs to 32-pixel multiples before VAE encoding
+- Supports animation and replacement modes
+- Supports optional `prefix_frames` and `transition_video` hard-freeze conditioning
+- Supports context-window sampling; non-first windows can see prepended prefix/transition context without fusing those prepended predictions
+
 ## Installation
 
 Place this repository into ComfyUI's `custom_nodes` directory:
@@ -75,7 +89,7 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 Restart ComfyUI after installation.
 
-> **Important**: To use `prefix_frames`, `transition_video`, or `Bernini`, you **must** replace the full workflow chain with WanAnimatePlus nodes. Mixing WanAnimatePlus nodes with original WanVideoWrapper nodes in the same workflow will result in degraded output.
+> **Important**: To use `prefix_frames`, `transition_video`, `Bernini`, or `SCAIL_2 Embeds`, you **must** replace the full workflow chain with WanAnimatePlus nodes. Mixing WanAnimatePlus nodes with original WanVideoWrapper nodes in the same workflow will result in degraded output.
 
 ## Quick Start
 
@@ -106,6 +120,7 @@ Core nodes:
 - `WanAnimatePlus SamplerExtraArgs`
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
+- `WanAnimatePlus SCAIL_2 Embeds`
 
 ### WanAnimatePlus AnimateEmbeds
 
@@ -138,6 +153,28 @@ Generates condition latents from source video, reference video, and/or reference
 | `tiled_vae` | Use tiled VAE encoding for memory savings |
 
 The task (v2v, rv2v, r2v, t2v) is automatically inferred from which inputs are connected.
+
+### WanAnimatePlus SCAIL_2 Embeds
+
+Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCAIL-2 checkpoints that include the pose and mask streams.
+
+**Inputs:**
+
+| Input | Description |
+|------|------|
+| `vae` | VAE model for encoding |
+| `width` / `height` / `num_frames` | Target dimensions; width and height are aligned to multiples of 32 |
+| `ref_image` | Reference image for SCAIL-2 conditioning |
+| `pose_images` | Driving pose video/images, encoded at half resolution |
+| `pose_image_mask` | Colored per-identity pose mask sequence |
+| `reference_image_mask` | Colored reference mask image |
+| `replacement_mode` | Enables SCAIL-2 replacement-mode RoPE and reference-mask compositing |
+| `prefix_frames` | Optional frames to hard-freeze at the front of the latent sequence |
+| `transition_video` | Optional transition frames to hard-freeze at the front of the latent sequence |
+| `clip_embeds` | Optional CLIP vision features from `WanAnimatePlus ClipVisionEncode` |
+| `force_offload` / `tiled_vae` | Memory controls for VAE encoding |
+
+For short generations, context windows are optional. For long generations or low VRAM, context windows are recommended. In context-window mode, the sampler prepends protected prefix/transition latents for model context and removes those prepended predictions before overlap fusion.
 
 ## Project Structure
 
@@ -205,4 +242,4 @@ This project is an independently maintained fork / derivative project based on [
 
 Modified portions and newly added code are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
 
-The wuwukasi/wuwukaka additions include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini in-context conditioning, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, and related custom-op handling.
+The wuwukasi/wuwukaka additions include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini in-context conditioning, SCAIL-2 embeds support, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, and related custom-op handling.

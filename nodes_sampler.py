@@ -10,6 +10,7 @@
 #   - Added EverAnimate segmented sampling with anchors, generated/random/user-first anchors, repeat-anchor padding, bg/mask conditioning, motion latents, and internal context-option blocking.
 #   - Added EverAnimate VAE re-encode clamp/uint8 preprocessing to match the reference path.
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
+#   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy
 import torch
@@ -575,6 +576,7 @@ class WanVideoSampler:
         transition_mask_values = image_embeds.get("transition_mask_values", None)
         transition_len = transition_latent.shape[1] if transition_latent is not None else 0
         has_transition = transition_latent is not None
+        scail_prefix_prepend_latents = int(image_embeds.get("scail_prefix_prepend_latents", 0))
 
 
         if has_transition:
@@ -828,7 +830,7 @@ class WanVideoSampler:
             vae = s2v_audio_embeds.get("vae", None)
 
         # vid2vid
-        noise_mask=original_image=None
+        noise_mask = original_image = scail_freeze_mask = None
         if samples is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling:
             saved_generator_state = samples.get("generator_state", None)
             if saved_generator_state is not None:
@@ -862,6 +864,66 @@ class WanVideoSampler:
                         mode='trilinear',
                         align_corners=False
                     ).repeat(1, noise.shape[0], 1, 1, 1)
+
+        scail_freeze_latents = image_embeds.get("scail_freeze_latents", None)
+        if scail_freeze_latents is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling:
+            freeze_latents = scail_freeze_latents
+            if freeze_latents.ndim == 5:
+                freeze_latents = freeze_latents.squeeze(0)
+            if freeze_latents.shape[0] != noise.shape[0]:
+                raise ValueError(f"SCAIL-2 freeze latent channels {freeze_latents.shape[0]} do not match target channels {noise.shape[0]}")
+
+            freeze_latents = freeze_latents.to(noise)
+            if freeze_latents.shape[1] < noise.shape[1]:
+                pad = torch.zeros(
+                    freeze_latents.shape[0], noise.shape[1] - freeze_latents.shape[1],
+                    freeze_latents.shape[2], freeze_latents.shape[3],
+                    device=freeze_latents.device, dtype=freeze_latents.dtype,
+                )
+                freeze_latents = torch.cat([freeze_latents, pad], dim=1)
+            elif freeze_latents.shape[1] > noise.shape[1]:
+                freeze_latents = freeze_latents[:, :noise.shape[1]]
+
+            if freeze_latents.shape[2:] != noise.shape[2:]:
+                freeze_latents = torch.nn.functional.interpolate(
+                    freeze_latents.unsqueeze(0),
+                    size=(noise.shape[1], noise.shape[2], noise.shape[3]),
+                    mode="trilinear",
+                    align_corners=False,
+                )[0]
+
+            raw_freeze_mask = image_embeds.get("scail_freeze_mask", None)
+            if raw_freeze_mask is None:
+                raw_freeze_mask = torch.ones(
+                    freeze_latents.shape[1], freeze_latents.shape[2], freeze_latents.shape[3],
+                    device=freeze_latents.device, dtype=freeze_latents.dtype,
+                )
+            if raw_freeze_mask.ndim == 5:
+                raw_freeze_mask = raw_freeze_mask.squeeze(0).squeeze(0)
+            elif raw_freeze_mask.ndim == 4:
+                raw_freeze_mask = raw_freeze_mask.squeeze(0) if raw_freeze_mask.shape[0] == 1 else raw_freeze_mask[0]
+            raw_freeze_mask = raw_freeze_mask.to(noise)
+            if raw_freeze_mask.shape[0] < noise.shape[1]:
+                pad = torch.zeros(
+                    noise.shape[1] - raw_freeze_mask.shape[0], raw_freeze_mask.shape[1], raw_freeze_mask.shape[2],
+                    device=raw_freeze_mask.device, dtype=raw_freeze_mask.dtype,
+                )
+                raw_freeze_mask = torch.cat([raw_freeze_mask, pad], dim=0)
+            elif raw_freeze_mask.shape[0] > noise.shape[1]:
+                raw_freeze_mask = raw_freeze_mask[:noise.shape[1]]
+
+            scail_freeze_mask = torch.nn.functional.interpolate(
+                raw_freeze_mask.unsqueeze(0).unsqueeze(0),
+                size=(noise.shape[1], noise.shape[2], noise.shape[3]),
+                mode="trilinear",
+                align_corners=False,
+            ).repeat(1, noise.shape[0], 1, 1, 1).to(device)
+
+            base_noise = noise.to(device)
+            original_image = freeze_latents.to(device)
+            freeze = scail_freeze_mask[0].to(base_noise)
+            noise = (original_image * freeze + base_noise * (1 - freeze)).detach()
+            log.info(f"SCAIL-2 freeze_mask active: protecting {int((raw_freeze_mask > 0).any(dim=(1, 2)).sum().item())} latent frames")
 
         # extra latents (Pusa) and 5b
         latents_to_insert = add_index = noise_multipliers = None
@@ -1304,7 +1366,7 @@ class WanVideoSampler:
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
                              wananim_face_pixels=None, wananim_num_anchor_latents=1, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
-                             context_latents=None, context_roles=None, context_window_start=0,):
+                             context_latents=None, context_roles=None, context_window_start=0, scail_context_prepend_latents=0,):
             nonlocal transformer
             nonlocal audio_cfg_scale
 
@@ -1540,10 +1602,61 @@ class WanVideoSampler:
                 scail_data_in = None
                 if scail_data is not None:
                     ref_concat_mask = torch.zeros_like(z[:4])
+                    if scail_freeze_mask is not None:
+                        history_mask = scail_freeze_mask[0, :4].to(z)
+                        if context_window is not None:
+                            history_parts = []
+                            if scail_context_prepend_latents > 0:
+                                history_parts.append(history_mask[:, :scail_context_prepend_latents])
+                            history_parts.append(history_mask[:, context_window])
+                            history_mask = torch.cat(history_parts, dim=1)
+                        else:
+                            history_mask = history_mask[:, :z.shape[1]]
+                        if history_mask.shape[1] < z.shape[1]:
+                            pad = torch.zeros(
+                                history_mask.shape[0], z.shape[1] - history_mask.shape[1],
+                                history_mask.shape[2], history_mask.shape[3],
+                                device=history_mask.device, dtype=history_mask.dtype,
+                            )
+                            history_mask = torch.cat([history_mask, pad], dim=1)
+                        elif history_mask.shape[1] > z.shape[1]:
+                            history_mask = history_mask[:, :z.shape[1]]
+                        if history_mask.shape[2:] != z.shape[2:]:
+                            history_mask = torch.nn.functional.interpolate(
+                                history_mask.unsqueeze(0),
+                                size=(z.shape[1], z.shape[2], z.shape[3]),
+                                mode="trilinear",
+                                align_corners=False,
+                            )[0]
+                        ref_concat_mask = history_mask
                     z = torch.cat([z, ref_concat_mask])
                     if context_window is not None:
                         scail_data_in = scail_data.copy()
-                        scail_data_in["pose_latent"] = scail_data["pose_latent"][:, context_window]
+                        if scail_data.get("pose_latent", None) is not None:
+                            pose_parts = []
+                            if scail_context_prepend_latents > 0:
+                                pose_parts.append(scail_data["pose_latent"][:, :scail_context_prepend_latents])
+                            pose_parts.append(scail_data["pose_latent"][:, context_window])
+                            scail_data_in["pose_latent"] = torch.cat(pose_parts, dim=1)
+                        if scail_data.get("sam_latents", None) is not None:
+                            sam_parts = []
+                            if scail_context_prepend_latents > 0:
+                                sam_parts.append(scail_data["sam_latents"][:, :scail_context_prepend_latents])
+                            sam_parts.append(scail_data["sam_latents"][:, context_window])
+                            scail_data_in["sam_latents"] = torch.cat(sam_parts, dim=1)
+                        ref_mask_latents = scail_data.get("ref_mask_latents", None)
+                        if ref_mask_latents is not None:
+                            ref_latent = scail_data.get("ref_latent_pos", scail_data.get("ref_latent_neg", None))
+                            ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
+                            ref_mask_prefix = ref_mask_latents[:, :ref_count]
+                            ref_mask_target = ref_mask_latents[:, ref_count:]
+                            if ref_mask_target.shape[1] > 0:
+                                target_parts = []
+                                if scail_context_prepend_latents > 0:
+                                    target_parts.append(ref_mask_target[:, :scail_context_prepend_latents])
+                                target_parts.append(ref_mask_target[:, context_window])
+                                ref_mask_target = torch.cat(target_parts, dim=1)
+                            scail_data_in["ref_mask_latents"] = torch.cat([ref_mask_prefix, ref_mask_target], dim=1)
                     else:
                         scail_data_in = scail_data
 
@@ -1857,7 +1970,11 @@ class WanVideoSampler:
                     elif guidance_mode not in ("cfg_chain", "apg_chain"):
                         base_params['z'] = [z] * 2
                         base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
-                        base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
+                        if clip_fea is not None:
+                            uncond_clip_fea = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            base_params['clip_fea'] = torch.cat([clip_fea, uncond_clip_fea], dim=0)
+                        else:
+                            base_params['clip_fea'] = None
                         cache_state_uncond = None
                         [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = transformer(
                             context=positive_embeds + negative_embeds, is_uncond=False,
@@ -2080,7 +2197,9 @@ class WanVideoSampler:
 
         # Differential diffusion prep
         masks = None
-        if not multitalk_sampling and samples is not None and noise_mask is not None:
+        if not multitalk_sampling and scail_freeze_mask is not None:
+            masks = scail_freeze_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device) > 0.5
+        elif not multitalk_sampling and samples is not None and noise_mask is not None:
             thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
             thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
             masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
@@ -2761,6 +2880,11 @@ class WanVideoSampler:
                             if latents_to_insert is not None and c[0] != 0:
                                 partial_latent_model_input[:, :1] = latents_to_insert
 
+                            scail_window_prepend_latents = scail_prefix_prepend_latents if c[0] != 0 else 0
+                            if scail_window_prepend_latents > 0:
+                                prefix_noise = latent_model_input[:, :scail_window_prepend_latents].to(device)
+                                partial_latent_model_input = torch.cat([prefix_noise, partial_latent_model_input], dim=1)
+
                             # ============ Prefix: prepend noise for cached prefix context ============
                             if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
                                 prefix_noise = latent_model_input[:, :prefix_prepend_latents].to(device)
@@ -2857,8 +2981,13 @@ class WanVideoSampler:
                                 image_cond_in = None
                             # ========================================
                             original_seq_len = seq_len
+                            prepend_seq_latents = 0
                             if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
-                                seq_len = original_seq_len + prefix_prepend_latents * base_patches_per_frame
+                                prepend_seq_latents += prefix_prepend_latents
+                            if scail_window_prepend_latents > 0:
+                                prepend_seq_latents += scail_window_prepend_latents
+                            if prepend_seq_latents > 0:
+                                seq_len = original_seq_len + prepend_seq_latents * base_patches_per_frame
                             # Slice context_latents for current context window
                             sliced_context_latents = None
                             if context_latents is not None:
@@ -2880,7 +3009,7 @@ class WanVideoSampler:
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                                 wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
                                 uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent, context_latents=sliced_context_latents,
-                                context_roles=context_roles, context_window_start=0)
+                                context_roles=context_roles, context_window_start=0, scail_context_prepend_latents=scail_window_prepend_latents)
 
                             seq_len = original_seq_len  # restore seq_len
 
@@ -2888,6 +3017,8 @@ class WanVideoSampler:
                             if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
                                 noise_pred_context = noise_pred_context[:, prefix_prepend_latents:]
                             # ==============================================================
+                            if scail_window_prepend_latents > 0:
+                                noise_pred_context = noise_pred_context[:, scail_window_prepend_latents:]
 
                             if cache_args is not None:
                                 self.window_tracker.cache_states[window_id] = new_teacache
@@ -3490,11 +3621,15 @@ class WanVideoSampler:
 
                     # differential diffusion inpaint
                     if masks is not None:
-                        if idx < len(timesteps) - 1:
+                        image_latent = None
+                        if scail_freeze_mask is not None:
+                            image_latent = original_image.to(device)
+                        elif idx < len(timesteps) - 1:
                             noise_timestep = timesteps[idx+1]
                             image_latent = sample_scheduler.scale_noise(
                                 original_image.to(device), torch.tensor([noise_timestep]), noise.to(device)
                             )
+                        if image_latent is not None:
                             mask = masks[idx].to(latent)
                             latent = image_latent * mask + latent * (1-mask)
 

@@ -2277,7 +2277,7 @@ class WanModel(torch.nn.Module):
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
                           steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
                           ref_frame_index=10, longcat_num_ref_latents=0, num_memory_frames=3, rope_negative_offset=0,
-                          context_frame_shapes=None, context_window_start=0):
+                          context_frame_shapes=None, context_window_start=0, scail_ref_frame_shape=None, ref_mask_flag=None):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
@@ -2290,6 +2290,49 @@ class WanModel(torch.nn.Module):
             steps_h = h_len
         if steps_w is None:
             steps_w = w_len
+
+        if ref_mask_flag is not None and not bool(ref_mask_flag):
+            # SCAIL-2 replacement mode: keep target video on the normal grid, move
+            # reference and pose streams into separate spatial RoPE regions.
+            segments = []
+
+            ref_t_len = 0
+            if scail_ref_frame_shape is not None:
+                ref_t, ref_h, ref_w = scail_ref_frame_shape[-3], scail_ref_frame_shape[-2], scail_ref_frame_shape[-1]
+                ref_t_len = ((ref_t + (patch_size[0] // 2)) // patch_size[0])
+                ref_h_len = ((ref_h + (patch_size[1] // 2)) // patch_size[1])
+                ref_w_len = ((ref_w + (patch_size[2] // 2)) // patch_size[2])
+                ref_ids = torch.zeros((ref_t_len, ref_h_len, ref_w_len, 3), device=device, dtype=dtype)
+                ref_ids[:, :, :, 0] += torch.linspace(0, ref_t_len - 1, steps=ref_t_len, device=device, dtype=dtype).reshape(-1, 1, 1)
+                ref_ids[:, :, :, 1] += torch.linspace(120.0, 120.0 + ref_h_len - 1, steps=ref_h_len, device=device, dtype=dtype).reshape(1, -1, 1)
+                ref_ids[:, :, :, 2] += torch.linspace(0, ref_w_len - 1, steps=ref_w_len, device=device, dtype=dtype).reshape(1, 1, -1)
+                segments.append(ref_ids.reshape(1, -1, ref_ids.shape[-1]))
+
+            main_t_len = max(t_len - ref_t_len, 0)
+            if main_t_len > 0:
+                main_ids = torch.zeros((main_t_len, h_len, w_len, 3), device=device, dtype=dtype)
+                main_ids[:, :, :, 0] += torch.linspace(0, main_t_len - 1, steps=main_t_len, device=device, dtype=dtype).reshape(-1, 1, 1)
+                main_ids[:, :, :, 1] += torch.linspace(0, h_len - 1, steps=h_len, device=device, dtype=dtype).reshape(1, -1, 1)
+                main_ids[:, :, :, 2] += torch.linspace(0, w_len - 1, steps=w_len, device=device, dtype=dtype).reshape(1, 1, -1)
+                segments.append(main_ids.reshape(1, -1, main_ids.shape[-1]))
+
+            if pose_frame_shape is not None:
+                pose_t, pose_h, pose_w = pose_frame_shape[-3], pose_frame_shape[-2], pose_frame_shape[-1]
+                pose_t_len = ((pose_t + (patch_size[0] // 2)) // patch_size[0])
+                pose_h_len = ((pose_h + (patch_size[1] // 2)) // patch_size[1])
+                pose_w_len = ((pose_w + (patch_size[2] // 2)) // patch_size[2])
+                h_scale = h / pose_h
+                w_scale = w / pose_w
+                h_shift = (h_scale - 1) / 2
+                w_shift = (w_scale - 1) / 2
+                pose_ids = torch.zeros((pose_t_len, pose_h_len, pose_w_len, 3), device=device, dtype=dtype)
+                pose_ids[:, :, :, 0] += torch.linspace(0, pose_t_len - 1, steps=pose_t_len, device=device, dtype=dtype).reshape(-1, 1, 1)
+                pose_ids[:, :, :, 1] += (torch.linspace(0, pose_h_len - 1, steps=pose_h_len, device=device, dtype=dtype) * h_scale + h_shift).reshape(1, -1, 1)
+                pose_ids[:, :, :, 2] += (torch.linspace(0, pose_w_len - 1, steps=pose_w_len, device=device, dtype=dtype) * w_scale + 120.0 + w_shift).reshape(1, 1, -1)
+                segments.append(pose_ids.reshape(1, -1, pose_ids.shape[-1]))
+
+            combined_img_ids = torch.cat(segments, dim=1)
+            return self.rope_embedder(combined_img_ids, ntk_alphas).movedim(1, 2)
 
         # Main frames position IDs
         img_ids = torch.zeros((steps_t, steps_h, steps_w, 3), device=device, dtype=dtype)
@@ -2345,7 +2388,8 @@ class WanModel(torch.nn.Module):
 
             pose_img_ids = torch.zeros((pose_f_len_full, pose_h_len_full, pose_w_len_full, 3), device=device, dtype=dtype)
             global_h_offset, global_w_offset = 0, 120  # global spatial offset to separate pose from main frames spatially (SCAIL uses 120 as offset)
-            pose_img_ids[:, :, :, 0] = pose_img_ids[:, :, :, 0] + torch.linspace(t_start+freq_offset, t_start + (pose_f_len_full - 1), steps=pose_f_len_full, device=device, dtype=dtype).reshape(-1, 1, 1)
+            pose_t_start = 1 if scail_ref_frame_shape is not None else t_start + freq_offset
+            pose_img_ids[:, :, :, 0] = pose_img_ids[:, :, :, 0] + torch.linspace(pose_t_start, pose_t_start + (pose_f_len_full - 1), steps=pose_f_len_full, device=device, dtype=dtype).reshape(-1, 1, 1)
             pose_img_ids[:, :, :, 1] = pose_img_ids[:, :, :, 1] + torch.linspace(global_h_offset + freq_offset, global_h_offset + pose_h_len_full - 1, steps=pose_h_len_full, device=device, dtype=dtype).reshape(1, -1, 1)
             pose_img_ids[:, :, :, 2] = pose_img_ids[:, :, :, 2] + torch.linspace(global_w_offset + freq_offset, global_w_offset + pose_w_len_full - 1, steps=pose_w_len_full, device=device, dtype=dtype).reshape(1, 1, -1)
 
@@ -2546,6 +2590,9 @@ class WanModel(torch.nn.Module):
 
         _, F, H, W = x[0].shape
         ref_frame_shape = pose_frame_shape = None
+        scail_ref_mask_latents = None
+        scail_ref_frame_shape = None
+        scail_ref_mask_flag = None
 
         sdancer_enabled = False
         if sdancer_input is not None and sdancer_input['start_percent'] <= current_step_percentage <= sdancer_input['end_percent']:
@@ -2600,8 +2647,11 @@ class WanModel(torch.nn.Module):
 
         # SCAIL ref
         if scail_input is not None:
+            scail_ref_mask_flag = scail_input.get("ref_mask_flag", None)
             ref_latent = scail_input.get("ref_latent_pos", None) if not is_uncond else scail_input.get("ref_latent_neg", None)
             if ref_latent is not None and scail_input['ref_start_percent'] <= current_step_percentage <= scail_input['ref_end_percent']:
+                scail_ref_mask_latents = scail_input.get("ref_mask_latents", None)
+                scail_ref_frame_shape = ref_latent.shape
                 x = [torch.cat([v, u], dim=1) for v, u in zip([ref_latent], x)]
                 seq_len += math.ceil((ref_latent.shape[-1] * ref_latent.shape[-2]) / 4 * ref_latent.shape[-3])
                 F += 1
@@ -2637,6 +2687,14 @@ class WanModel(torch.nn.Module):
             else:
                 self.original_patch_embedding.to(self.main_device)
                 x = [self.original_patch_embedding(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype) for u in x]
+            if scail_ref_mask_latents is not None:
+                if not hasattr(self, "patch_embedding_mask"):
+                    raise ValueError("SCAIL-2 mask latents were provided, but the model has no patch_embedding_mask module")
+                self.patch_embedding_mask.to(self.main_device)
+                scail_mask_x = self.patch_embedding_mask(scail_ref_mask_latents.unsqueeze(0).to(torch.float32)).to(x[0].dtype)
+                if scail_mask_x.shape[2:] != x[0].shape[2:]:
+                    raise ValueError(f"SCAIL-2 ref_mask_latents shape {scail_mask_x.shape[2:]} does not match latent token grid {x[0].shape[2:]}")
+                x = [u + scail_mask_x for u in x]
 
         # ovi audio model
         if self.audio_model is not None:
@@ -2729,7 +2787,16 @@ class WanModel(torch.nn.Module):
             scail_pose_latents = scail_input.get("pose_latent", None)
             if scail_pose_latents is not None and scail_input['pose_start_percent'] <= current_step_percentage <= scail_input['pose_end_percent']:
                 scail_x = [self.patch_embedding_pose(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype) for u in [scail_pose_latents]]
-                scail_x = [u.flatten(2).transpose(1, 2) * scail_input.get("pose_strength", 1) for u in scail_x]
+                scail_sam_latents = scail_input.get("sam_latents", None)
+                if scail_sam_latents is not None:
+                    if not hasattr(self, "patch_embedding_mask"):
+                        raise ValueError("SCAIL-2 sam_latents were provided, but the model has no patch_embedding_mask module")
+                    self.patch_embedding_mask.to(self.main_device)
+                    scail_mask_x = self.patch_embedding_mask(scail_sam_latents.unsqueeze(0).to(torch.float32)).to(scail_x[0].dtype)
+                    if scail_mask_x.shape[2:] != scail_x[0].shape[2:]:
+                        raise ValueError(f"SCAIL-2 sam_latents shape {scail_mask_x.shape[2:]} does not match pose token grid {scail_x[0].shape[2:]}")
+                    scail_x = [u + scail_mask_x for u in scail_x]
+                scail_x = [u.flatten(2).transpose(1, 2) for u in scail_x]
                 x = [torch.cat([u, v], dim=1) for u, v in zip(x, scail_x)]
                 seq_len += scail_x[0].shape[1]
                 del scail_x
@@ -2808,6 +2875,8 @@ class WanModel(torch.nn.Module):
                 attn_cond is not None,
                 tuple(ref_frame_shape) if ref_frame_shape is not None else None,
                 tuple(pose_frame_shape) if pose_frame_shape is not None else None,
+                tuple(scail_ref_frame_shape) if scail_ref_frame_shape is not None else None,
+                None if scail_ref_mask_flag is None else bool(scail_ref_mask_flag),
                 self.rope_embedder.k,
                 tuple(ntk_alphas),
                 longcat_num_ref_latents,
@@ -2830,6 +2899,8 @@ class WanModel(torch.nn.Module):
                     ntk_alphas=ntk_alphas,
                     ref_frame_shape=ref_frame_shape,
                     pose_frame_shape=pose_frame_shape,
+                    scail_ref_frame_shape=scail_ref_frame_shape,
+                    ref_mask_flag=scail_ref_mask_flag,
                     longcat_num_ref_latents=longcat_num_ref_latents,
                     rope_negative_offset=rope_negative_offset,
                     num_memory_frames=num_memory_frames,
