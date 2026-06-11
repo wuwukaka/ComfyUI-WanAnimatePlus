@@ -29,7 +29,7 @@ Use cases:
 
 ### SCAIL-2 Embeds
 
-Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. It prepares reference image, driving pose, colored pose mask, reference mask, and optional prefix/transition hard-freeze latents for the WanAnimatePlus sampler.
+Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. It prepares reference image, driving pose, colored pose mask, reference mask, optional prefix/transition hard-freeze latents, and prefix-aligned colored masks for the WanAnimatePlus sampler.
 
 ## Demo
 
@@ -72,10 +72,12 @@ Generates condition latents from source video, reference video, and/or reference
 
 Provides SCAIL-2 ref / pose / mask conditioning through `WanAnimatePlus SCAIL_2 Embeds`.
 
-- Encodes `ref_image`, `pose_images`, `pose_image_mask`, and `reference_image_mask`
+- Encodes `ref_image`, `pose_images`, `pose_image_mask`, `prefix_mask`, and `reference_image_mask`
 - Aligns SCAIL-2 inputs to 32-pixel multiples before VAE encoding
 - Supports animation and replacement modes
 - Supports optional `prefix_frames` and `transition_video` hard-freeze conditioning
+- Uses a single SCAIL-2 prefix layout: 37 front pixel frames when `prefix_frames` is connected, with transition frames placed at frames 17-36 when `transition_video` is also connected; transition-only uses 21 front pixel frames
+- Writes `prefix_mask` into the prefix pixel-mask frames before SCAIL-2 mask latent encoding
 - Supports context-window sampling; non-first windows can see prepended prefix/transition context without fusing those prepended predictions
 
 ## Installation
@@ -167,6 +169,7 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `ref_image` | Reference image for SCAIL-2 conditioning |
 | `pose_images` | Driving pose video/images, encoded at half resolution |
 | `pose_image_mask` | Colored per-identity pose mask sequence |
+| `prefix_mask` | Optional colored mask images matching `prefix_frames`; expanded as `1+4+4...` and written into the prefix mask frames before mask latent encoding |
 | `reference_image_mask` | Colored reference mask image |
 | `replacement_mode` | Enables SCAIL-2 replacement-mode RoPE and reference-mask compositing |
 | `prefix_frames` | Optional frames to hard-freeze at the front of the latent sequence |
@@ -175,6 +178,8 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `force_offload` / `tiled_vae` | Memory controls for VAE encoding |
 
 For short generations, context windows are optional. For long generations or low VRAM, context windows are recommended. In context-window mode, the sampler prepends protected prefix/transition latents for model context and removes those prepended predictions before overlap fusion.
+
+For SCAIL-2, `prefix_frames` always expands the front canvas by 37 pixel frames. If only `transition_video` is connected, the front canvas expands by 21 pixel frames. The separate 45-frame outfit layout belongs to the regular AnimateEmbeds node and is not used by `WanAnimatePlus SCAIL_2 Embeds`.
 
 ## Project Structure
 
@@ -242,4 +247,4 @@ This project is an independently maintained fork / derivative project based on [
 
 Modified portions and newly added code are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
 
-The wuwukasi/wuwukaka additions include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini in-context conditioning, SCAIL-2 embeds support, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, and related custom-op handling.
+The wuwukasi/wuwukaka additions include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini in-context conditioning, SCAIL-2 embeds support including prefix-mask handling and sampler freeze/prepend integration, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, and related custom-op handling.

@@ -6,7 +6,7 @@
 
 ## 项目简介
 
-`ComfyUI-WanAnimatePlus` 在 WanVideo 工作流上新增了三大功能：
+`ComfyUI-WanAnimatePlus` 在 WanVideo 工作流上新增了四大功能：
 
 ### prefix_frames 与 transition_video
 
@@ -26,6 +26,10 @@
 - 需要多参考图控制的动作迁移流程
 - 视频编辑（源视频 + 参考图）
 - 参考图生视频
+
+### SCAIL-2 Embeds
+
+新增基于 WanAnimatePlus 采样器适配的 `WanAnimatePlus SCAIL_2 Embeds` 节点，用于准备 SCAIL-2 的参考图、pose、colored pose mask、reference mask、prefix/transition 硬冻结 latent，以及与 prefix 对齐的 colored mask。
 
 ## 效果展示
 
@@ -64,6 +68,18 @@
 - 参考图像保持原始宽高比
 - 兼容 context window
 
+### SCAIL-2
+
+通过 `WanAnimatePlus SCAIL_2 Embeds` 提供 SCAIL-2 ref / pose / mask 条件注入。
+
+- 编码 `ref_image`、`pose_images`、`pose_image_mask`、`prefix_mask` 和 `reference_image_mask`
+- SCAIL-2 输入会在编码前对齐到 32 像素倍数
+- 支持 animation / replacement 两种模式
+- 支持 `prefix_frames` 和 `transition_video` 硬冻结条件
+- SCAIL-2 只有一种 prefix 布局：接入 `prefix_frames` 时前置扩展 37 个像素帧；同时接入 `transition_video` 时 transition 写入第 17-36 帧；只有 `transition_video` 时前置扩展 21 个像素帧
+- `prefix_mask` 会先写入 prefix 对应的像素 mask 帧，再统一编码为 SCAIL-2 mask latent
+- 支持 context window；非首窗口会把 prefix/transition latent prepend 给模型作为上下文，并在 overlap 融合前切掉 prepend 预测
+
 ## 安装方式
 
 将本仓库放入 ComfyUI 的 `custom_nodes` 目录：
@@ -75,7 +91,7 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 安装完成后重启 ComfyUI。
 
-> **重要**：要使用 `prefix_frames`、`transition_video` 或 `Bernini`，**必须**全链路替换为 WanAnimatePlus 版本节点。在同一个工作流中混用 WanAnimatePlus 节点和原版 WanVideoWrapper 节点会导致输出异常。
+> **重要**：要使用 `prefix_frames`、`transition_video`、`Bernini` 或 `SCAIL_2 Embeds`，**必须**全链路替换为 WanAnimatePlus 版本节点。在同一个工作流中混用 WanAnimatePlus 节点和原版 WanVideoWrapper 节点会导致输出异常。
 
 ## 快速开始
 
@@ -106,6 +122,7 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus SamplerExtraArgs`
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
+- `WanAnimatePlus SCAIL_2 Embeds`
 
 ### WanAnimatePlus AnimateEmbeds
 
@@ -138,6 +155,31 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 | `tiled_vae` | 使用分块 VAE 编码以节省显存 |
 
 任务类型（v2v、rv2v、r2v、t2v）根据连接的输入自动推断。
+
+### WanAnimatePlus SCAIL_2 Embeds
+
+为 WanAnimatePlus 采样生成 SCAIL-2 条件。请配合包含 pose / mask stream 的 SCAIL-2 checkpoint 使用。
+
+**输入：**
+
+| 输入 | 说明 |
+|------|------|
+| `vae` | 用于编码的 VAE |
+| `width` / `height` / `num_frames` | 目标尺寸；宽高会对齐到 32 像素倍数 |
+| `ref_image` | SCAIL-2 参考图条件 |
+| `pose_images` | 驱动 pose 视频/图像，按半分辨率编码 |
+| `pose_image_mask` | colored per-identity pose mask 序列 |
+| `prefix_mask` | 可选，与 `prefix_frames` 对齐的 colored mask 图像；按 `1+4+4...` 展开，并在 mask latent 编码前写入 prefix 对应的像素 mask 帧 |
+| `reference_image_mask` | colored reference mask 图像 |
+| `replacement_mode` | 启用 SCAIL-2 replacement-mode RoPE 和 reference-mask 合成 |
+| `prefix_frames` | 可选，硬冻结在 latent 序列前部的 prefix 帧 |
+| `transition_video` | 可选，硬冻结在 latent 序列前部的 transition 帧 |
+| `clip_embeds` | 可选，来自 `WanAnimatePlus ClipVisionEncode` 的 CLIP vision 特征 |
+| `force_offload` / `tiled_vae` | VAE 编码相关显存控制 |
+
+短视频生成时 context window 可选；长视频或低显存场景建议使用 context window。context-window 模式下，采样器会把受保护的 prefix/transition latents prepend 给模型作为上下文，并在 overlap 融合前移除这些 prepend 预测。
+
+SCAIL-2 的 `prefix_frames` 固定使用 37 像素帧前置画布。只有 `transition_video` 时使用 21 像素帧前置画布。普通 AnimateEmbeds 里的 45 帧 outfit 布局不适用于 `WanAnimatePlus SCAIL_2 Embeds`。
 
 ## 项目结构
 
@@ -173,7 +215,7 @@ ComfyUI-WanAnimatePlus/
 
 ### 3. prefix_frames 输入几张图合适？
 
-推荐 3 张。第一张为主要参考（占据 5 帧），后两张各占据 4 帧。超过 5 张会被自动截断。如果输入不足 3 张，节点也会正常工作，但覆盖范围会相应减小。
+推荐 3 张。第一张使用 1 帧，后续每张各展开 4 帧，即 `1+4+4...`，最多 5 张、17 帧。超过 5 张会被自动截断。如果输入不足 3 张，节点也会正常工作，但覆盖范围会相应减小。
 
 ### 4. transition_video 需要多少帧？
 
@@ -205,4 +247,4 @@ ComfyUI-WanAnimatePlus/
 
 本项目中的修改部分和新增代码 Copyright (c) 2026 wuwukasi/wuwukaka。详细归属和修改说明要求见 [NOTICE](NOTICE)。任何使用或修改 WanAnimatePlus 新增部分的下游项目，应保留相关 copyright / modification notices，并在 README、NOTICE 文件或等效归属说明文档中加入详细修改说明。该说明应标明哪些模块、文件或功能区域来自 wuwukasi/wuwukaka，并描述下游对这些部分做了哪些修改。
 
-wuwukasi/wuwukaka 新增部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini in-context conditioning、EverAnimate embeds、sampler/context-window 修改、cache/inference 安全保护，以及相关 custom-op 处理等。
+wuwukasi/wuwukaka 新增部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini in-context conditioning、SCAIL-2 embeds 支持（包括 prefix_mask 处理、freeze/prepend 集成）、EverAnimate embeds、sampler/context-window 修改、cache/inference 安全保护，以及相关 custom-op 处理等。

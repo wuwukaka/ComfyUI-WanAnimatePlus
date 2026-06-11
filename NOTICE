@@ -39,6 +39,10 @@ The wuwukasi/wuwukaka additions include, without limitation:
 - Bernini in-context conditioning, context_latents/context_roles propagation,
   Bernini source_id RoPE handling, context-window slicing, guidance modes, and
   native-aspect reference preprocessing.
+- SCAIL-2 embeds support, including wrapper-native ref/pose/mask conditioning,
+  prefix_mask pixel-frame replacement before mask latent encoding,
+  prefix/transition freeze handling, decode-side canvas trimming, and
+  context-window prepend/fusion integration.
 - EverAnimate embeds support, anchor selection and padding, pose/face/bg/mask
   conditioning, ping-pong sequence handling, and related sampling safeguards.
 - Sampler/model changes for WanAnimatePlus context windows, prefix handling,
