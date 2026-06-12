@@ -1130,6 +1130,15 @@ class WanVideoSampler:
             tsr_k = experimental_args.get("tsr_k", 1.0)
             tsr_sigma = experimental_args.get("tsr_sigma", 1.0)
 
+        scail2_fast_path_blocked_by_experimental_sampling = (
+            use_cfg_zero_star
+            or use_tangential
+            or raag_alpha > 0.0
+            or use_fresca
+            or use_tsr
+            or bool(transformer.video_attention_split_steps)
+        )
+
         # Rotary positional embeddings (RoPE)
 
         # RoPE base freq scaling as used with CineScale
@@ -1144,6 +1153,10 @@ class WanVideoSampler:
             rope_function = "comfy" # only works with this currently
         if context_latents is not None and "comfy" not in rope_function:
             log.info("Bernini context requires comfy RoPE; overriding rope_function to comfy")
+            rope_function = "comfy"
+        scail_embeds_for_rope = image_embeds.get("scail_embeds", None)
+        if scail_embeds_for_rope is not None and "comfy" not in rope_function:
+            log.info("SCAIL-2 requires comfy RoPE; overriding rope_function to comfy")
             rope_function = "comfy"
 
         freqs = None
@@ -1328,6 +1341,7 @@ class WanVideoSampler:
                 log.info(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else v}")
             scail_data = scail_embeds.copy()
             scail_data = dict_to_device(scail_data, device, dtype)
+        scail2_fast_path_fallback_logged = False
 
 
         # WanMove
@@ -1369,6 +1383,7 @@ class WanVideoSampler:
                              context_latents=None, context_roles=None, context_window_start=0, scail_context_prepend_latents=0,):
             nonlocal transformer
             nonlocal audio_cfg_scale
+            nonlocal scail2_fast_path_fallback_logged
 
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype) if autocast_enabled else nullcontext():
@@ -1813,7 +1828,187 @@ class WanVideoSampler:
                     and base_params['num_memory_frames'] == 0
                 )
                 strict_plain_t2v_fast_path = context_latents is None and context_window is None and fast_path_no_extra_conditions
-                base_params["simple_t2v"] = context_latents is not None or strict_plain_t2v_fast_path
+                base_params["simple_t2v"] = (context_latents is not None and base_params['scail_input'] is None) or strict_plain_t2v_fast_path
+                scail2_fast_path = (
+                    base_params['scail_input'] is not None
+                    and guidance_mode == "cfg"
+                    and context_latents is None
+                    and base_params['y'] is None
+                    and image_cond_neg is None
+                    and attn_cond is None
+                    and attn_cond_neg is None
+                    and not reverse_time
+                    and not enhance_enabled
+                    and cache_args is None
+                    and freeinit_args is None
+                    and not scail2_fast_path_blocked_by_experimental_sampling
+                    and slg_args is None
+                    and getattr(transformer, "slg_blocks", None) is None
+                    and not getattr(transformer, "is_longcat", False)
+                    and getattr(transformer, "audio_model", None) is None
+                    and getattr(transformer, "vace_layers", None) is None
+                    and not batched_cfg
+                    and not bidirectional_sampling
+                    and loop_args is None
+                    and qwenvl_embeds_pos is None
+                    and qwenvl_embeds_neg is None
+                    and control_latents is None
+                    and vace_data is None
+                    and unianim_data is None
+                    and audio_proj is None
+                    and control_camera_latents is None
+                    and add_cond is None
+                    and multitalk_audio_embeds is None
+                    and fantasy_portrait_input is None
+                    and mtv_motion_tokens is None
+                    and s2v_audio_input is None
+                    and s2v_ref_motion is None
+                    and s2v_pose is None
+                    and humo_image_cond is None
+                    and humo_audio is None
+                    and wananim_pose_latents is None
+                    and wananim_face_pixels is None
+                    and uni3c_data is None
+                    and latent_model_input_ovi is None
+                    and flashvsr_LQ_latent is None
+                    and base_params['fun_ref'] is None
+                    and base_params['fun_camera'] is None
+                    and base_params['audio_proj'] is None
+                    and base_params['uni3c_data'] is None
+                    and base_params['controlnet'] is None
+                    and base_params['add_cond'] is None
+                    and not base_params['nag_params']
+                    and base_params['nag_context'] is None
+                    and base_params['multitalk_audio'] is None
+                    and base_params['ref_target_masks'] is None
+                    and base_params['inner_t'] is None
+                    and base_params['standin_input'] is None
+                    and base_params['fantasy_portrait_input'] is None
+                    and base_params['phantom_ref'] is None
+                    and base_params['mtv_motion_tokens'] is None
+                    and base_params['mtv_motion_rotary_emb'] is None
+                    and base_params['s2v_audio_input'] is None
+                    and base_params['s2v_ref_latent'] is None
+                    and base_params['s2v_ref_motion'] is None
+                    and base_params['s2v_pose'] is None
+                    and base_params['humo_audio'] is None
+                    and base_params['wananim_pose_latents'] is None
+                    and base_params['wananim_face_pixel_values'] is None
+                    and base_params['lynx_embeds'] is None
+                    and base_params['x_ovi'] is None
+                    and base_params['flashvsr_LQ_latent'] is None
+                    and base_params['longcat_num_cond_latents'] == 0
+                    and base_params['longcat_num_ref_latents'] == 0
+                    and base_params['longcat_avatar_options'] is None
+                    and base_params['sdancer_input'] is None
+                    and base_params['one_to_all_input'] is None
+                    and base_params['dual_control_input'] is None
+                    and base_params['rope_negative_offset'] == 0
+                    and base_params['num_memory_frames'] == 0
+                    and "comfy" in getattr(transformer, "rope_func", "")
+                )
+                if base_params['scail_input'] is not None and not scail2_fast_path:
+                    if not scail2_fast_path_fallback_logged:
+                        scail2_fast_path_fallback_logged = True
+                        fallback_reasons = []
+                        if guidance_mode != "cfg":
+                            fallback_reasons.append(f"guidance_mode={guidance_mode!r}")
+                        if context_latents is not None:
+                            fallback_reasons.append("Bernini context_latents connected")
+                        if base_params['y'] is not None:
+                            fallback_reasons.append("image condition active")
+                        if image_cond_neg is not None:
+                            fallback_reasons.append("negative image condition active")
+                        if attn_cond is not None or attn_cond_neg is not None:
+                            fallback_reasons.append("attention condition active")
+                        if reverse_time:
+                            fallback_reasons.append("reverse_time enabled")
+                        if enhance_enabled:
+                            fallback_reasons.append("enhance enabled")
+                        if cache_args is not None:
+                            fallback_reasons.append("cache enabled")
+                        if freeinit_args is not None:
+                            fallback_reasons.append("FreeInit enabled")
+                        if scail2_fast_path_blocked_by_experimental_sampling:
+                            fallback_reasons.append("experimental sampling enabled")
+                        if slg_args is not None or getattr(transformer, "slg_blocks", None) is not None:
+                            fallback_reasons.append("SLG enabled")
+                        if getattr(transformer, "is_longcat", False):
+                            fallback_reasons.append("LongCat model active")
+                        if getattr(transformer, "audio_model", None) is not None:
+                            fallback_reasons.append("OVI audio model active")
+                        if getattr(transformer, "vace_layers", None) is not None:
+                            fallback_reasons.append("VACE layers active")
+                        if batched_cfg:
+                            fallback_reasons.append("batched CFG enabled")
+                        if bidirectional_sampling:
+                            fallback_reasons.append("bidirectional sampling enabled")
+                        if loop_args is not None:
+                            fallback_reasons.append("loop enabled")
+                        if qwenvl_embeds_pos is not None or qwenvl_embeds_neg is not None:
+                            fallback_reasons.append("QwenVL embeddings connected")
+                        if control_latents is not None or control_camera_latents is not None:
+                            fallback_reasons.append("control latents connected")
+                        if vace_data is not None:
+                            fallback_reasons.append("VACE input connected")
+                        if unianim_data is not None:
+                            fallback_reasons.append("UniAnimate input connected")
+                        if audio_proj is not None:
+                            fallback_reasons.append("audio projection connected")
+                        if add_cond is not None:
+                            fallback_reasons.append("additional condition connected")
+                        if multitalk_audio_embeds is not None:
+                            fallback_reasons.append("MultiTalk input connected")
+                        if fantasy_portrait_input is not None:
+                            fallback_reasons.append("FantasyPortrait input connected")
+                        if mtv_motion_tokens is not None:
+                            fallback_reasons.append("MTV motion tokens connected")
+                        if s2v_audio_input is not None or s2v_ref_motion is not None or s2v_pose is not None:
+                            fallback_reasons.append("S2V input connected")
+                        if humo_image_cond is not None or humo_audio is not None:
+                            fallback_reasons.append("HuMo input connected")
+                        if wananim_pose_latents is not None or wananim_face_pixels is not None:
+                            fallback_reasons.append("WanAnimate input connected")
+                        if uni3c_data is not None:
+                            fallback_reasons.append("Uni3C input connected")
+                        if latent_model_input_ovi is not None:
+                            fallback_reasons.append("OVI latent input connected")
+                        if flashvsr_LQ_latent is not None:
+                            fallback_reasons.append("FlashVSR input connected")
+                        if base_params['fun_ref'] is not None or base_params['fun_camera'] is not None:
+                            fallback_reasons.append("Fun reference/camera active")
+                        if base_params['controlnet'] is not None:
+                            fallback_reasons.append("ControlNet active")
+                        if base_params['nag_params'] or base_params['nag_context'] is not None:
+                            fallback_reasons.append("NAG active")
+                        if base_params['ref_target_masks'] is not None:
+                            fallback_reasons.append("reference target masks active")
+                        if base_params['inner_t'] is not None:
+                            fallback_reasons.append("EchoShot active")
+                        if base_params['standin_input'] is not None:
+                            fallback_reasons.append("Stand-In input connected")
+                        if base_params['phantom_ref'] is not None:
+                            fallback_reasons.append("Phantom reference connected")
+                        if base_params['lynx_embeds'] is not None:
+                            fallback_reasons.append("Lynx input connected")
+                        if base_params['longcat_num_cond_latents'] != 0 or base_params['longcat_num_ref_latents'] != 0 or base_params['longcat_avatar_options'] is not None:
+                            fallback_reasons.append("LongCat options active")
+                        if base_params['sdancer_input'] is not None:
+                            fallback_reasons.append("SteadyDancer input connected")
+                        if base_params['one_to_all_input'] is not None:
+                            fallback_reasons.append("One-to-All input connected")
+                        if base_params['dual_control_input'] is not None:
+                            fallback_reasons.append("Dual Control input connected")
+                        if base_params['rope_negative_offset'] != 0 or base_params['num_memory_frames'] != 0:
+                            fallback_reasons.append("StoryMem/memory RoPE active")
+                        if "comfy" not in getattr(transformer, "rope_func", ""):
+                            fallback_reasons.append(f"rope_func={getattr(transformer, 'rope_func', None)!r}")
+                        if not fallback_reasons:
+                            fallback_reasons.append("unsupported sampler/model option")
+                        log.info("SCAIL-2 fast path disabled; using normal path. Reason(s): " + "; ".join(fallback_reasons))
+                base_params["simple_scail2"] = scail2_fast_path
+                if scail2_fast_path:
+                    base_params["simple_t2v"] = False
 
                 batch_size = 1
 

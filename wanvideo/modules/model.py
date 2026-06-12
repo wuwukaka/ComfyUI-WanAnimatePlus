@@ -7,6 +7,7 @@
 #   - Added variable WanAnimate anchor count support for pose and face embedding offsets.
 #   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
 #   - Added simple T2V text/time embedding caches, cache-key helpers, and guarded no-op device moves.
+#   - Added a streamlined SCAIL-2 CFG fast path for the local WanAnimatePlus sampler.
 # Licensed under the Apache License, Version 2.0
 import math
 import torch
@@ -2388,7 +2389,10 @@ class WanModel(torch.nn.Module):
 
             pose_img_ids = torch.zeros((pose_f_len_full, pose_h_len_full, pose_w_len_full, 3), device=device, dtype=dtype)
             global_h_offset, global_w_offset = 0, 120  # global spatial offset to separate pose from main frames spatially (SCAIL uses 120 as offset)
-            pose_t_start = 1 if scail_ref_frame_shape is not None else t_start + freq_offset
+            scail_ref_t_len = 0
+            if scail_ref_frame_shape is not None:
+                scail_ref_t_len = ((scail_ref_frame_shape[-3] + (self.patch_size[0] // 2)) // self.patch_size[0])
+            pose_t_start = scail_ref_t_len if scail_ref_frame_shape is not None else t_start + freq_offset
             pose_img_ids[:, :, :, 0] = pose_img_ids[:, :, :, 0] + torch.linspace(pose_t_start, pose_t_start + (pose_f_len_full - 1), steps=pose_f_len_full, device=device, dtype=dtype).reshape(-1, 1, 1)
             pose_img_ids[:, :, :, 1] = pose_img_ids[:, :, :, 1] + torch.linspace(global_h_offset + freq_offset, global_h_offset + pose_h_len_full - 1, steps=pose_h_len_full, device=device, dtype=dtype).reshape(1, -1, 1)
             pose_img_ids[:, :, :, 2] = pose_img_ids[:, :, :, 2] + torch.linspace(global_w_offset + freq_offset, global_w_offset + pose_w_len_full - 1, steps=pose_w_len_full, device=device, dtype=dtype).reshape(1, 1, -1)
@@ -2515,6 +2519,21 @@ class WanModel(torch.nn.Module):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        # Fast SCAIL-2 path: local SCAIL-2 CFG workflow without unrelated control branches.
+        if kwargs.get("simple_scail2", False):
+            return self._forward_scail2_fast(
+                x, t, context, seq_len, freqs, scail_input,
+                is_uncond=is_uncond,
+                current_step_percentage=current_step_percentage,
+                current_step=current_step,
+                last_step=last_step,
+                clip_fea=clip_fea,
+                control_lora_enabled=control_lora_enabled,
+                transformer_options=transformer_options,
+                ntk_alphas=ntk_alphas,
+                context_window_start=kwargs.get("context_window_start", 0),
+            )
+
         # Fast T2V path: bypass all extra checks for simple text-to-video inference
         if kwargs.get("simple_t2v", False):
             return self._forward_t2v(x, t, context, seq_len, freqs,
@@ -2652,11 +2671,12 @@ class WanModel(torch.nn.Module):
             if ref_latent is not None and scail_input['ref_start_percent'] <= current_step_percentage <= scail_input['ref_end_percent']:
                 scail_ref_mask_latents = scail_input.get("ref_mask_latents", None)
                 scail_ref_frame_shape = ref_latent.shape
+                scail_ref_frames = ref_latent.shape[1]
                 x = [torch.cat([v, u], dim=1) for v, u in zip([ref_latent], x)]
                 seq_len += math.ceil((ref_latent.shape[-1] * ref_latent.shape[-2]) / 4 * ref_latent.shape[-3])
-                F += 1
-                prefix_frames = 1
-                suffix_frames += 1
+                F += scail_ref_frames
+                prefix_frames += scail_ref_frames
+                suffix_frames += scail_ref_frames
 
         #uni3c controlnet
         if uni3c_data is not None:
@@ -3621,6 +3641,249 @@ class WanModel(torch.nn.Module):
         x = [u[:, prefix_frames:suffix_frames, ...].float() for u in x]
         return (x, x_ovi, pred_id) if pred_id is not None else (x, x_ovi, None)
 
+    def _forward_scail2_fast(self, x, t, context, seq_len, freqs, scail_input,
+                             is_uncond=False, current_step_percentage=0.0, current_step=0, last_step=False,
+                             clip_fea=None, control_lora_enabled=False, transformer_options={},
+                             ntk_alphas=None, context_window_start=0):
+        """Streamlined SCAIL-2 forward for the local CFG sampler path."""
+        device = self.main_device
+        ntk = ntk_alphas if ntk_alphas is not None else [1.0, 1.0, 1.0]
+
+        if self.lora_scheduling_enabled:
+            update_lora_step(self, current_step)
+
+        if freqs is not None and freqs.device != device:
+            freqs = freqs.to(device)
+
+        _, F, H, W = x[0].shape
+        suffix_frames = x[0].shape[1]
+        prefix_frames = 0
+        pose_frame_shape = None
+        scail_ref_frame_shape = None
+        scail_ref_mask_latents = None
+        scail_ref_mask_flag = None
+
+        if scail_input is not None:
+            scail_ref_mask_flag = scail_input.get("ref_mask_flag", None)
+            ref_latent = scail_input.get("ref_latent_pos", None) if not is_uncond else scail_input.get("ref_latent_neg", None)
+            if ref_latent is not None and scail_input["ref_start_percent"] <= current_step_percentage <= scail_input["ref_end_percent"]:
+                scail_ref_mask_latents = scail_input.get("ref_mask_latents", None)
+                scail_ref_frame_shape = ref_latent.shape
+                scail_ref_frames = ref_latent.shape[1]
+                x = [torch.cat([v, u], dim=1) for v, u in zip([ref_latent], x)]
+                seq_len += math.ceil((ref_latent.shape[-1] * ref_latent.shape[-2]) / 4 * ref_latent.shape[-3])
+                F += scail_ref_frames
+                prefix_frames += scail_ref_frames
+                suffix_frames += scail_ref_frames
+
+        patch_embedding = self.expanded_patch_embedding if control_lora_enabled else self.original_patch_embedding
+        _module_to_if_needed(patch_embedding, device)
+        x = [patch_embedding(u.unsqueeze(0).to(torch.float32)).to(x[0].dtype) for u in x]
+
+        if scail_ref_mask_latents is not None:
+            if not hasattr(self, "patch_embedding_mask"):
+                raise ValueError("SCAIL-2 mask latents were provided, but the model has no patch_embedding_mask module")
+            _module_to_if_needed(self.patch_embedding_mask, device)
+            scail_mask_x = self.patch_embedding_mask(scail_ref_mask_latents.unsqueeze(0).to(torch.float32)).to(x[0].dtype)
+            if scail_mask_x.shape[2:] != x[0].shape[2:]:
+                raise ValueError(f"SCAIL-2 ref_mask_latents shape {scail_mask_x.shape[2:]} does not match latent token grid {x[0].shape[2:]}")
+            x = [u + scail_mask_x for u in x]
+
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], device=device, dtype=torch.long) for u in x])
+        original_grid_sizes = grid_sizes.clone()
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        self.original_seq_len = x[0].shape[1]
+
+        if scail_input is not None:
+            scail_pose_latents = scail_input.get("pose_latent", None)
+            if scail_pose_latents is not None and scail_input["pose_start_percent"] <= current_step_percentage <= scail_input["pose_end_percent"]:
+                _module_to_if_needed(self.patch_embedding_pose, device)
+                scail_x = self.patch_embedding_pose(scail_pose_latents.unsqueeze(0).to(torch.float32)).to(x[0].dtype)
+                scail_sam_latents = scail_input.get("sam_latents", None)
+                if scail_sam_latents is not None:
+                    if not hasattr(self, "patch_embedding_mask"):
+                        raise ValueError("SCAIL-2 sam_latents were provided, but the model has no patch_embedding_mask module")
+                    _module_to_if_needed(self.patch_embedding_mask, device)
+                    scail_mask_x = self.patch_embedding_mask(scail_sam_latents.unsqueeze(0).to(torch.float32)).to(scail_x.dtype)
+                    if scail_mask_x.shape[2:] != scail_x.shape[2:]:
+                        raise ValueError(f"SCAIL-2 sam_latents shape {scail_mask_x.shape[2:]} does not match pose token grid {scail_x.shape[2:]}")
+                    scail_x = scail_x + scail_mask_x
+                scail_x = scail_x.flatten(2).transpose(1, 2)
+                x = [torch.cat([u, scail_x], dim=1) for u in x]
+                seq_len += scail_x.shape[1]
+                pose_frame_shape = scail_pose_latents.shape
+
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.int32)
+        assert seq_lens.max() <= seq_len, f"max seq len {seq_lens.max()} exceeds provided seq_len {seq_len}"
+        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+        x = x.to(self.base_dtype)
+
+        if freqs is None and "comfy" in self.rope_func:
+            cache_key = (
+                "scail2_fast",
+                F, H, W,
+                tuple(pose_frame_shape) if pose_frame_shape is not None else None,
+                tuple(scail_ref_frame_shape) if scail_ref_frame_shape is not None else None,
+                None if scail_ref_mask_flag is None else bool(scail_ref_mask_flag),
+                self.rope_embedder.k,
+                tuple(ntk),
+                context_window_start,
+            )
+            if self.cached_freqs is not None and hasattr(self, "cached_key") and self.cached_key == cache_key:
+                freqs = self.cached_freqs
+            else:
+                freqs = self.rope_encode_comfy(
+                    F, H, W,
+                    ntk_alphas=ntk,
+                    pose_frame_shape=pose_frame_shape,
+                    scail_ref_frame_shape=scail_ref_frame_shape,
+                    ref_mask_flag=scail_ref_mask_flag,
+                    context_window_start=context_window_start,
+                    device=device,
+                    dtype=x.dtype,
+                )
+                self.cached_freqs = freqs
+                self.cached_key = cache_key
+        if freqs is None:
+            raise ValueError("SCAIL-2 fast path requires Comfy RoPE or precomputed freqs")
+        if freqs.device != device:
+            freqs = freqs.to(device)
+
+        _module_to_if_needed(self.time_embedding, device)
+        time_embed_dtype = self.time_embedding[0].weight.dtype
+        if time_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
+            time_embed_dtype = self.base_dtype
+        time_projection_enabled = hasattr(self, "time_projection")
+        if time_projection_enabled:
+            _module_to_if_needed(self.time_projection, device)
+        cached_time = getattr(self, "_scail2_time_embed_cache", None)
+        if (cached_time is not None and cached_time[0] is t and cached_time[1] == device
+                and cached_time[2] == time_embed_dtype and cached_time[3] == time_projection_enabled):
+            e_raw, e = cached_time[4], cached_time[5]
+        else:
+            e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(device=device, dtype=time_embed_dtype))
+            if time_projection_enabled:
+                e = self.time_projection(e_raw).unflatten(1, (6, self.dim))
+            else:
+                e = e_raw.reshape(1, 6, self.dim)
+            if e.dim() < 3 or e.shape[1] != 6:
+                e = e.reshape(1, 6, self.dim)
+            self._scail2_time_embed_cache = (t, device, time_embed_dtype, time_projection_enabled, e_raw, e)
+
+        clip_embed = None
+        if clip_fea is not None and hasattr(self, "img_emb"):
+            _module_to_if_needed(self.img_emb, device)
+            clip_embed = self.img_emb(clip_fea.to(device))
+            if self.offload_img_emb:
+                self.img_emb.to(self.offload_device, non_blocking=self.use_non_blocking)
+
+        if hasattr(self, "text_embedding") and isinstance(context, list) and context != []:
+            text_embed_dtype = self.text_embedding[0].weight.dtype
+            if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
+                text_embed_dtype = self.base_dtype
+            text_cache_key = _t2v_context_cache_key(context, text_embed_dtype, device, self.text_len)
+            text_cache = getattr(self, "_scail2_text_embed_cache", None)
+            if text_cache is None:
+                text_cache = {}
+                self._scail2_text_embed_cache = text_cache
+            cached_context = text_cache.get(text_cache_key)
+            if cached_context is None:
+                _module_to_if_needed(self.text_embedding, device)
+                padded_context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]).to(text_embed_dtype)
+                cached_context = self.text_embedding(padded_context.to(device))
+                if len(text_cache) >= 4:
+                    text_cache.clear()
+                text_cache[text_cache_key] = cached_context
+                if self.offload_txt_emb:
+                    self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
+            context = cached_context
+        elif isinstance(context, list):
+            context = None
+
+        block_kwargs = dict(
+            e=e,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            context=context,
+            clip_embed=clip_embed,
+            current_step=torch.tensor(current_step),
+            last_step=torch.tensor(last_step, dtype=torch.bool),
+            chunked_self_attention=False,
+            seq_chunks=1,
+            num_latent_frames=F,
+            frame_tokens=x.shape[1] // F,
+            original_seq_len=self.original_seq_len,
+            transformer_options=transformer_options,
+        )
+
+        if torch.cuda.is_available():
+            cuda_stream = None
+            events = [torch.cuda.Event() for _ in self.blocks]
+            swap_start_idx = len(self.blocks) - self.blocks_to_swap if self.blocks_to_swap > 0 else len(self.blocks)
+        else:
+            cuda_stream = None
+            events = None
+            swap_start_idx = len(self.blocks)
+
+        attn_override_blocks = attention_mode = None
+        attention_mode_override_active = False
+        attention_mode_override = transformer_options.get("attention_mode_override", None)
+        if attention_mode_override is not None:
+            attn_override_blocks = attention_mode_override.get("blocks", range(len(self.blocks)))
+            if attention_mode_override["start_step"] <= current_step < attention_mode_override["end_step"]:
+                attention_mode_override_active = True
+                if attention_mode_override["verbose"]:
+                    tqdm.write(f"Applying attention mode override: {attention_mode_override['mode']} at step {current_step} on blocks: {attn_override_blocks if attn_override_blocks is not None else 'all'}")
+
+        for b, block in enumerate(self.blocks):
+            mm.throw_exception_if_processing_interrupted()
+            if attention_mode_override_active and b in attn_override_blocks:
+                attention_mode = attention_mode_override["mode"]
+            else:
+                attention_mode = None
+
+            if self.prefetch_blocks > 0:
+                for prefetch_offset in range(1, self.prefetch_blocks + 1):
+                    prefetch_idx = b + prefetch_offset
+                    if prefetch_idx < len(self.blocks) and self.blocks_to_swap > 0 and prefetch_idx >= swap_start_idx:
+                        context_mgr = torch.cuda.stream(cuda_stream) if torch.cuda.is_available() and cuda_stream is not None else nullcontext()
+                        with context_mgr:
+                            self.blocks[prefetch_idx].to(device, non_blocking=self.use_non_blocking)
+                            if events is not None:
+                                events[prefetch_idx].record(cuda_stream)
+
+            if self.block_swap_debug:
+                transfer_start = time.perf_counter()
+            if b >= swap_start_idx and self.blocks_to_swap > 0:
+                if self.prefetch_blocks > 0 and events is not None:
+                    if not events[b].query():
+                        events[b].synchronize()
+                block.to(device)
+            if self.block_swap_debug:
+                transfer_end = time.perf_counter()
+                transfer_time = transfer_end - transfer_start
+                compute_start = time.perf_counter()
+
+            x, _, _, _ = block(x, attention_mode_override=attention_mode, **block_kwargs)
+
+            if self.block_swap_debug:
+                compute_end = time.perf_counter()
+                compute_time = compute_end - compute_start
+                to_cpu_transfer_start = time.perf_counter()
+            if b >= swap_start_idx and self.blocks_to_swap > 0:
+                block.to(self.offload_device, non_blocking=self.use_non_blocking)
+            if self.block_swap_debug:
+                to_cpu_transfer_end = time.perf_counter()
+                to_cpu_transfer_time = to_cpu_transfer_end - to_cpu_transfer_start
+                log.info(f"Block {b}: transfer_time={transfer_time:.4f}s, compute_time={compute_time:.4f}s, to_cpu_transfer_time={to_cpu_transfer_time:.4f}s")
+
+        x = x[:, :self.original_seq_len]
+        x = self.head(x, e_raw.to(device), temp_length=F)
+        x = self.unpatchify(x, original_grid_sizes)
+        x = [u[:, prefix_frames:suffix_frames, ...].float() for u in x]
+        return x, None, None
+
     def _forward_t2v(self, x, t, context, seq_len, freqs, context_latents=None,
                       context_frame_shapes=None, context_window_start=0, ntk_alphas=None):
         """Streamlined T2V forward — no block swap, no extra checks, ~15x faster."""
@@ -3675,6 +3938,8 @@ class WanModel(torch.nn.Module):
         # Time embedding (must produce [batch, 6, dim] for block.get_mod compatibility)
         _module_to_if_needed(self.time_embedding, device)
         time_embed_dtype = self.time_embedding[0].weight.dtype
+        if time_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
+            time_embed_dtype = self.base_dtype
         time_projection_enabled = hasattr(self, 'time_projection')
         if time_projection_enabled:
             _module_to_if_needed(self.time_projection, device)
@@ -3683,7 +3948,7 @@ class WanModel(torch.nn.Module):
                 and cached_time[2] == time_embed_dtype and cached_time[3] == time_projection_enabled):
             e_raw, e = cached_time[4], cached_time[5]
         else:
-            e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(time_embed_dtype))
+            e_raw = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(device=device, dtype=time_embed_dtype))
             if time_projection_enabled:
                 e = self.time_projection(e_raw).unflatten(1, (6, self.dim))  # [batch, 6, dim]
             else:

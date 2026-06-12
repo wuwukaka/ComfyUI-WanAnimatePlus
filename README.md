@@ -72,12 +72,12 @@ Generates condition latents from source video, reference video, and/or reference
 
 Provides SCAIL-2 ref / pose / mask conditioning through `WanAnimatePlus SCAIL_2 Embeds`.
 
-- Encodes `ref_image`, `pose_images`, `pose_image_mask`, `prefix_mask`, and `reference_image_mask`
+- Encodes `ref_image`, `pose_images`, `pose_image_mask`, `prefix_frames`, `prefix_mask`, `bg_image`, and `reference_image_mask`
 - Aligns SCAIL-2 inputs to 32-pixel multiples before VAE encoding
 - Supports animation and replacement modes
-- Supports optional `prefix_frames` and `transition_video` hard-freeze conditioning
-- Uses a single SCAIL-2 prefix layout: 37 front pixel frames when `prefix_frames` is connected, with transition frames placed at frames 17-36 when `transition_video` is also connected; transition-only uses 21 front pixel frames
-- Writes `prefix_mask` into the prefix pixel-mask frames before SCAIL-2 mask latent encoding
+- Supports single-frame prefix reference encoding and optional `transition_video` hard-freeze conditioning
+- By default, `prefix_frames` are encoded as full-resolution reference latents and do not expand the output canvas; disable `single_frame_prefix_encoding` to use the legacy 37 front pixel-frame prefix layout
+- In single-frame prefix mode, `prefix_mask` follows the same reference-mask path as `reference_image_mask`
 - Supports context-window sampling; non-first windows can see prepended prefix/transition context without fusing those prepended predictions
 
 ## Installation
@@ -167,19 +167,24 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `vae` | VAE model for encoding |
 | `width` / `height` / `num_frames` | Target dimensions; width and height are aligned to multiples of 32 |
 | `ref_image` | Reference image for SCAIL-2 conditioning |
+| `bg_image` | Optional single background image for animation mode; prepended as the first `prefix_frames` item with an internal white mask and ignored in replacement mode |
 | `pose_images` | Driving pose video/images, encoded at half resolution |
 | `pose_image_mask` | Colored per-identity pose mask sequence |
 | `prefix_mask` | Optional colored mask images matching `prefix_frames`; expanded as `1+4+4...` and written into the prefix mask frames before mask latent encoding |
 | `reference_image_mask` | Colored reference mask image |
 | `replacement_mode` | Enables SCAIL-2 replacement-mode RoPE and reference-mask compositing |
-| `prefix_frames` | Optional frames to hard-freeze at the front of the latent sequence |
+| `preserve_main_ref_background` | Animation mode only; keeps the main reference image background when enabled, or uses `reference_image_mask` as a black-background alpha crop when disabled. Ignored in replacement mode |
+| `single_frame_prefix_encoding` | Encodes `prefix_frames` as individual full-resolution reference latents instead of expanding the canvas; enabled by default |
+| `prefix_frames` | Optional prefix images. In default single-frame mode these become reference-stream latents; with single-frame mode disabled they hard-freeze the front canvas |
 | `transition_video` | Optional transition frames to hard-freeze at the front of the latent sequence |
 | `clip_embeds` | Optional CLIP vision features from `WanAnimatePlus ClipVisionEncode` |
 | `force_offload` / `tiled_vae` | Memory controls for VAE encoding |
 
-For short generations, context windows are optional. For long generations or low VRAM, context windows are recommended. In context-window mode, the sampler prepends protected prefix/transition latents for model context and removes those prepended predictions before overlap fusion.
+For short generations, context windows are optional. For long generations or low VRAM, context windows are recommended. In context-window mode, single-frame prefix references remain visible through the SCAIL-2 reference stream. Legacy canvas prefixes and transition latents are prepended for model context and removed before overlap fusion.
 
-For SCAIL-2, `prefix_frames` always expands the front canvas by 37 pixel frames. If only `transition_video` is connected, the front canvas expands by 21 pixel frames. The separate 45-frame outfit layout belongs to the regular AnimateEmbeds node and is not used by `WanAnimatePlus SCAIL_2 Embeds`.
+For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or trim the output for `prefix_frames`. If `transition_video` is connected, the front canvas expands by 21 pixel frames and those 21 frames are trimmed after decoding. With `single_frame_prefix_encoding` disabled, `prefix_frames` use the legacy 37 front pixel-frame canvas layout, with transition frames placed at frames 17-36 when `transition_video` is also connected.
+
+When `bg_image` is connected in animation mode, it consumes the first prefix slot and is handled as the first prefix image. The node internally adds a white mask for that background image only; user-provided `prefix_frames` and `prefix_mask` are then limited to four images each. In replacement mode, `bg_image` is ignored.
 
 ## Project Structure
 

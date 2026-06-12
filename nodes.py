@@ -1653,10 +1653,11 @@ class WanAnimatePlusSCAIL2Embeds:
             "optional": {
                 "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
                 "ref_image": ("IMAGE", {"tooltip": "Reference image for SCAIL conditioning. If a sequence is connected, only the first frame is used."}),
+                "bg_image": ("IMAGE", {"tooltip": "Optional single background image for animation mode. Prepended before prefix_frames with an internal white mask and ignored in replacement mode."}),
                 "pose_images": ("IMAGE", {"tooltip": "Driving pose video. Encoded at half resolution for SCAIL."}),
-                "prefix_frames": ("IMAGE", {"tooltip": "Optional frames to hard-freeze at the beginning of the SCAIL-2 latent sequence."}),
-                "prefix_mask": ("IMAGE", {"tooltip": "Optional colored mask images matching prefix_frames. Expanded as 1+4+4... and written into the prefix mask frames before mask latent encoding. In replacement mode it also alpha-crops matching prefix frames to black background."}),
-                "transition_video": ("IMAGE", {"tooltip": "Optional transition frames to hard-freeze after prefix_frames at the beginning of the SCAIL-2 latent sequence."}),
+                "prefix_frames": ("IMAGE", {"tooltip": "Optional prefix images. In single-frame prefix mode these are encoded as reference latents; in legacy mode they hard-freeze the beginning of the canvas."}),
+                "prefix_mask": ("IMAGE", {"tooltip": "Optional colored mask images matching prefix_frames. In single-frame prefix mode this follows the reference-mask path; in legacy canvas-prefix mode it is expanded as 1+4+4... and written into the prefix mask frames."}),
+                "transition_video": ("IMAGE", {"tooltip": "Optional transition frames to hard-freeze at the beginning of the canvas. In legacy canvas-prefix mode, transition frames are placed after the prefix frames."}),
                 "pose_image_mask": ("IMAGE", {"tooltip": "SCAIL-2 colored per-identity driving pose mask. Background is normalized to black in animation mode and white in replacement mode."}),
                 "reference_image_mask": ("IMAGE", {"tooltip": "SCAIL-2 colored per-identity reference mask image. Background is normalized to white in animation mode and black in replacement mode."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
@@ -1669,7 +1670,9 @@ class WanAnimatePlusSCAIL2Embeds:
                     'hm-mvgd-hm',
                     'hm-mkl-hm',
                 ], {"default": 'disabled', "tooltip": "Color match transition_video to ref_image."}),
-                "prefix_alpha_crop": ("BOOLEAN", {"default": False, "tooltip": "Off writes prefix_mask with white background and keeps prefix frames unchanged. On writes prefix_mask with black background and alpha-crops prefix_frames."}),
+                "prefix_alpha_crop": ("BOOLEAN", {"default": False, "tooltip": "Off keeps prefix masks as white-background reference masks in animation mode. On uses black-background masks and alpha-crops prefix_frames. Replacement mode always uses black-background reference masks."}),
+                "preserve_main_ref_background": ("BOOLEAN", {"default": True, "tooltip": "Animation mode only. Keep the main reference image background. When off, reference_image_mask is normalized to black background and used to alpha-crop ref_image. Ignored in replacement mode."}),
+                "single_frame_prefix_encoding": ("BOOLEAN", {"default": True, "tooltip": "Encode prefix images as individual full-resolution reference latents instead of expanding the canvas."}),
                 "by wuwukasi（bilibili）": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON", "tooltip": "Follow wuwukasi on bilibili"}),
             }
         }
@@ -1776,6 +1779,20 @@ class WanAnimatePlusSCAIL2Embeds:
         return torch.where(bg, torch.zeros_like(mask), mask)
 
     @staticmethod
+    def _alpha_crop_with_mask(images, masks):
+        if images is None or masks is None or images.shape[0] == 0 or masks.shape[0] == 0:
+            return images
+        count = min(images.shape[0], masks.shape[0])
+        crop_mask = masks[:count, :, :, :3]
+        if crop_mask.shape[1] != images.shape[1] or crop_mask.shape[2] != images.shape[2]:
+            crop_mask = WanAnimatePlusSCAIL2Embeds._resize_bhwc(crop_mask, images.shape[2], images.shape[1], mode="nearest-exact")
+        crop_mask = WanAnimatePlusSCAIL2Embeds._normalize_mask_background(crop_mask, white_background=False)
+        is_char = (crop_mask[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(device=images.device, dtype=images.dtype)
+        out = images.clone()
+        out[:count] = out[:count] * is_char
+        return out
+
+    @staticmethod
     def _color_match_frames(frames, ref_frame, method):
         if method == "disabled" or ref_frame is None or frames is None or frames.shape[0] == 0:
             return frames
@@ -1819,23 +1836,121 @@ class WanAnimatePlusSCAIL2Embeds:
         padded = padded[:t_lat * 4]
         return padded.view(t_lat, 28, h_lat, w_lat).movedim(0, 1).contiguous()
 
+    @staticmethod
+    def _empty_ref_mask_like(ref_latent):
+        return torch.zeros(
+            28, ref_latent.shape[1], ref_latent.shape[-2], ref_latent.shape[-1],
+            device=ref_latent.device, dtype=ref_latent.dtype,
+        )
+
     def process(self, vae, width, height, num_frames, force_offload, pose_strength, ref_strength,
                 pose_start_percent, pose_end_percent, ref_start_percent, ref_end_percent, replacement_mode,
-                clip_embeds=None, ref_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
+                clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
                 transition_video=None, pose_image_mask=None, reference_image_mask=None, tiled_vae=False,
-                transition_colormatch='disabled', prefix_alpha_crop=False, **kwargs):
+                transition_colormatch='disabled', prefix_alpha_crop=False, preserve_main_ref_background=True,
+                single_frame_prefix_encoding=True, **kwargs):
         W = (width // 32) * 32
         H = (height // 32) * 32
         num_frames = ((num_frames - 1) // 4) * 4 + 1
+        bg_prefix_mask_pixel_frames = 0
+        bg_prefix_mask_index = None
+        crop_main_ref_background = (not replacement_mode) and (not preserve_main_ref_background)
+
+        user_prefix_frames = prefix_frames
+        user_prefix_mask = prefix_mask if user_prefix_frames is not None else None
+        bg_prefix_active = bg_image is not None and not replacement_mode
+        if bg_image is not None and replacement_mode:
+            log.info("SCAIL-2 bg_image is ignored in replacement mode")
+
+        bg_prefix_image = None
+        bg_mask = None
+        user_prefix_count = 0
+        if bg_prefix_active:
+            if bg_image.shape[0] > 1:
+                log.warning("SCAIL-2 bg_image accepts one image; using the first frame")
+            bg_prefix_image = bg_image[:1, :, :, :3]
+
+            if user_prefix_frames is not None:
+                if user_prefix_frames.shape[0] > 4:
+                    log.warning("SCAIL-2 bg_image uses one prefix slot; truncating prefix_frames to 4 images")
+                user_prefix_frames = user_prefix_frames[:4, :, :, :3]
+                user_prefix_count = user_prefix_frames.shape[0]
+                if bg_prefix_image.shape[1] != user_prefix_frames.shape[1] or bg_prefix_image.shape[2] != user_prefix_frames.shape[2]:
+                    bg_prefix_image = self._resize_bhwc(bg_prefix_image, user_prefix_frames.shape[2], user_prefix_frames.shape[1])
+                bg_prefix_image = bg_prefix_image.to(device=user_prefix_frames.device, dtype=user_prefix_frames.dtype)
+
+            if user_prefix_mask is not None:
+                if user_prefix_mask.shape[0] > 4:
+                    log.warning("SCAIL-2 bg_image uses one prefix-mask slot; truncating prefix_mask to 4 images")
+                user_prefix_mask = user_prefix_mask[:4, :, :, :3]
+                bg_mask = torch.ones(
+                    1, user_prefix_mask.shape[1], user_prefix_mask.shape[2], 3,
+                    device=user_prefix_mask.device, dtype=user_prefix_mask.dtype,
+                )
+            else:
+                bg_mask = torch.ones_like(bg_prefix_image[:, :, :, :3])
+
+        if user_prefix_frames is not None and user_prefix_mask is not None and (replacement_mode or prefix_alpha_crop):
+            crop_count = min(user_prefix_frames.shape[0], user_prefix_mask.shape[0], 5)
+            if crop_count > 0:
+                cropped_prefix_frames = user_prefix_frames.clone()
+                cropped_prefix_frames[:crop_count] = self._alpha_crop_with_mask(
+                    cropped_prefix_frames[:crop_count],
+                    user_prefix_mask[:crop_count],
+                )
+                user_prefix_frames = cropped_prefix_frames
+
+        prefix_frames = user_prefix_frames
+        prefix_mask_for_prefix = user_prefix_mask
+        if bg_prefix_active:
+            if single_frame_prefix_encoding:
+                if user_prefix_frames is not None:
+                    prefix_frames = torch.cat([user_prefix_frames, bg_prefix_image], dim=0)
+                    bg_prefix_mask_index = prefix_frames.shape[0] - 1
+                else:
+                    prefix_frames = bg_prefix_image
+                    bg_prefix_mask_index = 0
+                if user_prefix_mask is not None:
+                    if user_prefix_mask.shape[0] < user_prefix_count:
+                        empty_user_masks = torch.zeros(
+                            user_prefix_count - user_prefix_mask.shape[0],
+                            user_prefix_mask.shape[1], user_prefix_mask.shape[2], 3,
+                            device=user_prefix_mask.device, dtype=user_prefix_mask.dtype,
+                        )
+                        user_prefix_mask = torch.cat([user_prefix_mask, empty_user_masks], dim=0)
+                    elif user_prefix_mask.shape[0] > user_prefix_count:
+                        user_prefix_mask = user_prefix_mask[:user_prefix_count]
+                    prefix_mask_for_prefix = torch.cat([user_prefix_mask, bg_mask], dim=0)
+                elif user_prefix_count > 0:
+                    empty_user_masks = torch.zeros(
+                        user_prefix_count, bg_mask.shape[1], bg_mask.shape[2], 3,
+                        device=bg_mask.device, dtype=bg_mask.dtype,
+                    )
+                    prefix_mask_for_prefix = torch.cat([empty_user_masks, bg_mask], dim=0)
+                else:
+                    prefix_mask_for_prefix = bg_mask
+            else:
+                if user_prefix_frames is not None:
+                    prefix_frames = torch.cat([bg_prefix_image, user_prefix_frames], dim=0)
+                else:
+                    prefix_frames = bg_prefix_image
+                if user_prefix_mask is not None:
+                    prefix_mask_for_prefix = torch.cat([bg_mask, user_prefix_mask], dim=0)
+                else:
+                    prefix_mask_for_prefix = bg_mask
+                bg_prefix_mask_pixel_frames = 1
+                bg_prefix_mask_index = 0
+
         canvas_expansion_px = 0
         freeze_canvas = None
-        if prefix_frames is not None:
+        canvas_prefix_frames = prefix_frames if not single_frame_prefix_encoding else None
+        if canvas_prefix_frames is not None:
             canvas_expansion_px = 37
         elif transition_video is not None:
             canvas_expansion_px = 21
         transition_px_range = None
         if transition_video is not None:
-            transition_px_range = (17, 37) if prefix_frames is not None else (0, 21)
+            transition_px_range = (17, 37) if canvas_prefix_frames is not None else (0, 21)
 
         if canvas_expansion_px:
             num_frames += canvas_expansion_px
@@ -1847,16 +1962,16 @@ class WanAnimatePlusSCAIL2Embeds:
                 pose_image_mask = torch.cat([_sample_reversed_prefix_frames(pose_image_mask, canvas_expansion_px), pose_image_mask], dim=0)
 
         prefix_mask_pixels = prefix_mask_frame_mask = scail_sam_keep_mask = scail_transition_keep_mask = None
-        if prefix_mask is not None:
+        if prefix_mask_for_prefix is not None:
             if prefix_frames is None:
                 log.warning("SCAIL-2 prefix_mask was provided without prefix_frames. Ignoring prefix_mask.")
             else:
                 prefix_count = min(prefix_frames.shape[0], 5)
-                if prefix_mask.shape[0] > prefix_count:
-                    log.warning(f"SCAIL-2 prefix_mask has {prefix_mask.shape[0]} images, but prefix_frames has {prefix_count}. Truncating prefix_mask.")
-                mask_count = min(prefix_mask.shape[0], prefix_count)
+                if prefix_mask_for_prefix.shape[0] > prefix_count:
+                    log.warning(f"SCAIL-2 prefix_mask has {prefix_mask_for_prefix.shape[0]} images, but prefix_frames has {prefix_count}. Truncating prefix_mask.")
+                mask_count = min(prefix_mask_for_prefix.shape[0], prefix_count)
                 if mask_count > 0:
-                    prefix_mask_pixels = self._build_prefix_pixels(prefix_mask[:mask_count])
+                    prefix_mask_pixels = self._build_prefix_pixels(prefix_mask_for_prefix[:mask_count])
 
         lat_h = H // vae.upsampling_factor
         lat_w = W // vae.upsampling_factor
@@ -1875,17 +1990,62 @@ class WanAnimatePlusSCAIL2Embeds:
             "ref_mask_flag": not replacement_mode,
         }
 
+        ref_latents = []
+        ref_masks = []
+        ref_mask_condition_used = False
+        prefix_ref_count = 0
+        prefix_ref_black_background = replacement_mode or prefix_alpha_crop
+        if single_frame_prefix_encoding and prefix_frames is not None:
+            prefix_ref_images = prefix_frames[:5, :, :, :3]
+            prefix_ref_source_indices = list(range(prefix_ref_images.shape[0]))
+            prefix_ref_count = prefix_ref_images.shape[0]
+            prefix_ref_masks = [None] * prefix_ref_count
+            if prefix_mask_for_prefix is not None:
+                for out_idx, src_idx in enumerate(prefix_ref_source_indices):
+                    if src_idx >= prefix_mask_for_prefix.shape[0]:
+                        continue
+                    mask = prefix_mask_for_prefix[src_idx:src_idx + 1, :, :, :3]
+                    if src_idx != bg_prefix_mask_index:
+                        mask = self._normalize_mask_background(mask, white_background=not prefix_ref_black_background)
+                    prefix_ref_masks[out_idx] = mask
+                ref_mask_condition_used = any(mask is not None for mask in prefix_ref_masks)
+            for i in range(prefix_ref_images.shape[0]):
+                prefix_latent = self._encode_scail_20ch(vae, prefix_ref_images[i:i + 1], W, H, tiled_vae, scale=ref_strength).to(offload_device)
+                ref_latents.append(prefix_latent)
+                if i < len(prefix_ref_masks) and prefix_ref_masks[i] is not None:
+                    ref_mask = self._resize_bhwc(prefix_ref_masks[i], W, H, mode="bicubic")
+                    ref_masks.append(self._extract_mask_to_28ch(ref_mask).to(offload_device, vae.dtype))
+                else:
+                    ref_masks.append(self._empty_ref_mask_like(prefix_latent))
+            log.info(f"SCAIL-2 prefix reference latents: {prefix_ref_count}")
+
         if ref_image is not None:
             ref_image = ref_image[:1, :, :, :3]
-            if replacement_mode and reference_image_mask is not None:
+            if (replacement_mode or crop_main_ref_background) and reference_image_mask is not None:
                 ref_mask = self._resize_bhwc(reference_image_mask[:1, :, :, :3], W, H, mode="nearest-exact")
                 ref_mask = self._normalize_mask_background(ref_mask, white_background=False)
                 is_char = (ref_mask[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(ref_image.dtype)
-                ref_image = self._resize_bhwc(ref_image, W, H) * is_char
+                ref_image = self._resize_bhwc(ref_image, W, H)
+                is_char = is_char.to(device=ref_image.device, dtype=ref_image.dtype)
+                ref_image = ref_image * is_char
             ref_latent = self._encode_scail_20ch(vae, ref_image, W, H, tiled_vae, scale=ref_strength).to(offload_device)
+            ref_latents.append(ref_latent)
+            if reference_image_mask is not None:
+                ref_mask_condition_used = True
+                ref_mask = self._fit_sequence(reference_image_mask[:, :, :, :3], 1)
+                ref_mask = self._normalize_mask_background(ref_mask, white_background=not (replacement_mode or crop_main_ref_background))
+                ref_mask = self._resize_bhwc(ref_mask, W, H, mode="bicubic")
+                ref_masks.append(self._extract_mask_to_28ch(ref_mask).to(offload_device, vae.dtype))
+            else:
+                ref_masks.append(self._empty_ref_mask_like(ref_latent))
+            log.info(f"SCAIL-2 reference latent shape: {ref_latent.shape}")
+
+        if ref_latents:
+            ref_latent = torch.cat(ref_latents, dim=1)
             scail_embeds["ref_latent_pos"] = ref_latent
             scail_embeds["ref_latent_neg"] = ref_latent
-            log.info(f"SCAIL-2 reference latent shape: {ref_latent.shape}")
+            scail_embeds["ref_prefix_latents"] = prefix_ref_count
+            log.info(f"SCAIL-2 combined reference latent shape: {ref_latent.shape}")
 
         scail_freeze_latents = scail_freeze_mask = scail_condition_zero_mask = None
         actual_prefix_px = 0
@@ -1895,19 +2055,9 @@ class WanAnimatePlusSCAIL2Embeds:
             transition_match_ref = self._resize_bhwc(ref_image[:1, :, :, :3], W, H) if ref_image is not None else None
             if transition_colormatch != "disabled" and transition_match_ref is None:
                 log.warning("SCAIL-2 transition_colormatch is enabled but ref_image is not connected. Skipping color match.")
-            if prefix_frames is not None:
-                prefix_pixels = self._build_prefix_pixels(prefix_frames)
+            if canvas_prefix_frames is not None:
+                prefix_pixels = self._build_prefix_pixels(canvas_prefix_frames)
                 actual_prefix_px = min(prefix_pixels.shape[0], 17)
-                if prefix_alpha_crop and prefix_mask_pixels is not None:
-                    crop_len = min(actual_prefix_px, prefix_mask_pixels.shape[0])
-                    if crop_len > 0:
-                        prefix_alpha = prefix_mask_pixels[:crop_len, :, :, :3]
-                        if prefix_alpha.shape[1] != prefix_pixels.shape[1] or prefix_alpha.shape[2] != prefix_pixels.shape[2]:
-                            prefix_alpha = self._resize_bhwc(prefix_alpha, prefix_pixels.shape[2], prefix_pixels.shape[1], mode="nearest-exact")
-                        prefix_alpha = self._normalize_mask_background(prefix_alpha, white_background=False)
-                        is_char = (prefix_alpha[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(prefix_pixels.dtype)
-                        prefix_pixels = prefix_pixels.clone()
-                        prefix_pixels[:crop_len] = prefix_pixels[:crop_len] * is_char
                 prefix_pixels = self._resize_bhwc(prefix_pixels[:actual_prefix_px], W, H)
                 freeze_canvas[:actual_prefix_px] = prefix_pixels.to(device, dtype=freeze_canvas.dtype)
                 freeze_frame_mask[:actual_prefix_px] = 1.0
@@ -1930,7 +2080,7 @@ class WanAnimatePlusSCAIL2Embeds:
             scail_freeze_mask = scail_freeze_mask.to(offload_device)
             scail_condition_zero_mask = (scail_freeze_mask > 0).any(dim=(1, 2))
             log.info(f"SCAIL-2 freeze latents shape: {scail_freeze_latents.shape}")
-            if prefix_frames is not None and actual_prefix_px > 0:
+            if canvas_prefix_frames is not None and actual_prefix_px > 0:
                 prefix_frame_mask = torch.zeros(canvas_expansion_px, device=device, dtype=vae.dtype)
                 prefix_frame_mask[:actual_prefix_px] = 1.0
                 scail_prefix_prepend_latents = int(self._frame_mask_to_latent_mask(prefix_frame_mask, target_latents).sum().item())
@@ -1967,7 +2117,7 @@ class WanAnimatePlusSCAIL2Embeds:
         if pose_image_mask is not None:
             pose_image_mask = self._fit_sequence(pose_image_mask[:, :, :, :3], num_frames)
             pose_image_mask = self._normalize_mask_background(pose_image_mask, white_background=replacement_mode)
-        elif prefix_mask_pixels is not None:
+        elif prefix_mask_pixels is not None and not single_frame_prefix_encoding:
             pose_bg = 1.0 if replacement_mode else 0.0
             pose_image_mask = torch.full(
                 (
@@ -1976,12 +2126,18 @@ class WanAnimatePlusSCAIL2Embeds:
                 pose_bg, device=prefix_mask_pixels.device, dtype=prefix_mask_pixels.dtype,
             )
 
-        if pose_image_mask is not None and prefix_mask_pixels is not None:
+        if pose_image_mask is not None and prefix_mask_pixels is not None and not single_frame_prefix_encoding:
             prefix_mask_len = min(prefix_mask_pixels.shape[0], pose_image_mask.shape[0])
             prefix_mask_in = prefix_mask_pixels[:prefix_mask_len, :, :, :3]
             if prefix_mask_in.shape[1] != pose_image_mask.shape[1] or prefix_mask_in.shape[2] != pose_image_mask.shape[2]:
                 prefix_mask_in = self._resize_bhwc(prefix_mask_in, pose_image_mask.shape[2], pose_image_mask.shape[1], mode="nearest-exact")
-            prefix_mask_in = self._normalize_mask_background(prefix_mask_in, white_background=not prefix_alpha_crop)
+            bg_keep = min(bg_prefix_mask_pixel_frames, prefix_mask_in.shape[0])
+            if prefix_mask_in.shape[0] > bg_keep:
+                user_prefix_mask_in = self._normalize_mask_background(prefix_mask_in[bg_keep:], white_background=not prefix_alpha_crop)
+                if bg_keep > 0:
+                    prefix_mask_in = torch.cat([prefix_mask_in[:bg_keep], user_prefix_mask_in], dim=0)
+                else:
+                    prefix_mask_in = user_prefix_mask_in
             pose_image_mask = pose_image_mask.clone()
             pose_image_mask[:prefix_mask_len] = prefix_mask_in.to(device=pose_image_mask.device, dtype=pose_image_mask.dtype)
             prefix_mask_frame_mask = torch.zeros(num_frames, device=pose_image_mask.device, dtype=pose_image_mask.dtype)
@@ -2010,16 +2166,13 @@ class WanAnimatePlusSCAIL2Embeds:
             scail_embeds["sam_latents"] = sam_latents
             log.info(f"SCAIL-2 driving mask latents shape: {sam_latents.shape}")
 
-        if reference_image_mask is not None:
-            ref_mask = self._fit_sequence(reference_image_mask[:, :, :, :3], 1)
-            ref_mask = self._normalize_mask_background(ref_mask, white_background=not replacement_mode)
-            ref_mask = self._resize_bhwc(ref_mask, W, H, mode="bicubic")
-            ref_mask_1f = self._extract_mask_to_28ch(ref_mask).to(offload_device, vae.dtype)
+        if ref_masks and ref_mask_condition_used:
+            ref_mask_prefix = torch.cat(ref_masks, dim=1)
             zeros = torch.zeros(
-                28, target_latents, ref_mask_1f.shape[-2], ref_mask_1f.shape[-1],
-                device=offload_device, dtype=ref_mask_1f.dtype,
+                28, target_latents, ref_mask_prefix.shape[-2], ref_mask_prefix.shape[-1],
+                device=offload_device, dtype=ref_mask_prefix.dtype,
             )
-            scail_embeds["ref_mask_latents"] = torch.cat([ref_mask_1f, zeros], dim=1)
+            scail_embeds["ref_mask_latents"] = torch.cat([ref_mask_prefix, zeros], dim=1)
             log.info(f"SCAIL-2 reference mask latents shape: {scail_embeds['ref_mask_latents'].shape}")
 
         if force_offload:
