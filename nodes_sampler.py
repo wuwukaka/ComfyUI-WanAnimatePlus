@@ -228,34 +228,32 @@ class WanVideoSampler:
                 fp8_matmul = False
                 model["fp8_matmul"] = False
                 log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
-                # Load dequantized bf16 weights BEFORE applying LoRA.
+                # Load dequantized bf16 weights.
                 load_weights(transformer, _sd, dtype, base_dtype=dtype,
                              transformer_load_device=device,
-                             block_swap_args=block_swap_args,
-                             compile_args=model.get("compile_args") if hasattr(model, "get") else None)
-                # Apply LoRA directly to dequantized weights — bypass
-                # _replace_linear/CustomLinear which would recreate meta tensors.
-                _lora_keys = {}
-                for pk, pv in patcher.patches.items():
-                    # pk is like 'diffusion_model.blocks.0.self_attn.q.weight'
-                    _mkey = pk.replace("diffusion_model.", "")
-                    _lora_keys[_mkey] = pv
+                             block_swap_args=block_swap_args)
+                # Apply LoRA directly to dequantized weights, matching
+                # CustomLinear._apply_lora_direct: torch.mm(A,B)=A@B.t()
                 for n, m in transformer.named_modules():
                     if isinstance(m, torch.nn.Linear):
                         _wk = f"{n}.weight"
-                        if _wk in _lora_keys:
+                        for pk, pv in patcher.patches.items():
+                            if pk.replace("diffusion_model.", "") != _wk:
+                                continue
                             w = m.weight.data.to(device, dtype)
-                            for strength, lora in _lora_keys[_wk]:
+                            for strength, lora in pv:
                                 if hasattr(lora, 'weights'):
                                     wa, wb = lora.weights
-                                    alpha = getattr(lora, 'alpha', 1.0) or 1.0
+                                    alpha = float(getattr(lora, 'alpha', 0) or 0)
                                     r = wb.shape[0]
-                                    patch = (wa.to(device, dtype) @ wb.to(device, dtype)) * (alpha / max(r, 1))
-                                    w = w + patch * strength
+                                    scale = strength * (alpha / r if alpha else 1.0)
+                                    w = w + torch.mm(wa, wb).reshape(w.shape).to(device, dtype) * scale
                                 elif isinstance(lora, tuple) and lora[0] == "diff":
                                     w = w + lora[1].to(device, dtype) * strength
                             m.weight = torch.nn.Parameter(w, requires_grad=False)
-                transformer.patched_linear = True
+                            break
+                # Prevent redundant load_weights from overwriting LoRA-baked weights.
+                patcher.model["sd"] = None
 
         # Load weights
         if transformer.audio_model is not None:
