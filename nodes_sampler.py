@@ -17,6 +17,7 @@
 import os, gc, math, copy
 import torch
 import numpy as np
+import comfy.lora
 from tqdm import tqdm
 import inspect
 from .wanvideo.modules.model import rope_params
@@ -239,8 +240,9 @@ class WanVideoSampler:
                     load_weights(transformer, _sd, dtype, base_dtype=dtype,
                                  transformer_load_device=device,
                                  block_swap_args=block_swap_args)
-                    # Apply LoRA directly to dequantized weights, matching
-                    # CustomLinear._apply_lora_direct: torch.mm(A,B)=A@B.t()
+                    # Apply LoRA patches using Comfy's native patch format
+                    # handler so current 5-tuple patch entries remain
+                    # compatible with unmerged MXFP8 fallback.
                     for n, m in transformer.named_modules():
                         if isinstance(m, torch.nn.Linear):
                             _wk = f"{n}.weight"
@@ -248,17 +250,12 @@ class WanVideoSampler:
                                 if pk.replace("diffusion_model.", "") != _wk:
                                     continue
                                 w = m.weight.data.to(device, dtype)
-                                for strength, lora in pv:
-                                    if hasattr(lora, 'weights'):
-                                        wa, wb = lora.weights
-                                        wa = wa.to(device, dtype)
-                                        wb = wb.to(device, dtype)
-                                        alpha = float(getattr(lora, 'alpha', 0) or 0)
-                                        r = wb.shape[0]
-                                        scale = strength * (alpha / r if alpha else 1.0)
-                                        w = w + torch.mm(wa, wb).reshape(w.shape) * scale
-                                    elif isinstance(lora, tuple) and lora[0] == "diff":
-                                        w = w + lora[1].to(device, dtype) * strength
+                                w = comfy.lora.calculate_weight(
+                                    pv,
+                                    w,
+                                    _wk,
+                                    intermediate_dtype=dtype,
+                                ).to(device=device, dtype=dtype)
                                 m.weight = torch.nn.Parameter(w, requires_grad=False)
                                 # Write baked weight back to sd so offload/reload works.
                                 if _wk in _sd:
