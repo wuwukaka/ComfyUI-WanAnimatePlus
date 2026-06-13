@@ -235,7 +235,8 @@ class WanVideoSampler:
                     from .fp8_optimization import dequantize_mxfp8_weight
                     for m in transformer.modules():
                         if isinstance(m, torch.nn.Linear) and hasattr(m, 'block_scale_weight'):
-                            w = dequantize_mxfp8_weight(m.weight, m.block_scale_weight)
+                            bsw = m.block_scale_weight.to(m.weight.device)
+                            w = dequantize_mxfp8_weight(m.weight, bsw)
                             m.weight = torch.nn.Parameter(w, requires_grad=False)
                             m._buffers.pop('block_scale_weight', None)
                             if hasattr(m, 'original_forward'):
