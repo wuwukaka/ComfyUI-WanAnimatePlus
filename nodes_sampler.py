@@ -11,6 +11,8 @@
 #   - Added EverAnimate VAE re-encode clamp/uint8 preprocessing to match the reference path.
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
+#   - Added runtime MXFP8 + unmerged LoRA compatibility routing and fallback-aware
+#     patched-linear setup.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy
 import torch
@@ -210,53 +212,58 @@ class WanVideoSampler:
         # path) so this block can find and use them.
         try: _is_mxfp8 = model["mxfp8_active"]
         except KeyError: _is_mxfp8 = False
+        try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
+        except KeyError: _mxfp8_unmerged_runtime = False
         if _is_mxfp8 and fp8_matmul and len(patcher.patches) != 0 and not merge_loras:
-            from .fp8_optimization import dequantize_mxfp8_weight
-            _sd = patcher.model["sd"]
-            _did = False
-            if _sd is not None:
-                _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
-                for k in list(_sd.keys()):
-                    if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
-                        sk = k.replace(".weight", ".scale_weight")
-                        if sk in _sd and _sd[sk].dtype in _E8:
-                            _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
-                            _sd.pop(sk, None)
-                            _did = True
-            if _did:
-                weight_dtype = dtype
-                fp8_matmul = False
-                model["fp8_matmul"] = False
-                log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
-                # Load dequantized bf16 weights.
-                load_weights(transformer, _sd, dtype, base_dtype=dtype,
-                             transformer_load_device=device,
-                             block_swap_args=block_swap_args)
-                # Apply LoRA directly to dequantized weights, matching
-                # CustomLinear._apply_lora_direct: torch.mm(A,B)=A@B.t()
-                for n, m in transformer.named_modules():
-                    if isinstance(m, torch.nn.Linear):
-                        _wk = f"{n}.weight"
-                        for pk, pv in patcher.patches.items():
-                            if pk.replace("diffusion_model.", "") != _wk:
-                                continue
-                            w = m.weight.data.to(device, dtype)
-                            for strength, lora in pv:
-                                if hasattr(lora, 'weights'):
-                                    wa, wb = lora.weights
-                                    wa = wa.to(device, dtype)
-                                    wb = wb.to(device, dtype)
-                                    alpha = float(getattr(lora, 'alpha', 0) or 0)
-                                    r = wb.shape[0]
-                                    scale = strength * (alpha / r if alpha else 1.0)
-                                    w = w + torch.mm(wa, wb).reshape(w.shape) * scale
-                                elif isinstance(lora, tuple) and lora[0] == "diff":
-                                    w = w + lora[1].to(device, dtype) * strength
-                            m.weight = torch.nn.Parameter(w, requires_grad=False)
-                            # Write baked weight back to sd so offload/reload works.
-                            if _wk in _sd:
-                                _sd[_wk] = w
-                            break
+            if _mxfp8_unmerged_runtime:
+                log.info("Using runtime MXFP8 + unmerged LoRA path")
+            else:
+                from .fp8_optimization import dequantize_mxfp8_weight
+                _sd = patcher.model["sd"]
+                _did = False
+                if _sd is not None:
+                    _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
+                    for k in list(_sd.keys()):
+                        if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
+                            sk = k.replace(".weight", ".scale_weight")
+                            if sk in _sd and _sd[sk].dtype in _E8:
+                                _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
+                                _sd.pop(sk, None)
+                                _did = True
+                if _did:
+                    weight_dtype = dtype
+                    fp8_matmul = False
+                    model["fp8_matmul"] = False
+                    log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
+                    # Load dequantized bf16 weights.
+                    load_weights(transformer, _sd, dtype, base_dtype=dtype,
+                                 transformer_load_device=device,
+                                 block_swap_args=block_swap_args)
+                    # Apply LoRA directly to dequantized weights, matching
+                    # CustomLinear._apply_lora_direct: torch.mm(A,B)=A@B.t()
+                    for n, m in transformer.named_modules():
+                        if isinstance(m, torch.nn.Linear):
+                            _wk = f"{n}.weight"
+                            for pk, pv in patcher.patches.items():
+                                if pk.replace("diffusion_model.", "") != _wk:
+                                    continue
+                                w = m.weight.data.to(device, dtype)
+                                for strength, lora in pv:
+                                    if hasattr(lora, 'weights'):
+                                        wa, wb = lora.weights
+                                        wa = wa.to(device, dtype)
+                                        wb = wb.to(device, dtype)
+                                        alpha = float(getattr(lora, 'alpha', 0) or 0)
+                                        r = wb.shape[0]
+                                        scale = strength * (alpha / r if alpha else 1.0)
+                                        w = w + torch.mm(wa, wb).reshape(w.shape) * scale
+                                    elif isinstance(lora, tuple) and lora[0] == "diff":
+                                        w = w + lora[1].to(device, dtype) * strength
+                                m.weight = torch.nn.Parameter(w, requires_grad=False)
+                                # Write baked weight back to sd so offload/reload works.
+                                if _wk in _sd:
+                                    _sd[_wk] = w
+                                break
 
         # Load weights
         if transformer.audio_model is not None:
@@ -265,7 +272,7 @@ class WanVideoSampler:
                     block.audio_block = None
 
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model.get("scale_weights", None), block_scale_weights=patcher.model.get("block_scale_weights", None), compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
@@ -278,7 +285,7 @@ class WanVideoSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul:
+            if not merge_loras and fp8_matmul and not _mxfp8_unmerged_runtime:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:

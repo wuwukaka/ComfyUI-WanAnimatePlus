@@ -4,11 +4,15 @@
 #   - Added guarded custom op registration for duplicate imports/stale bytecode.
 #   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
 #   - Added MXFP8/block-wise scale_weight expansion before linear forward.
+#   - Added runtime MXFP8 + unmerged LoRA support with effective-weight caching,
+#     per-step strength-aware cache invalidation, and non-fast fallback when
+#     runtime requantization is unavailable.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
+from .utils import log
 
 if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
     @torch.library.custom_op("wananimateplus::apply_lora", mutates_args=())
@@ -73,7 +77,7 @@ except RuntimeError:
     pass
 
 #based on https://github.com/huggingface/diffusers/blob/main/src/diffusers/quantizers/gguf/utils.py
-def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, scale_weights=None, compile_args=None, modules_to_not_convert=[]):
+def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, scale_weights=None, block_scale_weights=None, compile_args=None, modules_to_not_convert=[]):
 
     has_children = list(model.children())
     if not has_children:
@@ -86,7 +90,7 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
             allow_compile = compile_args.get("allow_unmerged_lora_compile", False)
         module_prefix = prefix + name + "."
         module_prefix = module_prefix.replace("_orig_mod.", "")
-        _replace_linear(module, compute_dtype, state_dict, module_prefix, patches, scale_weights, compile_args, modules_to_not_convert)
+        _replace_linear(module, compute_dtype, state_dict, module_prefix, patches, scale_weights, block_scale_weights, compile_args, modules_to_not_convert)
 
         if isinstance(module, nn.Linear) and "loras" not in module_prefix and "dual_controller" not in module_prefix and name not in modules_to_not_convert:
             weight_key = module_prefix + "weight"
@@ -103,6 +107,21 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
                 scale_key = f"{module_prefix}scale_weight"
                 scale_weight = scale_weights.get(scale_key)
 
+            block_scale_weight = None
+            if not is_gguf:
+                scale_key = f"{module_prefix}scale_weight"
+                if block_scale_weights is not None:
+                    block_scale_weight = block_scale_weights.get(scale_key)
+                elif scale_key in state_dict:
+                    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                    scale_tensor = state_dict[scale_key]
+                    e8m0_dtypes = tuple(dt for dt in (e8m0_dtype, torch.uint8) if dt is not None)
+                    if isinstance(scale_tensor, torch.Tensor) and scale_tensor.dtype in e8m0_dtypes:
+                        block_scale_weight = scale_tensor
+                e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                if block_scale_weight is not None and block_scale_weight.dtype == torch.uint8 and e8m0_dtype is not None:
+                    block_scale_weight = block_scale_weight.view(e8m0_dtype)
+
             with init_empty_weights():
                 model._modules[name] = CustomLinear(
                     in_features,
@@ -110,6 +129,7 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
                     module.bias is not None,
                     compute_dtype=compute_dtype,
                     scale_weight=scale_weight,
+                    block_scale_weight=block_scale_weight,
                     allow_compile=allow_compile,
                     is_gguf=is_gguf
                 )
@@ -164,6 +184,7 @@ class CustomLinear(nn.Linear):
         compute_dtype=None,
         device=None,
         scale_weight=None,
+        block_scale_weight=None,
         allow_compile=False,
         is_gguf=False
     ) -> None:
@@ -172,9 +193,17 @@ class CustomLinear(nn.Linear):
         self.lora_diffs = []
         self.register_buffer("_step", torch.zeros((), dtype=torch.long))
         self.scale_weight = scale_weight
+        if block_scale_weight is not None:
+            self.register_buffer("block_scale_weight", block_scale_weight, persistent=True)
+        else:
+            self.block_scale_weight = None
         self.lora_strengths = []
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
+        self._lora_cache_key = None
+        self._lora_cache_weight = None
+        self._lora_cache_mode = None
+        self._mxfp8_lora_last_error = None
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -215,6 +244,7 @@ class CustomLinear(nn.Linear):
         return torch.ops.wananimateplus.linear_forward(input, weight, bias)
 
     def set_lora_diffs(self, lora_diffs, device=torch.device("cpu")):
+        self._clear_lora_cache()
         self.lora_diffs = []
         for i, diff in enumerate(lora_diffs):
             if len(diff) > 1:
@@ -227,6 +257,7 @@ class CustomLinear(nn.Linear):
                 self.lora_diffs.append(f"lora_diff_{i}_0")
 
     def set_lora_strengths(self, lora_strengths, device=torch.device("cpu")):
+        self._clear_lora_cache()
         self._lora_strength_tensors = []
         self._lora_strength_is_scheduled = []
         self._step = self._step.to(device)
@@ -245,6 +276,41 @@ class CustomLinear(nn.Linear):
         if self._lora_strength_is_scheduled[idx]:
             return strength_tensor.index_select(0, self._step).squeeze(0)
         return strength_tensor[0]
+
+    def _get_lora_cache_key(self, input):
+        if not hasattr(self, "lora_diff_0_0"):
+            return None
+        step = int(self._step.item()) if hasattr(self, "_step") else 0
+        strengths = []
+        for idx in range(len(self.lora_diffs)):
+            strengths.append(float(self._get_lora_strength(idx).detach().float().cpu().item()))
+        return (
+            input.device.type,
+            int(input.device.index) if input.device.index is not None else -1,
+            input.dtype,
+            self.compute_dtype,
+            step,
+            tuple(strengths),
+            tuple(self.weight.shape),
+        )
+
+    def _clear_lora_cache(self):
+        self._lora_cache_key = None
+        self._lora_cache_weight = None
+        self._lora_cache_mode = None
+        self._mxfp8_lora_last_error = None
+
+    def _get_weight_with_lora_cached(self, weight, input):
+        if not hasattr(self, "lora_diff_0_0"):
+            return weight
+        cache_key = self._get_lora_cache_key(input)
+        if self._lora_cache_key == cache_key and self._lora_cache_weight is not None:
+            return self._lora_cache_weight
+        weight = self._get_weight_with_lora(weight)
+        self._lora_cache_key = cache_key
+        self._lora_cache_weight = weight
+        self._lora_cache_mode = "plain"
+        return weight
 
     def _get_weight_with_lora(self, weight):
         """Apply LoRA using custom ops to avoid graph breaks"""
@@ -276,13 +342,61 @@ class CustomLinear(nn.Linear):
             weight = self.weight.to(input)
         return weight
 
-    def forward(self, input):
-        weight = self._prepare_weight(input)
+    def _forward_mxfp8_with_lora_fallback(self, input, bias):
+        from .fp8_optimization import (
+            dequantize_mxfp8_weight,
+            quantize_mxfp8_weight_like,
+            run_mxfp8_linear_kernel,
+        )
+        plain_bias = bias.to(device=input.device, dtype=self.compute_dtype) if bias is not None else None
 
+        cache_key = self._get_lora_cache_key(input)
+        if self._lora_cache_key != cache_key:
+            self._lora_cache_weight = None
+            self._lora_cache_mode = None
+
+        if self._lora_cache_mode == "mxfp8" and self._lora_cache_weight is not None:
+            q_weight, q_scale = self._lora_cache_weight
+            return run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+
+        if self._lora_cache_mode == "plain" and self._lora_cache_weight is not None:
+            return self._linear_forward_impl(input.to(self.compute_dtype), self._lora_cache_weight, plain_bias)
+
+        block_scale_weight = self.block_scale_weight.to(self.weight.device)
+        base_weight = dequantize_mxfp8_weight(self.weight, block_scale_weight).to(
+            device=input.device, dtype=self.compute_dtype
+        )
+        effective_weight = self._get_weight_with_lora(base_weight)
+        self._lora_cache_key = cache_key
+
+        try:
+            q_weight, q_scale = quantize_mxfp8_weight_like(effective_weight, self.block_scale_weight)
+            self._lora_cache_weight = (q_weight, q_scale)
+            self._lora_cache_mode = "mxfp8"
+            return run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+        except Exception as e:
+            if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+                raise
+            if self._mxfp8_lora_last_error != str(e):
+                log.warning(f"MXFP8 + unmerged LoRA falling back to non-fast linear: {e}")
+                self._mxfp8_lora_last_error = str(e)
+            self._lora_cache_weight = effective_weight
+            self._lora_cache_mode = "plain"
+            return self._linear_forward_impl(input.to(self.compute_dtype), effective_weight, plain_bias)
+
+    def forward(self, input):
         if self.bias is not None:
             bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
         else:
             bias = None
+
+        if getattr(self, "block_scale_weight", None) is not None:
+            if hasattr(self, "lora_diff_0_0"):
+                return self._forward_mxfp8_with_lora_fallback(input, bias)
+            from .fp8_optimization import run_mxfp8_linear_kernel
+            return run_mxfp8_linear_kernel(self, input, bias, out_dtype=self.compute_dtype)
+
+        weight = self._prepare_weight(input)
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
@@ -297,7 +411,7 @@ class CustomLinear(nn.Linear):
             else:
                 input = input * sw
 
-        weight = self._get_weight_with_lora(weight)
+        weight = self._get_weight_with_lora_cached(weight, input)
         out = self._linear_forward_impl(input, weight, bias)
         del weight, input, bias
         return out
@@ -310,6 +424,8 @@ def update_lora_step(module, step):
 def remove_lora_from_module(module):
     for name, submodule in module.named_modules():
         if hasattr(submodule, "lora_diffs"):
+            if hasattr(submodule, "_clear_lora_cache"):
+                submodule._clear_lora_cache()
             for i in range(len(submodule.lora_diffs)):
                 if hasattr(submodule, f"lora_diff_{i}_0"):
                     delattr(submodule, f"lora_diff_{i}_0")

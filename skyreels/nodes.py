@@ -1,3 +1,10 @@
+# Copyright (c) 2025 kijai
+# Modified from skyreels/nodes.py in ComfyUI-WanVideoWrapper.
+# Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+#   - Added runtime MXFP8 + unmerged LoRA compatibility routing for the
+#     SkyReels diffusion-forcing sampler path.
+# Licensed under the Apache License, Version 2.0
 import os
 import torch
 import gc
@@ -153,6 +160,8 @@ class WanVideoDiffusionForcingSampler:
         fp8_matmul = model["fp8_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
+        try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
+        except KeyError: _mxfp8_unmerged_runtime = False
 
         transformer_options = patcher.model_options.get("transformer_options", None)
         merge_loras = transformer_options["merge_loras"]
@@ -172,7 +181,7 @@ class WanVideoDiffusionForcingSampler:
 
         # Load weights
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model.get("scale_weights", None), block_scale_weights=patcher.model.get("block_scale_weights", None), compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
@@ -183,7 +192,7 @@ class WanVideoDiffusionForcingSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul:
+            if not merge_loras and fp8_matmul and not _mxfp8_unmerged_runtime:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:

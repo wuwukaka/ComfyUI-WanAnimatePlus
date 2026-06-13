@@ -5,7 +5,8 @@
 #   - Added MXFP8 block-scaled quantization option ("mxfp8") to the quantization
 #     dropdown, auto-detection of float8_e8m0fnu block scales in state dicts,
 #     and comfy-kitchen integration for hardware-accelerated matmul on Blackwell
-#     GPUs with load-time dequantization fallback for unsupported hardware.
+#     GPUs with runtime unmerged-LoRA support and load-time dequantization
+#     fallback for unsupported hardware.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
@@ -1842,7 +1843,8 @@ class WanVideoModelLoader:
                 transformer.patched_linear = False
                 sd = None
             elif "scaled" in quantization or lora is not None:
-                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
+                prepatch_block_scales = block_scale_weights if ("mxfp8" in quantization and lora is not None and not merge_loras) else None
+                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, block_scale_weights=prepatch_block_scales, compile_args=compile_args)
                 transformer.patched_linear = True
 
         if "fast" in quantization:
@@ -1851,25 +1853,40 @@ class WanVideoModelLoader:
             from .fp8_optimization import convert_fp8_linear
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
 
+        mxfp8_unmerged_lora_runtime = False
         if "mxfp8" in quantization:
             from .fp8_optimization import convert_mxfp8_linear, dequantize_mxfp8_weight, _CK_MXFP8
             if lora is not None and not merge_loras:
-                # Unmerged LoRA + MXFP8: dequantize at load time so LoRA patches
-                # can be applied in compute_dtype, matching Bernini's fallback.
-                log.warning("MXFP8 dequantizing for unmerged LoRA compatibility")
-                if sd is None:
-                    raise RuntimeError(
-                        "MXFP8 requires comfy-kitchen and a Blackwell GPU (CC>=10). "
-                        "Install with: pip install comfy-kitchen==0.2.10"
-                    )
-                for k, v in block_scale_weights.items():
-                    weight_key = k.replace(".scale_weight", ".weight")
-                    if weight_key in sd:
-                        sd[weight_key] = dequantize_mxfp8_weight(sd[weight_key], v)
-                    sd.pop(k, None)
-                block_scale_weights.clear()
-                weight_dtype = base_dtype
-                quantization = "disabled"
+                if _CK_MXFP8 and block_scale_weights:
+                    log.warning("MXFP8 + unmerged LoRA enabled with runtime effective-weight quantization")
+                    if not transformer.patched_linear:
+                        transformer = _replace_linear(
+                            transformer,
+                            base_dtype,
+                            sd,
+                            scale_weights=scale_weights,
+                            block_scale_weights=block_scale_weights,
+                            compile_args=compile_args,
+                        )
+                        transformer.patched_linear = True
+                    mxfp8_unmerged_lora_runtime = True
+                    patcher.model["mxfp8_active"] = True
+                else:
+                    # Runtime MXFP8 path unavailable -> keep compatibility by dequantizing
+                    log.warning("MXFP8 runtime path unavailable, dequantizing for unmerged LoRA compatibility")
+                    if sd is None:
+                        raise RuntimeError(
+                            "MXFP8 requires comfy-kitchen and a Blackwell GPU (CC>=10). "
+                            "Install with: pip install comfy-kitchen==0.2.10"
+                        )
+                    for k, v in block_scale_weights.items():
+                        weight_key = k.replace(".scale_weight", ".weight")
+                        if weight_key in sd:
+                            sd[weight_key] = dequantize_mxfp8_weight(sd[weight_key], v)
+                        sd.pop(k, None)
+                    block_scale_weights.clear()
+                    weight_dtype = base_dtype
+                    quantization = "disabled"
             elif _CK_MXFP8:
                 convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
                 transformer.patched_linear = True
@@ -1967,7 +1984,9 @@ class WanVideoModelLoader:
         patcher.model["compile_args"] = compile_args
         patcher.model["gguf_reader"] = gguf_reader
         patcher.model["fp8_matmul"] = "fast" in quantization or "mxfp8" in quantization
+        patcher.model["mxfp8_unmerged_lora_runtime"] = mxfp8_unmerged_lora_runtime
         patcher.model["scale_weights"] = scale_weights
+        patcher.model["block_scale_weights"] = block_scale_weights
         patcher.model["sd"] = sd
         patcher.model["lora"] = lora
 

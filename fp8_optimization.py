@@ -3,8 +3,9 @@
 # Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 #   - Added MXFP8 block-scaled quantization support with comfy-kitchen integration,
-#     including block-scaled matmul forward, load-time dequantization fallback,
-#     and auto-detection of float8_e8m0fnu block scales.
+#     including block-scaled matmul forward, runtime effective-weight
+#     requantization helpers for unmerged LoRA, load-time dequantization
+#     fallback, and auto-detection of float8_e8m0fnu block scales.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
@@ -114,6 +115,44 @@ def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
     return (weight_fp8.float() * scale_expanded).to(torch.bfloat16)
 
 
+def quantize_mxfp8_weight_like(weight, reference_block_scale):
+    if not _CK_MXFP8:
+        raise RuntimeError("comfy-kitchen MXFP8 quantization is unavailable")
+    q_weight, q_scale = ck.quantize_mxfp8(weight.to(torch.bfloat16), pad_32x=True)
+    if q_scale.dtype == torch.uint8:
+        q_scale = q_scale.view(torch.float8_e8m0fnu)
+    if reference_block_scale is not None and q_scale.shape != reference_block_scale.shape:
+        raise RuntimeError(
+            f"Quantized MXFP8 scale shape {q_scale.shape} does not match reference scale shape {reference_block_scale.shape}"
+        )
+    return q_weight, q_scale
+
+
+def run_mxfp8_linear_kernel(cls, input, bias, weight=None, block_scale=None, out_dtype=None):
+    if not _CK_MXFP8:
+        raise RuntimeError("comfy-kitchen MXFP8 kernel is unavailable")
+    if len(input.shape) != 3:
+        effective_weight = (weight if weight is not None else cls.weight).to(input.device)
+        effective_bias = bias.to(device=input.device, dtype=out_dtype or input.dtype) if bias is not None else None
+        return torch.nn.functional.linear(input.to(out_dtype or input.dtype), effective_weight.to(out_dtype or input.dtype), effective_bias)
+
+    input_shape = input.shape
+    inp_2d = input.reshape(-1, input_shape[2]).to(out_dtype or bias.dtype if bias is not None else torch.bfloat16)
+    orig_rows = inp_2d.shape[0]
+    orig_cols = (weight if weight is not None else cls.weight).shape[0]
+    inp_fp8, inp_block_scale = ck.quantize_mxfp8(inp_2d, pad_32x=True)
+    q_weight = (weight if weight is not None else cls.weight).to(input.device)
+    q_scale = (block_scale if block_scale is not None else cls.block_scale_weight).to(input.device)
+    bias = bias.to(device=input.device, dtype=out_dtype or inp_2d.dtype) if bias is not None else None
+    o = ck.scaled_mm_mxfp8(
+        inp_fp8, q_weight, inp_block_scale, q_scale,
+        bias=bias, out_dtype=out_dtype or inp_2d.dtype,
+    )
+    if o.shape[0] != orig_rows or o.shape[1] != orig_cols:
+        o = o[:orig_rows, :orig_cols]
+    return o.reshape((-1, input_shape[1], orig_cols))
+
+
 def mxfp8_linear_forward(cls, base_dtype, input):
     """MXFP8 block-scaled linear forward, counterpart to fp8_linear_forward.
 
@@ -123,23 +162,8 @@ def mxfp8_linear_forward(cls, base_dtype, input):
     """
     if cls.weight.dtype == torch.float8_e4m3fn and _CK_MXFP8 and hasattr(cls, 'block_scale_weight'):
         if len(input.shape) == 3:
-            input_shape = input.shape
-            inp_2d = input.reshape(-1, input_shape[2]).to(base_dtype)
-            orig_rows, orig_cols = inp_2d.shape[0], cls.weight.shape[0]
             try:
-                # Block-quantize activation (same layout as weight), matching Bernini
-                inp_fp8, inp_block_scale = ck.quantize_mxfp8(inp_2d, pad_32x=True)
-                block_scale = cls.block_scale_weight.to(input.device)
-                weight = cls.weight.to(input.device)
-                bias = cls.bias.to(device=input.device, dtype=base_dtype) if cls.bias is not None else None
-                o = ck.scaled_mm_mxfp8(
-                    inp_fp8, weight, inp_block_scale, block_scale,
-                    bias=bias, out_dtype=base_dtype,
-                )
-                # ck.scaled_mm_mxfp8 may pad output to 32-alignment; slice back
-                if o.shape[0] != orig_rows or o.shape[1] != orig_cols:
-                    o = o[:orig_rows, :orig_cols]
-                return o.reshape((-1, input_shape[1], orig_cols))
+                return run_mxfp8_linear_kernel(cls, input, cls.bias, out_dtype=base_dtype)
             except Exception as e:
                 # Re-raise OOM immediately — the fallback allocates 2x more
                 # memory (bf16 dequant) and would cause a cascading OOM.
