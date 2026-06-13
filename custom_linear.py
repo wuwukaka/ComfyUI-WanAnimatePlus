@@ -10,9 +10,11 @@
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
+import logging
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
-from .utils import log
+
+log = logging.getLogger(__name__)
 
 if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
     @torch.library.custom_op("wananimateplus::apply_lora", mutates_args=())
