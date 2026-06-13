@@ -12,3 +12,4 @@ tools/
 convert_*
 *.pt
 *.pth
+/.claude
