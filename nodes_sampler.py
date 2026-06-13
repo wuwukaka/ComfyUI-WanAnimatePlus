@@ -1385,7 +1385,7 @@ class WanVideoSampler:
             nonlocal audio_cfg_scale
             nonlocal scail2_fast_path_fallback_logged
 
-            autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
+            autocast_enabled = ("fp8" in model["quantization"] and "mxfp8" not in model["quantization"] and not transformer.patched_linear)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype) if autocast_enabled else nullcontext():
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
@@ -3605,7 +3605,7 @@ class WanVideoSampler:
 
                             if offloaded:
                                 # Load weights
-                                if transformer.patched_linear and gguf_reader is None:
+                                if transformer.patched_linear and patcher.model["sd"] is not None and gguf_reader is None:
                                     load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)

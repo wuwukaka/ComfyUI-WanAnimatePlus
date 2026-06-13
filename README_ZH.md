@@ -189,6 +189,16 @@ SCAIL-2 的 `prefix_frames` 固定使用 37 像素帧前置画布。只有 `tran
 |------|------|
 | `mxfp8` | MXFP8（微缩放 FP8）量化格式。通过跨元素块共享缩放因子，相比逐张量 FP8 在相近的显存节省下提供更高的精度。需要兼容的量化模型权重。 |
 
+**硬件要求：** 硬件加速的 MXFP8 矩阵乘法需要 NVIDIA Blackwell GPU（计算能力 &gt;= 10.0，如 RTX 5090 / B100 / B200）。在非 Blackwell GPU 上，MXFP8 权重会在加载时自动反量化到 BF16 进行正常推理（无显存节省，但模型正常运行）。
+
+**自动检测：** 当 `quantization` 下拉菜单设为 `disabled` 时，MXFP8 权重会通过扫描 state_dict 中的 `float8_e8m0fnu` 块缩放张量自动检测。无需手动选择。
+
+**安装（可选）：** 硬件加速需要 [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)：
+```
+pip install comfy-kitchen==0.2.10
+```
+此包**不是**硬依赖——仅 Blackwell GPU 加速需要。没有它模型也能通过反量化回退正常运行。
+
 MXFP8 量化支持源自 [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)（Apache 2.0）。
 
 ## 项目结构

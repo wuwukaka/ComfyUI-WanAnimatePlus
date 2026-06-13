@@ -454,7 +454,7 @@ class WanVideoDiffusionForcingSampler:
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None, 
                              vace_data=None, unianim_data=None, teacache_state=None):
-            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"])):
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype, enabled=("fp8" in model["quantization"] and "mxfp8" not in model["quantization"])):
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
                     return latent_model_input*0, None
