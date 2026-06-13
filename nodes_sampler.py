@@ -204,20 +204,26 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
-        # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
+        # MXFP8 + unmerged LoRA: dequantize BEFORE _replace_linear so the
         # normal CustomLinear + load_weights + set_lora_params path works.
-        if fp8_matmul and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
+        # E8M0 keys were already cleaned from sd during model load, so use the
+        # registered block_scale_weight buffers on modules as the source.
+        if fp8_matmul and transformer.patched_linear and len(patcher.patches) != 0 and not merge_loras:
             from .fp8_optimization import dequantize_mxfp8_weight
-            _sd = patcher.model["sd"]
-            _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
+            try: _sd = patcher.model["sd"]
+            except (KeyError, TypeError): _sd = None
             _dequant = False
-            for k in list(_sd.keys()):
-                if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
-                    sk = k.replace(".weight", ".scale_weight")
-                    if sk in _sd and _sd[sk].dtype in _E8:
-                        _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
-                        _sd.pop(sk, None)
-                        _dequant = True
+            for n, m in transformer.named_modules():
+                bsw = getattr(m, 'block_scale_weight', None)
+                if bsw is not None and isinstance(m, torch.nn.Linear):
+                    w = dequantize_mxfp8_weight(m.weight, bsw.to(m.weight.device)).to(dtype)
+                    _wk = f"{n}.weight"
+                    if _sd is not None and _wk in _sd:
+                        _sd[_wk] = w
+                    _sk = f"{n}.scale_weight"
+                    if _sd is not None and _sk in _sd:
+                        _sd.pop(_sk, None)
+                    _dequant = True
             if _dequant:
                 transformer.patched_linear = False
                 weight_dtype = dtype
