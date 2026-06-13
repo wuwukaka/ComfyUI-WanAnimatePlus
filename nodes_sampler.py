@@ -206,10 +206,9 @@ class WanVideoSampler:
 
         # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
         # normal CustomLinear + load_weights + set_lora_params path works.
-        _is_mxfp8 = False
-        try: _is_mxfp8 = "mxfp8" in model["quantization"]
-        except KeyError: pass
-        if _is_mxfp8 and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
+        # Detect by presence of block_scale_weight buffers, not quantization string.
+        _has_mxfp8 = any(hasattr(m, 'block_scale_weight') for m in transformer.modules())
+        if _has_mxfp8 and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
             from .fp8_optimization import dequantize_mxfp8_weight
             _sd = patcher.model["sd"]
             _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
