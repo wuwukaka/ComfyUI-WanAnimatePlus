@@ -204,6 +204,26 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
+        # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
+        # normal CustomLinear + load_weights + set_lora_params path works.
+        _is_mxfp8 = False
+        try: _is_mxfp8 = "mxfp8" in model["quantization"]
+        except KeyError: pass
+        if _is_mxfp8 and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
+            from .fp8_optimization import dequantize_mxfp8_weight
+            _sd = patcher.model["sd"]
+            _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
+            for k in list(_sd.keys()):
+                if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
+                    sk = k.replace(".weight", ".scale_weight")
+                    if sk in _sd and _sd[sk].dtype in _E8:
+                        _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
+                        _sd.pop(sk, None)
+            transformer.patched_linear = False
+            weight_dtype = dtype
+            model["fp8_matmul"] = False
+            log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
+
         # Load weights
         if transformer.audio_model is not None:
             for block in transformer.blocks:
@@ -225,26 +245,7 @@ class WanVideoSampler:
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
             if not merge_loras and fp8_matmul:
-                try:
-                    _mq = model["quantization"]
-                except KeyError:
-                    _mq = ""
-                if "mxfp8" in _mq:
-                    # MXFP8 + unmerged LoRA added after model loading:
-                    # dequantize in-place so LoRA works in compute_dtype.
-                    from .fp8_optimization import dequantize_mxfp8_weight
-                    for m in transformer.modules():
-                        if isinstance(m, torch.nn.Linear) and hasattr(m, 'block_scale_weight'):
-                            bsw = m.block_scale_weight.to(m.weight.device)
-                            w = dequantize_mxfp8_weight(m.weight, bsw)
-                            m.weight = torch.nn.Parameter(w, requires_grad=False)
-                            m._buffers.pop('block_scale_weight', None)
-                            if hasattr(m, 'original_forward'):
-                                m.forward = m.original_forward
-                    model["fp8_matmul"] = False
-                    log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
-                else:
-                    raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
+                raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
