@@ -225,7 +225,10 @@ class WanVideoSampler:
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
             if not merge_loras and fp8_matmul:
-                _mq = model["quantization"] if "quantization" in model else ""
+                try:
+                    _mq = model["quantization"]
+                except KeyError:
+                    _mq = ""
                 if "mxfp8" in _mq:
                     # MXFP8 + unmerged LoRA added after model loading:
                     # dequantize in-place so LoRA works in compute_dtype.
