@@ -225,7 +225,22 @@ class WanVideoSampler:
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
             if not merge_loras and fp8_matmul:
-                raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
+                _mq = model["quantization"] if "quantization" in model else ""
+                if "mxfp8" in _mq:
+                    # MXFP8 + unmerged LoRA added after model loading:
+                    # dequantize in-place so LoRA works in compute_dtype.
+                    from .fp8_optimization import dequantize_mxfp8_weight
+                    for m in transformer.modules():
+                        if isinstance(m, torch.nn.Linear) and hasattr(m, 'block_scale_weight'):
+                            w = dequantize_mxfp8_weight(m.weight, m.block_scale_weight)
+                            m.weight = torch.nn.Parameter(w, requires_grad=False)
+                            m._buffers.pop('block_scale_weight', None)
+                            if hasattr(m, 'original_forward'):
+                                m.forward = m.original_forward
+                    model["fp8_matmul"] = False
+                    log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
+                else:
+                    raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
