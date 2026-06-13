@@ -206,13 +206,13 @@ class WanVideoSampler:
 
         # MXFP8 + unmerged LoRA: dequantize BEFORE _replace_linear so the
         # normal CustomLinear + load_weights + set_lora_params path works.
-        # E8M0 keys were already cleaned from sd during model load, so use the
-        # registered block_scale_weight buffers on modules as the source.
-        if fp8_matmul and transformer.patched_linear and len(patcher.patches) != 0 and not merge_loras:
+        try: _is_mxfp8 = model["mxfp8_active"]
+        except KeyError: _is_mxfp8 = False
+        if _is_mxfp8 and fp8_matmul and len(patcher.patches) != 0 and not merge_loras:
             from .fp8_optimization import dequantize_mxfp8_weight
             try: _sd = patcher.model["sd"]
             except (KeyError, TypeError): _sd = None
-            _dequant = False
+            _did = False
             for n, m in transformer.named_modules():
                 bsw = getattr(m, 'block_scale_weight', None)
                 if bsw is not None and isinstance(m, torch.nn.Linear):
@@ -220,11 +220,10 @@ class WanVideoSampler:
                     _wk = f"{n}.weight"
                     if _sd is not None and _wk in _sd:
                         _sd[_wk] = w
-                    _sk = f"{n}.scale_weight"
-                    if _sd is not None and _sk in _sd:
-                        _sd.pop(_sk, None)
-                    _dequant = True
-            if _dequant:
+                    if _sd is not None:
+                        _sd.pop(f"{n}.scale_weight", None)
+                    _did = True
+            if _did:
                 transformer.patched_linear = False
                 weight_dtype = dtype
                 fp8_matmul = False

@@ -1873,6 +1873,7 @@ class WanVideoModelLoader:
             elif _CK_MXFP8:
                 convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
                 transformer.patched_linear = True
+                patcher.model["mxfp8_active"] = True
                 # Remove E8M0 block-scale keys from sd so they never reach
                 # CustomLinear as per-tensor scale_weights — their shape/dtype
                 # would cause broadcast errors in the non-MXFP8 forward path.
