@@ -206,23 +206,24 @@ class WanVideoSampler:
 
         # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
         # normal CustomLinear + load_weights + set_lora_params path works.
-        # Detect by presence of block_scale_weight buffers, not quantization string.
-        _has_mxfp8 = any(hasattr(m, 'block_scale_weight') for m in transformer.modules())
-        if _has_mxfp8 and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
+        if fp8_matmul and transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and not merge_loras:
             from .fp8_optimization import dequantize_mxfp8_weight
             _sd = patcher.model["sd"]
             _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
+            _dequant = False
             for k in list(_sd.keys()):
                 if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
                     sk = k.replace(".weight", ".scale_weight")
                     if sk in _sd and _sd[sk].dtype in _E8:
                         _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
                         _sd.pop(sk, None)
-            transformer.patched_linear = False
-            weight_dtype = dtype
-            fp8_matmul = False
-            model["fp8_matmul"] = False
-            log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
+                        _dequant = True
+            if _dequant:
+                transformer.patched_linear = False
+                weight_dtype = dtype
+                fp8_matmul = False
+                model["fp8_matmul"] = False
+                log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
 
         # Load weights
         if transformer.audio_model is not None:
