@@ -220,6 +220,7 @@ class WanVideoSampler:
                         _sd.pop(sk, None)
             transformer.patched_linear = False
             weight_dtype = dtype
+            fp8_matmul = False
             model["fp8_matmul"] = False
             log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
 
