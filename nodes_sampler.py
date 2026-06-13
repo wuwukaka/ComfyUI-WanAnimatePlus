@@ -244,16 +244,19 @@ class WanVideoSampler:
                             for strength, lora in pv:
                                 if hasattr(lora, 'weights'):
                                     wa, wb = lora.weights
+                                    wa = wa.to(device, dtype)
+                                    wb = wb.to(device, dtype)
                                     alpha = float(getattr(lora, 'alpha', 0) or 0)
                                     r = wb.shape[0]
                                     scale = strength * (alpha / r if alpha else 1.0)
-                                    w = w + torch.mm(wa, wb).reshape(w.shape).to(device, dtype) * scale
+                                    w = w + torch.mm(wa, wb).reshape(w.shape) * scale
                                 elif isinstance(lora, tuple) and lora[0] == "diff":
                                     w = w + lora[1].to(device, dtype) * strength
                             m.weight = torch.nn.Parameter(w, requires_grad=False)
+                            # Write baked weight back to sd so offload/reload works.
+                            if _wk in _sd:
+                                _sd[_wk] = w
                             break
-                # Prevent redundant load_weights from overwriting LoRA-baked weights.
-                patcher.model["sd"] = None
 
         # Load weights
         if transformer.audio_model is not None:
