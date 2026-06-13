@@ -225,27 +225,30 @@ class WanVideoSampler:
                             _did = True
             if _did:
                 # Replace nn.Linear with CustomLinear so unmerged LoRA can apply.
-                # Transfer dequantized weights directly — bypass _replace_linear
-                # which would create fresh meta tensors.
+                # Transfer dequantized weights directly — bypass _replace_linear.
                 from .custom_linear import CustomLinear
                 _replaced = []
                 for n, m in transformer.named_modules():
                     if isinstance(m, torch.nn.Linear) and hasattr(m, 'block_scale_weight'):
-                        parent = transformer
-                        path = n.split('.')
-                        for p in path[:-1]:
-                            parent = getattr(parent, p)
-                        name = path[-1]
                         cl = CustomLinear(m.in_features, m.out_features, m.bias is not None,
                                           compute_dtype=dtype, device=device)
+                        _wk = f"{n}.weight"
                         cl.weight = torch.nn.Parameter(
-                            _sd[f"{n}.weight"].to(device, dtype) if f"{n}.weight" in _sd
+                            _sd[_wk].to(device, dtype) if _wk in _sd
                             else m.weight.data.to(device, dtype), requires_grad=False)
                         if m.bias is not None:
                             cl.bias = torch.nn.Parameter(m.bias.data.to(device, dtype), requires_grad=False)
                         if hasattr(m, 'original_forward'):
                             cl.forward = m.original_forward
-                        setattr(parent, name, cl)
+                        # navigate to parent using _modules (handles integer keys like blocks.0)
+                        parent = transformer
+                        parts = n.split('.')
+                        for p in parts[:-1]:
+                            parent = parent._modules.get(p)
+                            if parent is None and p.isdigit():
+                                parent = parent  # fallback, shouldn't happen
+                        if parent is not None:
+                            setattr(parent, parts[-1], cl)
                         _replaced.append(n)
                 transformer.patched_linear = True
                 weight_dtype = dtype
