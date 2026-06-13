@@ -181,6 +181,16 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 
 SCAIL-2 的 `prefix_frames` 固定使用 37 像素帧前置画布。只有 `transition_video` 时使用 21 像素帧前置画布。普通 AnimateEmbeds 里的 45 帧 outfit 布局不适用于 `WanAnimatePlus SCAIL_2 Embeds`。
 
+## 量化
+
+`WanAnimatePlus ModelLoader` 支持 `mxfp8` 权重量化以减少显存占用。
+
+| 选项 | 说明 |
+|------|------|
+| `mxfp8` | MXFP8（微缩放 FP8）量化格式。通过跨元素块共享缩放因子，相比逐张量 FP8 在相近的显存节省下提供更高的精度。需要兼容的量化模型权重。 |
+
+MXFP8 量化支持源自 [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)（Apache 2.0）。
+
 ## 项目结构
 
 ```text

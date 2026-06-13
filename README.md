@@ -186,6 +186,16 @@ For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or 
 
 When `bg_image` is connected in animation mode, it consumes the first prefix slot and is handled as the first prefix image. The node internally adds a white mask for that background image only; user-provided `prefix_frames` and `prefix_mask` are then limited to four images each. In replacement mode, `bg_image` is ignored.
 
+## Quantization
+
+The `WanAnimatePlus ModelLoader` supports `mxfp8` weight quantization for reduced VRAM usage.
+
+| Option | Description |
+|--------|-------------|
+| `mxfp8` | MXFP8 (Microscaling FP8) quantization format. Uses shared scaling factors across blocks of elements, providing better accuracy than per-tensor FP8 at similar memory savings. Requires compatible quantized model weights. |
+
+MXFP8 quantization support is derived from [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) (Apache 2.0).
+
 ## Project Structure
 
 ```text
