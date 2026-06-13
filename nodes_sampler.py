@@ -204,25 +204,25 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
-        # MXFP8 + unmerged LoRA: dequantize BEFORE _replace_linear so the
+        # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
         # normal CustomLinear + load_weights + set_lora_params path works.
+        # E8M0 keys are intentionally kept in sd during model loading (no-LoRA
+        # path) so this block can find and use them.
         try: _is_mxfp8 = model["mxfp8_active"]
         except KeyError: _is_mxfp8 = False
         if _is_mxfp8 and fp8_matmul and len(patcher.patches) != 0 and not merge_loras:
             from .fp8_optimization import dequantize_mxfp8_weight
-            try: _sd = patcher.model["sd"]
-            except (KeyError, TypeError): _sd = None
+            _sd = patcher.model["sd"]
             _did = False
-            for n, m in transformer.named_modules():
-                bsw = getattr(m, 'block_scale_weight', None)
-                if bsw is not None and isinstance(m, torch.nn.Linear):
-                    w = dequantize_mxfp8_weight(m.weight, bsw.to(m.weight.device)).to(dtype)
-                    _wk = f"{n}.weight"
-                    if _sd is not None and _wk in _sd:
-                        _sd[_wk] = w
-                    if _sd is not None:
-                        _sd.pop(f"{n}.scale_weight", None)
-                    _did = True
+            if _sd is not None:
+                _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
+                for k in list(_sd.keys()):
+                    if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
+                        sk = k.replace(".weight", ".scale_weight")
+                        if sk in _sd and _sd[sk].dtype in _E8:
+                            _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
+                            _sd.pop(sk, None)
+                            _did = True
             if _did:
                 transformer.patched_linear = False
                 weight_dtype = dtype

@@ -1874,12 +1874,12 @@ class WanVideoModelLoader:
                 convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
                 transformer.patched_linear = True
                 patcher.model["mxfp8_active"] = True
-                # Remove E8M0 block-scale keys from sd so they never reach
-                # CustomLinear as per-tensor scale_weights — their shape/dtype
-                # would cause broadcast errors in the non-MXFP8 forward path.
-                if sd is not None:
-                    for k in list(block_scale_weights.keys()):
-                        sd.pop(k, None)
+                # Keep E8M0 keys in sd for the no-LoRA path: if unmerged LoRA
+                # is added later, the sampler needs them to dequantize before
+                # _replace_linear.  They are harmless while patched_linear=True
+                # because CustomLinear is never created.
+                # (For merged/unmerged LoRA at load time, the branches above
+                # already popped them.)
                 block_scale_weights.clear()
             else:
                 # comfy-kitchen not installed → dequantize at load time, run normal path
