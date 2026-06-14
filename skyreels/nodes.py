@@ -157,11 +157,17 @@ class WanVideoDiffusionForcingSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        fp8_matmul = model["fp8_matmul"]
+        regular_fp8_fast_matmul = model.get("regular_fp8_fast_matmul", model["fp8_matmul"])
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
+        try: _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
+        except KeyError: _mxfp8_fast_runtime = False
         try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
         except KeyError: _mxfp8_unmerged_runtime = False
+        _is_mxfp8_runtime = model.get("mxfp8_active", False) or _mxfp8_fast_runtime
+        try: _quantization = model["quantization"]
+        except KeyError: _quantization = "disabled"
+        _is_regular_fp8_fast = regular_fp8_fast_matmul and ("mxfp8" not in str(_quantization))
 
         transformer_options = patcher.model_options.get("transformer_options", None)
         merge_loras = transformer_options["merge_loras"]
@@ -192,7 +198,7 @@ class WanVideoDiffusionForcingSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul and not (_mxfp8_unmerged_runtime or model.get("mxfp8_active", False)):
+            if not merge_loras and _is_regular_fp8_fast and not _is_mxfp8_runtime:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
