@@ -9,10 +9,6 @@ The original ComfyUI-WanVideoWrapper project and its original portions remain
 copyrighted by kijai and its contributors. Deep thanks to kijai for the work
 that made this project possible.
 
-This project also includes code derived from comfy-kitchen
-(https://github.com/Comfy-Org/comfy-kitchen), used under the Apache License,
-Version 2.0, for MXFP8 quantization support.
-
 This project is distributed under the Apache License, Version 2.0. See LICENSE.
 
 Modified portions and newly added code in this repository are Copyright (c)
@@ -55,8 +51,3 @@ The wuwukasi/wuwukaka additions include, without limitation:
   helpers.
 - Custom linear operation registration safeguards and WanAnimatePlus-specific
   custom op handling.
-- MXFP8 block-scaled quantization support, including auto-detection of E8M0
-  block scales, comfy-kitchen integration for hardware-accelerated matmul on
-  Blackwell GPUs, runtime support for unmerged LoRA via effective-weight
-  requantization with automatic fallback to non-fast linear execution when
-  needed, and load-time dequantization fallback for unsupported hardware.

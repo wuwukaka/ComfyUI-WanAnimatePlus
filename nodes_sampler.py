@@ -11,13 +11,10 @@
 #   - Added EverAnimate VAE re-encode clamp/uint8 preprocessing to match the reference path.
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
-#   - Added runtime MXFP8 + unmerged LoRA compatibility routing and fallback-aware
-#     patched-linear setup.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy
 import torch
 import numpy as np
-import comfy.lora
 from tqdm import tqdm
 import inspect
 from .wanvideo.modules.model import rope_params
@@ -184,7 +181,7 @@ class WanVideoSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        regular_fp8_fast_matmul = model["regular_fp8_fast_matmul"]
+        fp8_matmul = model["fp8_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
 
@@ -207,16 +204,6 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
-        _is_mxfp8 = model["mxfp8_active"]
-        _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
-        _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
-        _quantization = model["quantization"]
-        _is_regular_fp8_fast = regular_fp8_fast_matmul and ("mxfp8" not in str(_quantization))
-        _is_mxfp8_runtime = _is_mxfp8 or _mxfp8_fast_runtime
-        if _is_mxfp8_runtime and len(patcher.patches) != 0 and not merge_loras:
-            if _mxfp8_unmerged_runtime:
-                log.info("Using runtime MXFP8 + unmerged LoRA path")
-
         # Load weights
         if transformer.audio_model is not None:
             for block in transformer.blocks:
@@ -224,7 +211,7 @@ class WanVideoSampler:
                     block.audio_block = None
 
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model["scale_weights"], block_scale_weights=patcher.model["block_scale_weights"], compile_args=model["compile_args"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
@@ -237,7 +224,7 @@ class WanVideoSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and _is_regular_fp8_fast and not _is_mxfp8_runtime:
+            if not merge_loras and fp8_matmul:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
@@ -1398,7 +1385,7 @@ class WanVideoSampler:
             nonlocal audio_cfg_scale
             nonlocal scail2_fast_path_fallback_logged
 
-            autocast_enabled = ("fp8" in model["quantization"] and "mxfp8" not in model["quantization"] and not transformer.patched_linear)
+            autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype) if autocast_enabled else nullcontext():
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
@@ -3618,7 +3605,7 @@ class WanVideoSampler:
 
                             if offloaded:
                                 # Load weights
-                                if transformer.patched_linear and patcher.model["sd"] is not None and gguf_reader is None:
+                                if transformer.patched_linear and gguf_reader is None:
                                     load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)

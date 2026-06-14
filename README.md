@@ -186,26 +186,6 @@ For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or 
 
 When `bg_image` is connected in animation mode, it consumes the first prefix slot and is handled as the first prefix image. The node internally adds a white mask for that background image only; user-provided `prefix_frames` and `prefix_mask` are then limited to four images each. In replacement mode, `bg_image` is ignored.
 
-## Quantization
-
-The `WanAnimatePlus ModelLoader` supports `mxfp8` weight quantization for reduced VRAM usage.
-
-| Option | Description |
-|--------|-------------|
-| `mxfp8` | MXFP8 (Microscaling FP8) quantization format. Uses shared scaling factors across blocks of elements, providing better accuracy than per-tensor FP8 at similar memory savings. Requires compatible quantized model weights. |
-
-**Hardware requirements:** Hardware-accelerated MXFP8 matmul requires an NVIDIA Blackwell GPU (compute capability >= 10.0, e.g., RTX 5090 / B100 / B200). On non-Blackwell GPUs, MXFP8 weights are automatically dequantized to BF16 at load time for normal inference (no VRAM savings, but the model runs correctly).
-
-**Auto-detection:** When the `quantization` dropdown is set to `disabled`, MXFP8 weights are auto-detected from the state dict by scanning for `float8_e8m0fnu` block scale tensors. No manual selection is needed.
-
-**Installation (optional):** Hardware acceleration requires [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen):
-```
-pip install comfy-kitchen==0.2.10
-```
-This package is **not** a hard dependency — it is only needed for Blackwell GPU acceleration. The model works without it via the dequantization fallback.
-
-MXFP8 quantization support is derived from [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) (Apache 2.0).
-
 ## Project Structure
 
 ```text

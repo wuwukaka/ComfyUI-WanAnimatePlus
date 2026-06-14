@@ -1,13 +1,3 @@
-# Copyright (c) 2025 kijai
-# Modified from nodes_model_loading.py in ComfyUI-WanVideoWrapper.
-# Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
-# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
-#   - Added MXFP8 block-scaled quantization option ("mxfp8") to the quantization
-#     dropdown, auto-detection of float8_e8m0fnu block scales in state dicts,
-#     and comfy-kitchen integration for hardware-accelerated matmul on Blackwell
-#     GPUs with runtime unmerged-LoRA support and per-layer dequantization
-#     fallback for unsupported hardware.
-# Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
 import os, gc, uuid
@@ -15,9 +5,6 @@ from .utils import log, apply_lora
 import numpy as np
 from tqdm import tqdm
 import re
-
-# E8M0 dtype may not exist on older PyTorch; safetensors stores it as uint8
-_E8M0_DTYPES = (torch.float8_e8m0fnu, torch.uint8) if hasattr(torch, 'float8_e8m0fnu') else (torch.uint8,)
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
@@ -820,7 +807,7 @@ def rename_fuser_block(name):
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                  transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None, compile_args=None):
     params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding",
-                      "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj", "face_encoder", "fuser_block"}
+                      "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob", "face_encoder", "fuser_block"}
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
     block_idx = vace_block_idx = None
@@ -910,8 +897,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             dtype_to_use = torch.float32 if "patch_embedding" in name or "motion_encoder" in name else base_dtype
         else:
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else weight_dtype
-            if value.dtype == weight_dtype:
-                dtype_to_use = weight_dtype
+            dtype_to_use = weight_dtype if value.dtype == weight_dtype else dtype_to_use
             scale_key = key.replace(".weight", ".scale_weight")
             if scale_key in sd:
                 dtype_to_use = value.dtype
@@ -1096,7 +1082,7 @@ class WanVideoModelLoader:
                 "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
             "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
-            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast", "mxfp8"], {"default": "disabled",
+            "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast"], {"default": "disabled",
                             "tooltip": "Optional quantization method, 'disabled' acts as autoselect based by weights. Scaled modes only work with matching weights, _fast modes (fp8 matmul) require CUDA compute capability >= 8.9 (NVIDIA 4000 series and up), e4m3fn generally can not be torch.compiled on compute capability < 8.9 (3000 series and under)"}),
             "load_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
@@ -1202,20 +1188,6 @@ class WanVideoModelLoader:
             for k, v in sd.items():
                 if isinstance(v, torch.Tensor):
                     if v.dtype == torch.float8_e4m3fn:
-                        # Check for MXFP8 block-scaled format first (E8M0 block scales).
-                        # Supports Bernini (.weight_scale), internal (.scale_weight),
-                        # and saved-after-patching (.block_scale_weight) conventions.
-                        scale_key_ws = k.replace(".weight", ".weight_scale")
-                        scale_key_sw = k.replace(".weight", ".scale_weight")
-                        scale_key_bs = k.replace(".weight", ".block_scale_weight")
-                        # safetensors stores E8M0 as uint8 (no F8_E8M0 in spec)
-                        _e8m0 = _E8M0_DTYPES
-                        if ((scale_key_ws in sd and sd[scale_key_ws].dtype in _e8m0) or
-                            (scale_key_sw in sd and sd[scale_key_sw].dtype in _e8m0) or
-                            (scale_key_bs in sd and sd[scale_key_bs].dtype in _e8m0)):
-                            quantization = "mxfp8"
-                            log.info("MXFP8 block-scaled weights detected")
-                            break
                         quantization = "fp8_e4m3fn"
                         if "scaled_fp8" in sd:
                             is_scaled_fp8 = True
@@ -1229,7 +1201,7 @@ class WanVideoModelLoader:
                         break
 
         scale_weights = {}
-        if "fp8" in quantization and "mxfp8" not in quantization:
+        if "fp8" in quantization:
             for k, v in sd.items():
                 if k.endswith(".scale_weight") or k.endswith(".weight_scale"):
                     is_scaled_fp8 = True
@@ -1244,8 +1216,6 @@ class WanVideoModelLoader:
             log.info(f"CUDA Compute Capability: {major}.{minor}")
             if compile_args is not None and "e4" in quantization and (major, minor) < (8, 9):
                 log.warning("WARNING: Torch.compile with fp8_e4m3fn weights on CUDA compute capability < 8.9 may not be supported. Please use fp8_e5m2, GGUF or higher precision instead, or check the latest triton version that adds support for older architectures https://github.com/woct0rdho/triton-windows/releases/tag/v3.5.0-windows.post21")
-            if compile_args is not None and "mxfp8" in quantization:
-                log.warning("WARNING: MXFP8 is not compatible with torch.compile — the try/except in mxfp8_linear_forward causes graph breaks on every linear layer. Consider disabling compile for MXFP8 models.")
 
         if is_scaled_fp8 and "scaled" not in quantization:
             raise ValueError("The model is a scaled fp8 model, please set quantization to '_scaled'")
@@ -1627,14 +1597,7 @@ class WanVideoModelLoader:
             sd.update(extra_sd)
             del extra_sd
 
-        # Normalise MXFP8 scale-key suffixes.  Detect collisions between conventions.
-        _new_sd = {}
-        for k, v in sd.items():
-            nk = k.replace(".weight_scale", ".scale_weight").replace(".block_scale_weight", ".scale_weight")
-            if nk != k and nk in _new_sd:
-                log.warning(f"MXFP8 key collision: {k} → {nk} overwrites existing {nk}")
-            _new_sd[nk] = v
-        sd = _new_sd
+        sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
 
         # FlashVSR
         if "LQ_proj_in.norm1.gamma" in sd:
@@ -1750,42 +1713,12 @@ class WanVideoModelLoader:
         patcher.model.is_patched = False
 
         scale_weights = {}
-        if "fp8" in quantization and "mxfp8" not in quantization:
+        if "fp8" in quantization:
             for k, v in sd.items():
                 if k.endswith(".scale_weight"):
                     scale_weights[k] = v.to(device, base_dtype)
 
-        block_scale_weights = {}
-        if "mxfp8" in quantization:
-            for k, v in sd.items():
-                if k.endswith(".scale_weight") and v.dtype in (_E8M0_DTYPES):
-                    block_scale_weights[k] = v  # keep as E8M0, do not convert
-            # Dequantize fp8 weights for modules excluded from MXFP8 patching
-            # (text_embedding, time_embedding, time_projection, img_emb,
-            #  modulation, audio_proj, etc.) so they never reach raw F.linear.
-            if block_scale_weights:
-                from .fp8_optimization import dequantize_mxfp8_weight
-                _ptk = {"norm", "bias", "patch_embedding", "time_",
-                        "img_emb", "modulation", "text_embedding", "adapter",
-                        "ref_conv", "audio_proj"}
-                _dequant_keys = []
-                for scale_key in list(block_scale_weights.keys()):
-                    weight_key = scale_key.replace(".scale_weight", ".weight")
-                    # module name is the key prefix before .weight or .scale_weight
-                    _mod_name = scale_key.rsplit(".scale_weight", 1)[0]
-                    if any(kw in _mod_name for kw in _ptk) and weight_key in sd:
-                        sd[weight_key] = dequantize_mxfp8_weight(sd[weight_key], block_scale_weights[scale_key])
-                        sd.pop(scale_key, None)
-                        _dequant_keys.append(scale_key)
-                for k in _dequant_keys:
-                    block_scale_weights.pop(k, None)
-            if not block_scale_weights:
-                raise RuntimeError(
-                    "MXFP8 quantization was selected, but no valid MXFP8 block scales were found in the model. "
-                    "This model is not a valid MXFP8 checkpoint."
-                )
-
-        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "mxfp8"]:
+        if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
             weight_dtype = torch.float8_e4m3fn
         elif quantization in ["fp8_e5m2", "fp8_e5m2_fast"]:
             weight_dtype = torch.float8_e5m2
@@ -1806,21 +1739,6 @@ class WanVideoModelLoader:
                 sd.update(unianimate_sd)
                 del unianimate_sd
 
-        # Merged LoRA + MXFP8: dequantize BEFORE LoRA baking so block scales
-        # don't become stale (LoRA modifies fp8 weights, invalidating the
-        # original per-block scale factors used by ck.scaled_mm_mxfp8).
-        if "mxfp8" in quantization and lora is not None and merge_loras and block_scale_weights:
-            from .fp8_optimization import dequantize_mxfp8_weight
-            log.warning("MXFP8 dequantizing for merged LoRA compatibility")
-            for k, v in block_scale_weights.items():
-                weight_key = k.replace(".scale_weight", ".weight")
-                if weight_key in sd:
-                    sd[weight_key] = dequantize_mxfp8_weight(sd[weight_key], v)
-                sd.pop(k, None)
-            block_scale_weights.clear()
-            weight_dtype = base_dtype
-            quantization = "disabled"
-
         if not gguf:
             if lora is not None and merge_loras:
                 if not lora_low_mem_load:
@@ -1840,8 +1758,7 @@ class WanVideoModelLoader:
                 transformer.patched_linear = False
                 sd = None
             elif "scaled" in quantization or lora is not None:
-                prepatch_block_scales = block_scale_weights if ("mxfp8" in quantization and lora is not None and not merge_loras) else None
-                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, block_scale_weights=prepatch_block_scales, compile_args=compile_args)
+                transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
                 transformer.patched_linear = True
 
         if "fast" in quantization:
@@ -1850,73 +1767,7 @@ class WanVideoModelLoader:
             from .fp8_optimization import convert_fp8_linear
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
 
-        mxfp8_active = False
-        mxfp8_unmerged_lora_runtime = False
-        mxfp8_fast_runtime = False
-        if "mxfp8" in quantization:
-            from .fp8_optimization import convert_mxfp8_linear, mxfp8_fastpath_enabled
-            if lora is not None and not merge_loras:
-                if mxfp8_fastpath_enabled() and block_scale_weights:
-                    log.warning("MXFP8 + unmerged LoRA enabled with runtime effective-weight quantization")
-                    if not transformer.patched_linear:
-                        transformer = _replace_linear(
-                            transformer,
-                            base_dtype,
-                            sd,
-                            scale_weights=scale_weights,
-                            block_scale_weights=block_scale_weights,
-                            compile_args=compile_args,
-                        )
-                        transformer.patched_linear = True
-                    mxfp8_unmerged_lora_runtime = True
-                    mxfp8_active = True
-                    mxfp8_fast_runtime = True
-                else:
-                    log.warning("MXFP8 fast runtime unavailable, using per-layer dequantized fallback for unmerged LoRA")
-                    if not transformer.patched_linear:
-                        transformer = _replace_linear(
-                            transformer,
-                            base_dtype,
-                            sd,
-                            scale_weights=scale_weights,
-                            block_scale_weights=block_scale_weights,
-                            compile_args=compile_args,
-                        )
-                    transformer.patched_linear = True
-                    mxfp8_active = False
-            elif mxfp8_fastpath_enabled():
-                convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
-                transformer.patched_linear = True
-                mxfp8_active = True
-                mxfp8_fast_runtime = True
-                # Keep E8M0 keys in sd for the no-LoRA path: if unmerged LoRA
-                # is added later, the sampler needs them to dequantize before
-                # _replace_linear.  They are harmless while patched_linear=True
-                # because CustomLinear is never created.
-                # (For merged/unmerged LoRA at load time, the branches above
-                # already popped them.)
-                block_scale_weights.clear()
-            else:
-                log.warning("comfy-kitchen MXFP8 kernel unavailable, using per-layer dequantized fallback")
-                if not transformer.patched_linear:
-                    transformer = _replace_linear(
-                        transformer,
-                        base_dtype,
-                        sd,
-                        scale_weights=scale_weights,
-                        block_scale_weights=block_scale_weights,
-                        compile_args=compile_args,
-                    )
-                    transformer.patched_linear = True
-                mxfp8_active = False
-
         if vram_management_args is not None:
-            if "mxfp8" in quantization:
-                raise ValueError(
-                    "VRAM management is not compatible with MXFP8 quantization. "
-                    "AutoWrappedLinear would strip the MXFP8 block-scaled forward, "
-                    "producing silently wrong output. Use block_swap_args instead."
-                )
             if gguf:
                 raise ValueError("GGUF models don't support vram management")
             from .diffsynth.vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
@@ -1978,13 +1829,8 @@ class WanVideoModelLoader:
         patcher.model["control_lora"] = control_lora
         patcher.model["compile_args"] = compile_args
         patcher.model["gguf_reader"] = gguf_reader
-        patcher.model["regular_fp8_fast_matmul"] = "fast" in quantization
-        patcher.model["fp8_matmul"] = "fast" in quantization or mxfp8_fast_runtime
-        patcher.model["mxfp8_active"] = mxfp8_active
-        patcher.model["mxfp8_fast_runtime"] = mxfp8_fast_runtime
-        patcher.model["mxfp8_unmerged_lora_runtime"] = mxfp8_unmerged_lora_runtime
+        patcher.model["fp8_matmul"] = "fast" in quantization
         patcher.model["scale_weights"] = scale_weights
-        patcher.model["block_scale_weights"] = block_scale_weights
         patcher.model["sd"] = sd
         patcher.model["lora"] = lora
 
@@ -2148,13 +1994,6 @@ class LoadWanVideoT5TextEncoder:
 
         model_path = folder_paths.get_full_path_or_raise("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
-
-        if any(k.endswith((".block_scale_weight", ".scale_weight", ".weight_scale")) and
-               v.dtype in _E8M0_DTYPES for k, v in sd.items()):
-            raise ValueError(
-                "MXFP8 is not supported for the T5 text encoder. "
-                "Use a standard fp8_e4m3fn or bf16 model."
-            )
 
         if quantization == "disabled":
             for k, v in sd.items():
