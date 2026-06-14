@@ -1899,6 +1899,20 @@ class WanAnimatePlusSCAIL2Embeds:
                     user_prefix_mask[:crop_count],
                 )
                 user_prefix_frames = cropped_prefix_frames
+                # Composite cropped prefix frames onto bg when bg + prefix_alpha_crop + crop_main_ref_bg are all active
+                if bg_prefix_active and crop_main_ref_background:
+                    comp_bg = bg_prefix_image
+                    if comp_bg.shape[1] != user_prefix_frames.shape[1] or comp_bg.shape[2] != user_prefix_frames.shape[2]:
+                        comp_bg = self._resize_bhwc(comp_bg, user_prefix_frames.shape[2], user_prefix_frames.shape[1])
+                    comp_bg = comp_bg.to(device=user_prefix_frames.device, dtype=user_prefix_frames.dtype)
+                    for ci in range(crop_count):
+                        mi = user_prefix_mask[ci:ci + 1, :, :, :3]
+                        mi = self._normalize_mask_background(mi, white_background=False)
+                        is_bg = (mi[..., :3].max(dim=-1, keepdim=True).values <= 0.1).to(
+                            device=user_prefix_frames.device, dtype=user_prefix_frames.dtype
+                        )
+                        user_prefix_frames[ci:ci + 1] = user_prefix_frames[ci:ci + 1] + comp_bg * is_bg
+                    log.info("SCAIL-2 prefix frames composited onto bg; masks will be inverted")
 
         prefix_frames = user_prefix_frames
         prefix_mask_for_prefix = user_prefix_mask
@@ -2007,6 +2021,10 @@ class WanAnimatePlusSCAIL2Embeds:
                     mask = prefix_mask_for_prefix[src_idx:src_idx + 1, :, :, :3]
                     if src_idx != bg_prefix_mask_index:
                         mask = self._normalize_mask_background(mask, white_background=not prefix_ref_black_background)
+                        # Invert mask when bg compositing is active: black bg->white, keep character colors
+                        if bg_prefix_active and crop_main_ref_background:
+                            is_bg = mask.amax(dim=-1, keepdim=True) <= 0.1
+                            mask = torch.where(is_bg, torch.ones_like(mask), mask)
                     prefix_ref_masks[out_idx] = mask
                 ref_mask_condition_used = any(mask is not None for mask in prefix_ref_masks)
             for i in range(prefix_ref_images.shape[0]):
@@ -2028,12 +2046,25 @@ class WanAnimatePlusSCAIL2Embeds:
                 ref_image = self._resize_bhwc(ref_image, W, H)
                 is_char = is_char.to(device=ref_image.device, dtype=ref_image.dtype)
                 ref_image = ref_image * is_char
+                # Composite ref foreground onto bg
+                if bg_prefix_active and crop_main_ref_background:
+                    comp_bg = bg_prefix_image
+                    if comp_bg.shape[1] != W or comp_bg.shape[2] != H:
+                        comp_bg = self._resize_bhwc(comp_bg, W, H)
+                    comp_bg = comp_bg.to(device=ref_image.device, dtype=ref_image.dtype)
+                    bg_is_char = 1.0 - is_char
+                    ref_image = ref_image + comp_bg * bg_is_char
+                    log.info("SCAIL-2 ref image composited onto bg")
             ref_latent = self._encode_scail_20ch(vae, ref_image, W, H, tiled_vae, scale=ref_strength).to(offload_device)
             ref_latents.append(ref_latent)
             if reference_image_mask is not None:
                 ref_mask_condition_used = True
                 ref_mask = self._fit_sequence(reference_image_mask[:, :, :, :3], 1)
                 ref_mask = self._normalize_mask_background(ref_mask, white_background=not (replacement_mode or crop_main_ref_background))
+                # Invert mask when bg compositing is active: black bg->white, keep character colors
+                if bg_prefix_active and crop_main_ref_background:
+                    is_bg = ref_mask.amax(dim=-1, keepdim=True) <= 0.1
+                    ref_mask = torch.where(is_bg, torch.ones_like(ref_mask), ref_mask)
                 ref_mask = self._resize_bhwc(ref_mask, W, H, mode="bicubic")
                 ref_masks.append(self._extract_mask_to_28ch(ref_mask).to(offload_device, vae.dtype))
             else:
