@@ -2164,7 +2164,10 @@ class WanAnimatePlusSCAIL2Embeds:
                 prefix_mask_in = self._resize_bhwc(prefix_mask_in, pose_image_mask.shape[2], pose_image_mask.shape[1], mode="nearest-exact")
             bg_keep = min(bg_prefix_mask_pixel_frames, prefix_mask_in.shape[0])
             if prefix_mask_in.shape[0] > bg_keep:
-                user_prefix_mask_in = self._normalize_mask_background(prefix_mask_in[bg_keep:], white_background=not prefix_alpha_crop)
+                user_prefix_mask_in = self._normalize_mask_background(
+                    prefix_mask_in[bg_keep:],
+                    white_background=not replacement_mode and not prefix_alpha_crop,
+                )
                 if bg_keep > 0:
                     prefix_mask_in = torch.cat([prefix_mask_in[:bg_keep], user_prefix_mask_in], dim=0)
                 else:

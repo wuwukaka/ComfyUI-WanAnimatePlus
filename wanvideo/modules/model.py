@@ -2317,23 +2317,45 @@ class WanModel(torch.nn.Module):
                 main_ids[:, :, :, 2] += torch.linspace(0, w_len - 1, steps=w_len, device=device, dtype=dtype).reshape(1, 1, -1)
                 segments.append(main_ids.reshape(1, -1, main_ids.shape[-1]))
 
+            replacement_pose_downscale = False
+            pose_downsample_meta = None
             if pose_frame_shape is not None:
                 pose_t, pose_h, pose_w = pose_frame_shape[-3], pose_frame_shape[-2], pose_frame_shape[-1]
-                pose_t_len = ((pose_t + (patch_size[0] // 2)) // patch_size[0])
-                pose_h_len = ((pose_h + (patch_size[1] // 2)) // patch_size[1])
-                pose_w_len = ((pose_w + (patch_size[2] // 2)) // patch_size[2])
-                h_scale = h / pose_h
-                w_scale = w / pose_w
-                h_shift = (h_scale - 1) / 2
-                w_shift = (w_scale - 1) / 2
-                pose_ids = torch.zeros((pose_t_len, pose_h_len, pose_w_len, 3), device=device, dtype=dtype)
-                pose_ids[:, :, :, 0] += torch.linspace(0, pose_t_len - 1, steps=pose_t_len, device=device, dtype=dtype).reshape(-1, 1, 1)
-                pose_ids[:, :, :, 1] += (torch.linspace(0, pose_h_len - 1, steps=pose_h_len, device=device, dtype=dtype) * h_scale + h_shift).reshape(1, -1, 1)
-                pose_ids[:, :, :, 2] += (torch.linspace(0, pose_w_len - 1, steps=pose_w_len, device=device, dtype=dtype) * w_scale + 120.0 + w_shift).reshape(1, 1, -1)
+                replacement_pose_downscale = pose_h != h
+                pose_t_len_full = ((pose_t + (patch_size[0] // 2)) // patch_size[0])
+                pose_h_len_full = (((pose_h * (2 if replacement_pose_downscale else 1)) + (patch_size[1] // 2)) // patch_size[1])
+                pose_w_len_full = (((pose_w * (2 if replacement_pose_downscale else 1)) + (patch_size[2] // 2)) // patch_size[2])
+                pose_ids = torch.zeros((pose_t_len_full, pose_h_len_full, pose_w_len_full, 3), device=device, dtype=dtype)
+                pose_ids[:, :, :, 0] += torch.linspace(0, pose_t_len_full - 1, steps=pose_t_len_full, device=device, dtype=dtype).reshape(-1, 1, 1)
+                pose_ids[:, :, :, 1] += torch.linspace(0, pose_h_len_full - 1, steps=pose_h_len_full, device=device, dtype=dtype).reshape(1, -1, 1)
+                pose_ids[:, :, :, 2] += torch.linspace(120.0, 120.0 + pose_w_len_full - 1, steps=pose_w_len_full, device=device, dtype=dtype).reshape(1, 1, -1)
                 segments.append(pose_ids.reshape(1, -1, pose_ids.shape[-1]))
+                pose_downsample_meta = (
+                    pose_t_len_full,
+                    pose_h_len_full,
+                    pose_w_len_full,
+                    ((pose_h + (patch_size[1] // 2)) // patch_size[1]),
+                    ((pose_w + (patch_size[2] // 2)) // patch_size[2]),
+                )
 
             combined_img_ids = torch.cat(segments, dim=1)
-            return self.rope_embedder(combined_img_ids, ntk_alphas).movedim(1, 2)
+            freqs = self.rope_embedder(combined_img_ids, ntk_alphas).movedim(1, 2)
+
+            if replacement_pose_downscale and pose_downsample_meta is not None:
+                pose_t_len_full, pose_h_len_full, pose_w_len_full, pose_h_len_actual, pose_w_len_actual = pose_downsample_meta
+                pose_start_idx = freqs.shape[1] - pose_t_len_full * pose_h_len_full * pose_w_len_full
+                main_freqs, pose_freqs = freqs[:, :pose_start_idx], freqs[:, pose_start_idx:]
+
+                B, _, heads, dim, _, _ = pose_freqs.shape
+                pose_freqs = pose_freqs.reshape(B, pose_t_len_full, pose_h_len_full, pose_w_len_full, heads, dim, 2, 2)
+                pose_freqs = pose_freqs.permute(0, 1, 4, 5, 6, 7, 2, 3).reshape(-1, pose_h_len_full, pose_w_len_full)
+                pose_freqs = F.avg_pool2d(pose_freqs, kernel_size=2, stride=2)
+                pose_freqs = pose_freqs.reshape(B, pose_t_len_full, heads, dim, 2, 2, pose_h_len_actual, pose_w_len_actual)
+                pose_freqs = pose_freqs.permute(0, 1, 6, 7, 2, 3, 4, 5).reshape(B, -1, heads, dim, 2, 2)
+
+                freqs = torch.cat([main_freqs, pose_freqs], dim=1)
+
+            return freqs
 
         # Main frames position IDs
         img_ids = torch.zeros((steps_t, steps_h, steps_w, 3), device=device, dtype=dtype)
