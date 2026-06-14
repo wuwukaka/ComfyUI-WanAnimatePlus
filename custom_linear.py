@@ -4,9 +4,9 @@
 #   - Added guarded custom op registration for duplicate imports/stale bytecode.
 #   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
 #   - Added MXFP8/block-wise scale_weight expansion before linear forward.
-#   - Added runtime MXFP8 + unmerged LoRA support with effective-weight caching,
-#     per-step strength-aware cache invalidation, and non-fast fallback when
-#     runtime requantization is unavailable.
+#   - Added runtime MXFP8 + unmerged LoRA support with MXFP8-only effective-weight
+#     caching, per-step strength-aware cache invalidation, and non-fast fallback
+#     when runtime requantization is unavailable.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
@@ -302,18 +302,6 @@ class CustomLinear(nn.Linear):
         self._lora_cache_mode = None
         self._mxfp8_lora_last_error = None
 
-    def _get_weight_with_lora_cached(self, weight, input):
-        if not hasattr(self, "lora_diff_0_0"):
-            return weight
-        cache_key = self._get_lora_cache_key(input)
-        if self._lora_cache_key == cache_key and self._lora_cache_weight is not None:
-            return self._lora_cache_weight
-        weight = self._get_weight_with_lora(weight)
-        self._lora_cache_key = cache_key
-        self._lora_cache_weight = weight
-        self._lora_cache_mode = "plain"
-        return weight
-
     def _get_weight_with_lora(self, weight):
         """Apply LoRA using custom ops to avoid graph breaks"""
         if not hasattr(self, "lora_diff_0_0"):
@@ -413,7 +401,7 @@ class CustomLinear(nn.Linear):
             else:
                 input = input * sw
 
-        weight = self._get_weight_with_lora_cached(weight, input)
+        weight = self._get_weight_with_lora(weight)
         out = self._linear_forward_impl(input, weight, bias)
         del weight, input, bias
         return out
