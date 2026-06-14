@@ -192,7 +192,7 @@ class WanVideoDiffusionForcingSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul and not _mxfp8_unmerged_runtime:
+            if not merge_loras and fp8_matmul and not (_mxfp8_unmerged_runtime or model.get("mxfp8_active", False)):
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
