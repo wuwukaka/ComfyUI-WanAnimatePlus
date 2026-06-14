@@ -203,6 +203,7 @@ class CustomLinear(nn.Linear):
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
         self._mxfp8_lora_last_error = None
+        self._mxfp8_last_error = None
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -278,6 +279,7 @@ class CustomLinear(nn.Linear):
 
     def _clear_lora_cache(self):
         self._mxfp8_lora_last_error = None
+        self._mxfp8_last_error = None
 
     def _get_weight_with_lora(self, weight):
         """Apply LoRA using custom ops to avoid graph breaks"""
@@ -347,8 +349,22 @@ class CustomLinear(nn.Linear):
         if getattr(self, "block_scale_weight", None) is not None:
             if hasattr(self, "lora_diff_0_0"):
                 return self._forward_mxfp8_with_lora_fallback(input, bias)
-            from .fp8_optimization import run_mxfp8_linear_kernel
-            return run_mxfp8_linear_kernel(self, input, bias, out_dtype=self.compute_dtype)
+            from .fp8_optimization import dequantize_mxfp8_weight, run_mxfp8_linear_kernel
+            try:
+                return run_mxfp8_linear_kernel(self, input, bias, out_dtype=self.compute_dtype)
+            except Exception as e:
+                if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+                    raise
+                if self._mxfp8_last_error != str(e):
+                    log.warning(f"MXFP8 linear falling back to per-layer dequantized linear: {e}")
+                    self._mxfp8_last_error = str(e)
+                weight = dequantize_mxfp8_weight(self.weight, self.block_scale_weight).to(
+                    device=input.device, dtype=self.compute_dtype
+                )
+                plain_bias = bias.to(device=input.device, dtype=self.compute_dtype) if bias is not None else None
+                out = self._linear_forward_impl(input.to(self.compute_dtype), weight, plain_bias)
+                del weight, plain_bias
+                return out
 
         weight = self._prepare_weight(input)
 

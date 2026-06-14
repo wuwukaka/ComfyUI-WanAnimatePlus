@@ -4,12 +4,39 @@
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 #   - Added MXFP8 block-scaled quantization support with comfy-kitchen integration,
 #     including block-scaled matmul forward, runtime effective-weight
-#     requantization helpers for unmerged LoRA, load-time dequantization
-#     fallback, and auto-detection of float8_e8m0fnu block scales.
+#     requantization helpers for unmerged LoRA, pure-PyTorch per-layer
+#     dequantization fallback, and auto-detection of float8_e8m0fnu block scales.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
 from .utils import log
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _from_blocked(blocked_matrix, num_rows, num_cols):
+    n_row_blocks = _ceil_div(num_rows, 128)
+    n_col_blocks = _ceil_div(num_cols, 4)
+
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    step1 = blocked_matrix.reshape(-1, 32, 16)
+    step2 = step1.reshape(-1, 32, 4, 4).transpose(1, 2)
+    step3 = step2.reshape(n_row_blocks, n_col_blocks, 4, 32, 4)
+    step4 = step3.reshape(n_row_blocks, n_col_blocks, 128, 4)
+    step5 = step4.permute(0, 2, 1, 3)
+    unblocked = step5.reshape(padded_rows, padded_cols)
+    return unblocked[:num_rows, :num_cols]
+
+
+def _e8m0_to_f32(x):
+    biased_exp = x.to(torch.int32)
+    result = biased_exp << 23
+    result = torch.where(biased_exp == 0, torch.zeros_like(result), result)
+    return result.view(torch.float32)
 
 #based on ComfyUI's and MinusZoneAI's fp8_linear optimization
 def fp8_linear_forward(cls, base_dtype, input):
@@ -95,22 +122,9 @@ def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
         f"MXFP8 weight must be 32-aligned, got {weight_fp8.shape[-1]}"
     num_rows = weight_fp8.shape[0]
     num_cols = weight_fp8.shape[-1] // 32
-    if ck is None:
-        raise RuntimeError(
-            "Cannot dequantize MXFP8 weights without comfy-kitchen. "
-            "Please install it: pip install comfy-kitchen==0.2.10"
-        )
-    # Canonical E8M0 conversion: view as uint8, unswizzle, then e8m0_to_f32
     scale_u8 = block_scale_e8m0.view(torch.uint8)
-    logical_u8 = ck.from_blocked(scale_u8, num_rows, num_cols)
-    if hasattr(ck, 'float_utils'):
-        scale_f32 = ck.float_utils.e8m0_to_f32(logical_u8)
-    else:
-        # Manual E8M0→float32: biased exponent in bits [0:8], shift to float32
-        # exponent bits, reinterpret as float32.  Zero maps to 0.0.
-        biased = logical_u8.to(torch.int32)
-        scale_f32 = (biased << 23).view(torch.float32)
-        scale_f32 = torch.where(logical_u8 == 0, torch.zeros_like(scale_f32), scale_f32)
+    logical_u8 = _from_blocked(scale_u8, num_rows, num_cols)
+    scale_f32 = _e8m0_to_f32(logical_u8)
     scale_expanded = scale_f32.repeat_interleave(32, dim=-1)[:, :weight_fp8.shape[-1]]
     return (weight_fp8.float() * scale_expanded).to(torch.bfloat16)
 
@@ -174,7 +188,7 @@ def mxfp8_linear_forward(cls, base_dtype, input):
                         f"ck.scaled_mm_mxfp8 failed, falling back to dequant+F.linear: {e}"
                     )
                     cls._mxfp8_fallback_warned = True
-        else:
+        elif hasattr(cls, 'original_forward'):
             return cls.original_forward(input.to(base_dtype))
 
     # safety: fp8 weight must have a block scale; refuse to guess

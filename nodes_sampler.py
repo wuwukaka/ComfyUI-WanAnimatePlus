@@ -207,10 +207,6 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
-        # MXFP8 + unmerged LoRA: dequantize sd BEFORE _replace_linear so the
-        # normal CustomLinear + load_weights + set_lora_params path works.
-        # E8M0 keys are intentionally kept in sd during model loading (no-LoRA
-        # path) so this block can find and use them.
         try: _is_mxfp8 = model["mxfp8_active"]
         except KeyError: _is_mxfp8 = False
         try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
@@ -218,49 +214,6 @@ class WanVideoSampler:
         if _is_mxfp8 and fp8_matmul and len(patcher.patches) != 0 and not merge_loras:
             if _mxfp8_unmerged_runtime:
                 log.info("Using runtime MXFP8 + unmerged LoRA path")
-            else:
-                from .fp8_optimization import dequantize_mxfp8_weight
-                _sd = patcher.model["sd"]
-                _did = False
-                if _sd is not None:
-                    _E8 = (getattr(torch, 'float8_e8m0fnu', torch.uint8), torch.uint8)
-                    for k in list(_sd.keys()):
-                        if k.endswith(".weight") and _sd[k].dtype == torch.float8_e4m3fn:
-                            sk = k.replace(".weight", ".scale_weight")
-                            if sk in _sd and _sd[sk].dtype in _E8:
-                                _sd[k] = dequantize_mxfp8_weight(_sd[k], _sd[sk]).to(dtype)
-                                _sd.pop(sk, None)
-                                _did = True
-                if _did:
-                    weight_dtype = dtype
-                    fp8_matmul = False
-                    model["fp8_matmul"] = False
-                    log.warning("MXFP8 dequantized for unmerged LoRA compatibility")
-                    # Load dequantized bf16 weights.
-                    load_weights(transformer, _sd, dtype, base_dtype=dtype,
-                                 transformer_load_device=device,
-                                 block_swap_args=block_swap_args)
-                    # Apply LoRA patches using Comfy's native patch format
-                    # handler so current 5-tuple patch entries remain
-                    # compatible with unmerged MXFP8 fallback.
-                    for n, m in transformer.named_modules():
-                        if isinstance(m, torch.nn.Linear):
-                            _wk = f"{n}.weight"
-                            for pk, pv in patcher.patches.items():
-                                if pk.replace("diffusion_model.", "") != _wk:
-                                    continue
-                                w = m.weight.data.to(device, dtype)
-                                w = comfy.lora.calculate_weight(
-                                    pv,
-                                    w,
-                                    _wk,
-                                    intermediate_dtype=dtype,
-                                ).to(device=device, dtype=dtype)
-                                m.weight = torch.nn.Parameter(w, requires_grad=False)
-                                # Write baked weight back to sd so offload/reload works.
-                                if _wk in _sd:
-                                    _sd[_wk] = w
-                                break
 
         # Load weights
         if transformer.audio_model is not None:
