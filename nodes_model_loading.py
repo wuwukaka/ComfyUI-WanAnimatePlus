@@ -1978,7 +1978,7 @@ class WanVideoModelLoader:
         patcher.model["compile_args"] = compile_args
         patcher.model["gguf_reader"] = gguf_reader
         patcher.model["regular_fp8_fast_matmul"] = "fast" in quantization
-        patcher.model["fp8_matmul"] = patcher.model["regular_fp8_fast_matmul"]
+        patcher.model["fp8_matmul"] = "fast" in quantization or mxfp8_fast_runtime
         patcher.model["mxfp8_fast_runtime"] = mxfp8_fast_runtime
         patcher.model["mxfp8_unmerged_lora_runtime"] = mxfp8_unmerged_lora_runtime
         patcher.model["scale_weights"] = scale_weights
