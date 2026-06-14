@@ -4,9 +4,9 @@
 #   - Added guarded custom op registration for duplicate imports/stale bytecode.
 #   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
 #   - Added MXFP8/block-wise scale_weight expansion before linear forward.
-#   - Added runtime MXFP8 + unmerged LoRA support with MXFP8-only effective-weight
-#     caching, per-step strength-aware cache invalidation, and non-fast fallback
-#     when runtime requantization is unavailable.
+#   - Added runtime MXFP8 + unmerged LoRA support with per-forward temporary
+#     effective-weight reconstruction, explicit temporary release, and non-fast
+#     fallback when runtime requantization is unavailable.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
@@ -202,9 +202,6 @@ class CustomLinear(nn.Linear):
         self.lora_strengths = []
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
-        self._lora_cache_key = None
-        self._lora_cache_weight = None
-        self._lora_cache_mode = None
         self._mxfp8_lora_last_error = None
 
         if not allow_compile:
@@ -279,27 +276,7 @@ class CustomLinear(nn.Linear):
             return strength_tensor.index_select(0, self._step).squeeze(0)
         return strength_tensor[0]
 
-    def _get_lora_cache_key(self, input):
-        if not hasattr(self, "lora_diff_0_0"):
-            return None
-        step = int(self._step.item()) if hasattr(self, "_step") else 0
-        strengths = []
-        for idx in range(len(self.lora_diffs)):
-            strengths.append(float(self._get_lora_strength(idx).detach().float().cpu().item()))
-        return (
-            input.device.type,
-            int(input.device.index) if input.device.index is not None else -1,
-            input.dtype,
-            self.compute_dtype,
-            step,
-            tuple(strengths),
-            tuple(self.weight.shape),
-        )
-
     def _clear_lora_cache(self):
-        self._lora_cache_key = None
-        self._lora_cache_weight = None
-        self._lora_cache_mode = None
         self._mxfp8_lora_last_error = None
 
     def _get_weight_with_lora(self, weight):
@@ -340,39 +317,26 @@ class CustomLinear(nn.Linear):
         )
         plain_bias = bias.to(device=input.device, dtype=self.compute_dtype) if bias is not None else None
 
-        cache_key = self._get_lora_cache_key(input)
-        if self._lora_cache_key != cache_key:
-            self._lora_cache_weight = None
-            self._lora_cache_mode = None
-
-        if self._lora_cache_mode == "mxfp8" and self._lora_cache_weight is not None:
-            q_weight, q_scale = self._lora_cache_weight
-            return run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
-
-        if self._lora_cache_mode == "plain" and self._lora_cache_weight is not None:
-            return self._linear_forward_impl(input.to(self.compute_dtype), self._lora_cache_weight, plain_bias)
-
         block_scale_weight = self.block_scale_weight.to(self.weight.device)
         base_weight = dequantize_mxfp8_weight(self.weight, block_scale_weight).to(
             device=input.device, dtype=self.compute_dtype
         )
         effective_weight = self._get_weight_with_lora(base_weight)
-        self._lora_cache_key = cache_key
 
         try:
             q_weight, q_scale = quantize_mxfp8_weight_like(effective_weight, self.block_scale_weight)
-            self._lora_cache_weight = (q_weight, q_scale)
-            self._lora_cache_mode = "mxfp8"
-            return run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+            out = run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+            del q_weight, q_scale, effective_weight, base_weight, block_scale_weight, plain_bias
+            return out
         except Exception as e:
             if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
                 raise
             if self._mxfp8_lora_last_error != str(e):
                 log.warning(f"MXFP8 + unmerged LoRA falling back to non-fast linear: {e}")
                 self._mxfp8_lora_last_error = str(e)
-            self._lora_cache_weight = effective_weight
-            self._lora_cache_mode = "plain"
-            return self._linear_forward_impl(input.to(self.compute_dtype), effective_weight, plain_bias)
+            out = self._linear_forward_impl(input.to(self.compute_dtype), effective_weight, plain_bias)
+            del effective_weight, base_weight, block_scale_weight, plain_bias
+            return out
 
     def forward(self, input):
         if self.bias is not None:

@@ -169,17 +169,11 @@ def mxfp8_linear_forward(cls, base_dtype, input):
                 # memory (bf16 dequant) and would cause a cascading OOM.
                 if isinstance(e, RuntimeError) and 'out of memory' in str(e).lower():
                     raise
-                # comfy-kitchen kernel failed for non-OOM reasons — cache a
-                # dequantized bf16 copy so subsequent calls skip re-dequant.
                 if not getattr(cls, '_mxfp8_fallback_warned', False):
                     log.warning(
                         f"ck.scaled_mm_mxfp8 failed, falling back to dequant+F.linear: {e}"
                     )
                     cls._mxfp8_fallback_warned = True
-                if getattr(cls, '_mxfp8_dequant_cache', None) is None:
-                    cls._mxfp8_dequant_cache = dequantize_mxfp8_weight(
-                        cls.weight, cls.block_scale_weight,
-                    )
         else:
             return cls.original_forward(input.to(base_dtype))
 
@@ -190,16 +184,14 @@ def mxfp8_linear_forward(cls, base_dtype, input):
             f"The model is partially quantized or the MXFP8 setup is incomplete."
         )
 
-    # fallback: use cached dequantized weight or compute on first call
-    weight = getattr(cls, '_mxfp8_dequant_cache', None)
-    if weight is None and cls.weight.dtype == torch.float8_e4m3fn and hasattr(cls, 'block_scale_weight'):
+    weight = cls.weight
+    if cls.weight.dtype == torch.float8_e4m3fn and hasattr(cls, 'block_scale_weight'):
         weight = dequantize_mxfp8_weight(cls.weight, cls.block_scale_weight)
-        cls._mxfp8_dequant_cache = weight
-    if weight is None:
-        weight = cls.weight
     weight = weight.to(device=input.device, dtype=base_dtype)
     bias = cls.bias.to(device=input.device, dtype=base_dtype) if cls.bias is not None else None
-    return torch.nn.functional.linear(input.to(base_dtype), weight, bias)
+    out = torch.nn.functional.linear(input.to(base_dtype), weight, bias)
+    del weight, bias
+    return out
 
 
 def convert_mxfp8_linear(module, base_dtype, params_to_keep, block_scale_keys):
