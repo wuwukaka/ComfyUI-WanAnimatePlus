@@ -211,6 +211,9 @@ class WanVideoSampler:
         except KeyError: _is_mxfp8 = False
         try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
         except KeyError: _mxfp8_unmerged_runtime = False
+        try: _quantization = model["quantization"]
+        except KeyError: _quantization = "disabled"
+        _is_regular_fp8_fast = fp8_matmul and ("mxfp8" not in str(_quantization))
         if _is_mxfp8 and fp8_matmul and len(patcher.patches) != 0 and not merge_loras:
             if _mxfp8_unmerged_runtime:
                 log.info("Using runtime MXFP8 + unmerged LoRA path")
@@ -235,7 +238,7 @@ class WanVideoSampler:
             transformer.patched_linear = True
         elif len(patcher.patches) != 0: #handle patched linear layers (unmerged loras, fp8 scaled)
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
-            if not merge_loras and fp8_matmul and not (_mxfp8_unmerged_runtime or _is_mxfp8):
+            if not merge_loras and _is_regular_fp8_fast and not (_mxfp8_unmerged_runtime or _is_mxfp8):
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
         else:
