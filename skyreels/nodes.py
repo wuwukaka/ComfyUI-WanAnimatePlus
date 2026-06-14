@@ -157,14 +157,17 @@ class WanVideoDiffusionForcingSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        regular_fp8_fast_matmul = patcher.model.get("regular_fp8_fast_matmul", patcher.model["fp8_matmul"])
+        try: regular_fp8_fast_matmul = patcher.model["regular_fp8_fast_matmul"]
+        except KeyError: regular_fp8_fast_matmul = patcher.model["fp8_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
         try: _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
         except KeyError: _mxfp8_fast_runtime = False
         try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
         except KeyError: _mxfp8_unmerged_runtime = False
-        _is_mxfp8_runtime = patcher.model.get("mxfp8_active", False) or _mxfp8_fast_runtime
+        try: _is_mxfp8_active = patcher.model["mxfp8_active"]
+        except KeyError: _is_mxfp8_active = False
+        _is_mxfp8_runtime = _is_mxfp8_active or _mxfp8_fast_runtime
         try: _quantization = model["quantization"]
         except KeyError: _quantization = "disabled"
         _is_regular_fp8_fast = regular_fp8_fast_matmul and ("mxfp8" not in str(_quantization))
@@ -187,7 +190,7 @@ class WanVideoDiffusionForcingSampler:
 
         # Load weights
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model.get("scale_weights", None), block_scale_weights=patcher.model.get("block_scale_weights", None), compile_args=model["compile_args"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model["scale_weights"], block_scale_weights=patcher.model["block_scale_weights"], compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device, block_swap_args=block_swap_args)

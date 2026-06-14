@@ -184,7 +184,8 @@ class WanVideoSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        regular_fp8_fast_matmul = patcher.model.get("regular_fp8_fast_matmul", patcher.model["fp8_matmul"])
+        try: regular_fp8_fast_matmul = patcher.model["regular_fp8_fast_matmul"]
+        except KeyError: regular_fp8_fast_matmul = patcher.model["fp8_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
 
@@ -228,7 +229,7 @@ class WanVideoSampler:
                     block.audio_block = None
 
         if not transformer.patched_linear and patcher.model["sd"] is not None and len(patcher.patches) != 0 and gguf_reader is None:
-            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model.get("scale_weights", None), block_scale_weights=patcher.model.get("block_scale_weights", None), compile_args=model["compile_args"])
+            transformer = _replace_linear(transformer, dtype, patcher.model["sd"], scale_weights=patcher.model["scale_weights"], block_scale_weights=patcher.model["block_scale_weights"], compile_args=model["compile_args"])
             transformer.patched_linear = True
         if patcher.model["sd"] is not None and gguf_reader is None:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
