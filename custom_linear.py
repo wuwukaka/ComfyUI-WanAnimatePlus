@@ -358,19 +358,20 @@ class CustomLinear(nn.Linear):
                 if self._mxfp8_last_error != str(e):
                     log.warning(f"MXFP8 linear falling back to per-layer dequantized linear: {e}")
                     self._mxfp8_last_error = str(e)
-                weight = dequantize_mxfp8_weight(self.weight, self.block_scale_weight).to(
+                block_scale_weight = self.block_scale_weight.to(self.weight.device)
+                weight = dequantize_mxfp8_weight(self.weight, block_scale_weight).to(
                     device=input.device, dtype=self.compute_dtype
                 )
                 plain_bias = bias.to(device=input.device, dtype=self.compute_dtype) if bias is not None else None
                 out = self._linear_forward_impl(input.to(self.compute_dtype), weight, plain_bias)
-                del weight, plain_bias
+                del weight, block_scale_weight, plain_bias
                 return out
 
         weight = self._prepare_weight(input)
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
-            sw = self.scale_weight
+            sw = self.scale_weight.to(weight.device, weight.dtype)
             # MXFP8 block-wise scale: expand from [out, in//block] to [out, in]
             if sw.ndim > 1 and sw.shape[-1] != weight.shape[-1]:
                 block_size = weight.shape[-1] // sw.shape[-1]

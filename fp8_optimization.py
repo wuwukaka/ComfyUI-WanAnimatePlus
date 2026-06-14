@@ -111,6 +111,8 @@ except ImportError:
 
 def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
     """Dequantize MXFP8 block-scaled weight to bf16."""
+    if block_scale_e8m0.device != weight_fp8.device:
+        block_scale_e8m0 = block_scale_e8m0.to(weight_fp8.device)
     # Normalize: safetensors stores E8M0 as uint8
     if block_scale_e8m0.dtype == torch.uint8:
         block_scale_e8m0 = block_scale_e8m0.view(torch.float8_e8m0fnu)
