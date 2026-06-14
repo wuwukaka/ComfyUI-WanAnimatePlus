@@ -1850,6 +1850,7 @@ class WanVideoModelLoader:
             from .fp8_optimization import convert_fp8_linear
             convert_fp8_linear(transformer, base_dtype, params_to_keep, scale_weight_keys=scale_weights)
 
+        mxfp8_active = False
         mxfp8_unmerged_lora_runtime = False
         mxfp8_fast_runtime = False
         if "mxfp8" in quantization:
@@ -1868,7 +1869,7 @@ class WanVideoModelLoader:
                         )
                         transformer.patched_linear = True
                     mxfp8_unmerged_lora_runtime = True
-                    patcher.model["mxfp8_active"] = True
+                    mxfp8_active = True
                     mxfp8_fast_runtime = True
                 else:
                     log.warning("MXFP8 fast runtime unavailable, using per-layer dequantized fallback for unmerged LoRA")
@@ -1882,11 +1883,11 @@ class WanVideoModelLoader:
                             compile_args=compile_args,
                         )
                     transformer.patched_linear = True
-                    patcher.model["mxfp8_active"] = False
+                    mxfp8_active = False
             elif mxfp8_fastpath_enabled():
                 convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
                 transformer.patched_linear = True
-                patcher.model["mxfp8_active"] = True
+                mxfp8_active = True
                 mxfp8_fast_runtime = True
                 # Keep E8M0 keys in sd for the no-LoRA path: if unmerged LoRA
                 # is added later, the sampler needs them to dequantize before
@@ -1907,7 +1908,7 @@ class WanVideoModelLoader:
                         compile_args=compile_args,
                     )
                     transformer.patched_linear = True
-                patcher.model["mxfp8_active"] = False
+                mxfp8_active = False
 
         if vram_management_args is not None:
             if "mxfp8" in quantization:
@@ -1979,6 +1980,7 @@ class WanVideoModelLoader:
         patcher.model["gguf_reader"] = gguf_reader
         patcher.model["regular_fp8_fast_matmul"] = "fast" in quantization
         patcher.model["fp8_matmul"] = "fast" in quantization or mxfp8_fast_runtime
+        patcher.model["mxfp8_active"] = mxfp8_active
         patcher.model["mxfp8_fast_runtime"] = mxfp8_fast_runtime
         patcher.model["mxfp8_unmerged_lora_runtime"] = mxfp8_unmerged_lora_runtime
         patcher.model["scale_weights"] = scale_weights

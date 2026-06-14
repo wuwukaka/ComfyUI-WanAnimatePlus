@@ -184,8 +184,7 @@ class WanVideoSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        try: regular_fp8_fast_matmul = patcher.model["regular_fp8_fast_matmul"]
-        except KeyError: regular_fp8_fast_matmul = patcher.model["fp8_matmul"]
+        regular_fp8_fast_matmul = model["regular_fp8_fast_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
 
@@ -208,14 +207,10 @@ class WanVideoSampler:
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
-        try: _is_mxfp8 = model["mxfp8_active"]
-        except KeyError: _is_mxfp8 = False
-        try: _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
-        except KeyError: _mxfp8_fast_runtime = False
-        try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
-        except KeyError: _mxfp8_unmerged_runtime = False
-        try: _quantization = model["quantization"]
-        except KeyError: _quantization = "disabled"
+        _is_mxfp8 = model["mxfp8_active"]
+        _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
+        _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
+        _quantization = model["quantization"]
         _is_regular_fp8_fast = regular_fp8_fast_matmul and ("mxfp8" not in str(_quantization))
         _is_mxfp8_runtime = _is_mxfp8 or _mxfp8_fast_runtime
         if _is_mxfp8_runtime and len(patcher.patches) != 0 and not merge_loras:

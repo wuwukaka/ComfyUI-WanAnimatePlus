@@ -157,19 +157,14 @@ class WanVideoDiffusionForcingSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        try: regular_fp8_fast_matmul = patcher.model["regular_fp8_fast_matmul"]
-        except KeyError: regular_fp8_fast_matmul = patcher.model["fp8_matmul"]
+        regular_fp8_fast_matmul = model["regular_fp8_fast_matmul"]
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
-        try: _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
-        except KeyError: _mxfp8_fast_runtime = False
-        try: _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
-        except KeyError: _mxfp8_unmerged_runtime = False
-        try: _is_mxfp8_active = patcher.model["mxfp8_active"]
-        except KeyError: _is_mxfp8_active = False
+        _mxfp8_fast_runtime = model["mxfp8_fast_runtime"]
+        _mxfp8_unmerged_runtime = model["mxfp8_unmerged_lora_runtime"]
+        _is_mxfp8_active = model["mxfp8_active"]
         _is_mxfp8_runtime = _is_mxfp8_active or _mxfp8_fast_runtime
-        try: _quantization = model["quantization"]
-        except KeyError: _quantization = "disabled"
+        _quantization = model["quantization"]
         _is_regular_fp8_fast = regular_fp8_fast_matmul and ("mxfp8" not in str(_quantization))
 
         transformer_options = patcher.model_options.get("transformer_options", None)
