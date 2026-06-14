@@ -184,7 +184,7 @@ class WanVideoSampler:
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
-        regular_fp8_fast_matmul = model.get("regular_fp8_fast_matmul", model["fp8_matmul"])
+        regular_fp8_fast_matmul = patcher.model.get("regular_fp8_fast_matmul", patcher.model["fp8_matmul"])
         gguf_reader = model["gguf_reader"]
         control_lora = model["control_lora"]
 
