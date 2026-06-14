@@ -1853,9 +1853,9 @@ class WanVideoModelLoader:
         mxfp8_unmerged_lora_runtime = False
         mxfp8_fast_runtime = False
         if "mxfp8" in quantization:
-            from .fp8_optimization import convert_mxfp8_linear, _CK_MXFP8
+            from .fp8_optimization import convert_mxfp8_linear, mxfp8_fastpath_enabled
             if lora is not None and not merge_loras:
-                if _CK_MXFP8 and block_scale_weights:
+                if mxfp8_fastpath_enabled() and block_scale_weights:
                     log.warning("MXFP8 + unmerged LoRA enabled with runtime effective-weight quantization")
                     if not transformer.patched_linear:
                         transformer = _replace_linear(
@@ -1881,9 +1881,9 @@ class WanVideoModelLoader:
                             block_scale_weights=block_scale_weights,
                             compile_args=compile_args,
                         )
-                        transformer.patched_linear = True
-                    patcher.model["mxfp8_active"] = True
-            elif _CK_MXFP8:
+                    transformer.patched_linear = True
+                    patcher.model["mxfp8_active"] = False
+            elif mxfp8_fastpath_enabled():
                 convert_mxfp8_linear(transformer, base_dtype, params_to_keep, block_scale_keys=block_scale_weights)
                 transformer.patched_linear = True
                 patcher.model["mxfp8_active"] = True
@@ -1907,6 +1907,7 @@ class WanVideoModelLoader:
                         compile_args=compile_args,
                     )
                     transformer.patched_linear = True
+                patcher.model["mxfp8_active"] = False
 
         if vram_management_args is not None:
             if "mxfp8" in quantization:

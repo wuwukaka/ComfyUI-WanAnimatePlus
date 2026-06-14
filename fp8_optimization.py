@@ -7,6 +7,8 @@
 #     requantization helpers for unmerged LoRA, pure-PyTorch per-layer
 #     dequantization fallback, and auto-detection of float8_e8m0fnu block scales.
 # Licensed under the Apache License, Version 2.0
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from .utils import log
@@ -97,6 +99,7 @@ def convert_fp8_linear(module, base_dtype, params_to_keep={}, scale_weight_keys=
 
 try:
     import comfy_kitchen as ck
+    from comfy_kitchen.registry import registry as ck_registry
     _CK_MXFP8 = (
         hasattr(ck, 'scaled_mm_mxfp8') and
         hasattr(ck, 'quantize_mxfp8') and
@@ -107,6 +110,39 @@ try:
 except ImportError:
     _CK_MXFP8 = False
     ck = None
+    ck_registry = None
+
+_MXFP8_BACKEND_LOGGED = False
+_MXFP8_FASTPATH_DISABLED = False
+_MXFP8_FASTPATH_DISABLE_REASON = None
+
+
+def _get_mxfp8_backend_context():
+    global _MXFP8_BACKEND_LOGGED
+    if (
+        _CK_MXFP8 and
+        ck_registry is not None and
+        ck_registry.is_available("eager") and
+        hasattr(torch.nn.functional, "scaled_mm")
+    ):
+        if not _MXFP8_BACKEND_LOGGED:
+            log.info("MXFP8 using comfy-kitchen eager backend")
+            _MXFP8_BACKEND_LOGGED = True
+        return ck_registry.use_backend("eager")
+    return nullcontext()
+
+
+def mxfp8_fastpath_enabled():
+    return _CK_MXFP8 and not _MXFP8_FASTPATH_DISABLED
+
+
+def disable_mxfp8_fastpath(reason):
+    global _MXFP8_FASTPATH_DISABLED, _MXFP8_FASTPATH_DISABLE_REASON
+    if _MXFP8_FASTPATH_DISABLED:
+        return
+    _MXFP8_FASTPATH_DISABLED = True
+    _MXFP8_FASTPATH_DISABLE_REASON = str(reason)
+    log.warning(f"Disabling MXFP8 fast path for this session, using dequantized fallback: {reason}")
 
 
 def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
@@ -117,7 +153,8 @@ def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
     if block_scale_e8m0.dtype == torch.uint8:
         block_scale_e8m0 = block_scale_e8m0.view(torch.float8_e8m0fnu)
     if _CK_MXFP8:
-        return ck.dequantize_mxfp8(weight_fp8, block_scale_e8m0, torch.bfloat16)
+        with _get_mxfp8_backend_context():
+            return ck.dequantize_mxfp8(weight_fp8, block_scale_e8m0, torch.bfloat16)
 
     # Manual dequant when comfy-kitchen is not available.
     assert weight_fp8.shape[-1] % 32 == 0, \
@@ -132,9 +169,10 @@ def dequantize_mxfp8_weight(weight_fp8, block_scale_e8m0):
 
 
 def quantize_mxfp8_weight_like(weight, reference_block_scale):
-    if not _CK_MXFP8:
+    if not mxfp8_fastpath_enabled():
         raise RuntimeError("comfy-kitchen MXFP8 quantization is unavailable")
-    q_weight, q_scale = ck.quantize_mxfp8(weight.to(torch.bfloat16), pad_32x=True)
+    with _get_mxfp8_backend_context():
+        q_weight, q_scale = ck.quantize_mxfp8(weight.to(torch.bfloat16), pad_32x=True)
     if q_scale.dtype == torch.uint8:
         q_scale = q_scale.view(torch.float8_e8m0fnu)
     if reference_block_scale is not None and q_scale.shape != reference_block_scale.shape:
@@ -145,25 +183,36 @@ def quantize_mxfp8_weight_like(weight, reference_block_scale):
 
 
 def run_mxfp8_linear_kernel(cls, input, bias, weight=None, block_scale=None, out_dtype=None):
-    if not _CK_MXFP8:
+    if not mxfp8_fastpath_enabled():
         raise RuntimeError("comfy-kitchen MXFP8 kernel is unavailable")
+    effective_weight = weight if weight is not None else cls.weight
+    effective_block_scale = block_scale if block_scale is not None else cls.block_scale_weight
     if len(input.shape) != 3:
-        effective_weight = (weight if weight is not None else cls.weight).to(input.device)
+        effective_weight = dequantize_mxfp8_weight(effective_weight, effective_block_scale).to(
+            device=input.device, dtype=out_dtype or input.dtype
+        )
         effective_bias = bias.to(device=input.device, dtype=out_dtype or input.dtype) if bias is not None else None
-        return torch.nn.functional.linear(input.to(out_dtype or input.dtype), effective_weight.to(out_dtype or input.dtype), effective_bias)
+        return torch.nn.functional.linear(input.to(out_dtype or input.dtype), effective_weight, effective_bias)
 
     input_shape = input.shape
     inp_2d = input.reshape(-1, input_shape[2]).to(out_dtype or bias.dtype if bias is not None else torch.bfloat16)
     orig_rows = inp_2d.shape[0]
-    orig_cols = (weight if weight is not None else cls.weight).shape[0]
-    inp_fp8, inp_block_scale = ck.quantize_mxfp8(inp_2d, pad_32x=True)
-    q_weight = (weight if weight is not None else cls.weight).to(input.device)
-    q_scale = (block_scale if block_scale is not None else cls.block_scale_weight).to(input.device)
+    orig_cols = effective_weight.shape[0]
+    q_weight = effective_weight.to(input.device)
+    q_scale = effective_block_scale.to(input.device)
     bias = bias.to(device=input.device, dtype=out_dtype or inp_2d.dtype) if bias is not None else None
-    o = ck.scaled_mm_mxfp8(
-        inp_fp8, q_weight, inp_block_scale, q_scale,
-        bias=bias, out_dtype=out_dtype or inp_2d.dtype,
-    )
+    try:
+        with _get_mxfp8_backend_context():
+            inp_fp8, inp_block_scale = ck.quantize_mxfp8(inp_2d, pad_32x=True)
+            o = ck.scaled_mm_mxfp8(
+                inp_fp8, q_weight, inp_block_scale, q_scale,
+                bias=bias, out_dtype=out_dtype or inp_2d.dtype,
+            )
+    except Exception as e:
+        if isinstance(e, RuntimeError) and 'out of memory' in str(e).lower():
+            raise
+        disable_mxfp8_fastpath(e)
+        raise
     if o.shape[0] != orig_rows or o.shape[1] != orig_cols:
         o = o[:orig_rows, :orig_cols]
     return o.reshape((-1, input_shape[1], orig_cols))
@@ -176,22 +225,23 @@ def mxfp8_linear_forward(cls, base_dtype, input):
     both activation and weight are block-quantized via ck.quantize_mxfp8,
     then ck.scaled_mm_mxfp8 performs the block-scaled matmul.
     """
-    if cls.weight.dtype == torch.float8_e4m3fn and _CK_MXFP8 and hasattr(cls, 'block_scale_weight'):
+    if cls.weight.dtype == torch.float8_e4m3fn and hasattr(cls, 'block_scale_weight'):
         if len(input.shape) == 3:
-            try:
-                return run_mxfp8_linear_kernel(cls, input, cls.bias, out_dtype=base_dtype)
-            except Exception as e:
-                # Re-raise OOM immediately — the fallback allocates 2x more
-                # memory (bf16 dequant) and would cause a cascading OOM.
-                if isinstance(e, RuntimeError) and 'out of memory' in str(e).lower():
-                    raise
-                if not getattr(cls, '_mxfp8_fallback_warned', False):
-                    log.warning(
-                        f"ck.scaled_mm_mxfp8 failed, falling back to dequant+F.linear: {e}"
-                    )
-                    cls._mxfp8_fallback_warned = True
+            if mxfp8_fastpath_enabled():
+                try:
+                    return run_mxfp8_linear_kernel(cls, input, cls.bias, out_dtype=base_dtype)
+                except Exception as e:
+                    if isinstance(e, RuntimeError) and 'out of memory' in str(e).lower():
+                        raise
+                    if not getattr(cls, '_mxfp8_fallback_warned', False):
+                        log.warning(
+                            f"MXFP8 fast path failed, falling back to dequant+F.linear: {e}"
+                        )
+                        cls._mxfp8_fallback_warned = True
         elif hasattr(cls, 'original_forward'):
-            return cls.original_forward(input.to(base_dtype))
+            weight = dequantize_mxfp8_weight(cls.weight, cls.block_scale_weight).to(device=input.device, dtype=base_dtype)
+            bias = cls.bias.to(device=input.device, dtype=base_dtype) if cls.bias is not None else None
+            return torch.nn.functional.linear(input.to(base_dtype), weight, bias)
 
     # safety: fp8 weight must have a block scale; refuse to guess
     if cls.weight.dtype == torch.float8_e4m3fn and not hasattr(cls, 'block_scale_weight'):

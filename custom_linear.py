@@ -315,6 +315,7 @@ class CustomLinear(nn.Linear):
         from .fp8_optimization import (
             dequantize_mxfp8_weight,
             quantize_mxfp8_weight_like,
+            mxfp8_fastpath_enabled,
             run_mxfp8_linear_kernel,
         )
         plain_bias = bias.to(device=input.device, dtype=self.compute_dtype) if bias is not None else None
@@ -326,8 +327,11 @@ class CustomLinear(nn.Linear):
         effective_weight = self._get_weight_with_lora(base_weight)
 
         try:
-            q_weight, q_scale = quantize_mxfp8_weight_like(effective_weight, self.block_scale_weight)
-            out = run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+            if mxfp8_fastpath_enabled():
+                q_weight, q_scale = quantize_mxfp8_weight_like(effective_weight, self.block_scale_weight)
+                out = run_mxfp8_linear_kernel(self, input, bias, q_weight, q_scale)
+            else:
+                raise RuntimeError("MXFP8 fast path disabled")
             del q_weight, q_scale, effective_weight, base_weight, block_scale_weight, plain_bias
             return out
         except Exception as e:
@@ -349,9 +353,11 @@ class CustomLinear(nn.Linear):
         if getattr(self, "block_scale_weight", None) is not None:
             if hasattr(self, "lora_diff_0_0"):
                 return self._forward_mxfp8_with_lora_fallback(input, bias)
-            from .fp8_optimization import dequantize_mxfp8_weight, run_mxfp8_linear_kernel
+            from .fp8_optimization import dequantize_mxfp8_weight, mxfp8_fastpath_enabled, run_mxfp8_linear_kernel
             try:
-                return run_mxfp8_linear_kernel(self, input, bias, out_dtype=self.compute_dtype)
+                if mxfp8_fastpath_enabled():
+                    return run_mxfp8_linear_kernel(self, input, bias, out_dtype=self.compute_dtype)
+                raise RuntimeError("MXFP8 fast path disabled")
             except Exception as e:
                 if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
                     raise
