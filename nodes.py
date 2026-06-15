@@ -722,6 +722,90 @@ class WanVideoClipVisionEncode:
         }
 
         return (clip_embeds_dict,)
+
+
+class WanVideoClipVisionEncodeV2:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "clip_vision": ("CLIP_VISION",),
+            "images": ("IMAGE", {"tooltip": "Image sequence to encode. All frames in the IMAGE batch are accepted."}),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Additional multiplier applied to every image embed"}),
+            "crop": (["center", "disabled"], {"default": "center", "tooltip": "Crop image to 224x224 before encoding"}),
+            "combine_embeds": (["average", "sum", "concat", "batch"], {"default": "average", "tooltip": "Method to combine multiple clip embeds"}),
+            "force_offload": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "negative_image": ("IMAGE", {"tooltip": "Image batch to use for uncond"}),
+                "tiles": ("INT", {"default": 0, "min": 0, "max": 16, "step": 2, "tooltip": "Use matteo's tiled image encoding for improved accuracy"}),
+                "ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Ratio of the tile average"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_CLIPEMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+
+    def process(self, clip_vision, images, strength, force_offload, crop, combine_embeds, negative_image=None, tiles=0, ratio=1.0):
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+
+        if images is None or images.shape[0] == 0:
+            raise ValueError("At least one image is required")
+
+        clip_vision.model.to(device)
+
+        negative_clip_embeds = None
+
+        if tiles > 0:
+            log.info("Using tiled image encoding")
+            clip_embeds = clip_encode_image_tiled(clip_vision, images.to(device), tiles=tiles, ratio=ratio)
+            if negative_image is not None:
+                negative_clip_embeds = clip_encode_image_tiled(clip_vision, negative_image.to(device), tiles=tiles, ratio=ratio)
+        else:
+            if isinstance(clip_vision, ClipVisionModel):
+                clip_embeds = clip_vision.encode_image(images).penultimate_hidden_states.to(device)
+                if negative_image is not None:
+                    negative_clip_embeds = clip_vision.encode_image(negative_image).penultimate_hidden_states.to(device)
+            else:
+                pixel_values = clip_preprocess(images.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
+                clip_embeds = clip_vision.visual(pixel_values)
+                if negative_image is not None:
+                    pixel_values = clip_preprocess(negative_image.to(device), size=224, mean=image_mean, std=image_std, crop=(not crop == "disabled")).float()
+                    negative_clip_embeds = clip_vision.visual(pixel_values)
+
+        log.info(f"Clip embeds V2 shape: {clip_embeds.shape}, dtype: {clip_embeds.dtype}")
+
+        weighted_embeds = []
+        for i in range(clip_embeds.shape[0]):
+            weighted_embeds.append(clip_embeds[i:i + 1] * strength)
+
+        if len(weighted_embeds) == 1:
+            clip_embeds = weighted_embeds[0]
+        elif combine_embeds == "average":
+            clip_embeds = torch.mean(torch.stack(weighted_embeds), dim=0)
+        elif combine_embeds == "sum":
+            clip_embeds = torch.sum(torch.stack(weighted_embeds), dim=0)
+        elif combine_embeds == "concat":
+            clip_embeds = torch.cat(weighted_embeds, dim=1)
+        elif combine_embeds == "batch":
+            clip_embeds = torch.cat(weighted_embeds, dim=0)
+        else:
+            raise ValueError(f"Unsupported combine_embeds mode: {combine_embeds}")
+
+        log.info(f"Combined clip embeds V2 shape: {clip_embeds.shape}")
+
+        if force_offload:
+            clip_vision.model.to(offload_device)
+            mm.soft_empty_cache()
+
+        clip_embeds_dict = {
+            "clip_embeds": clip_embeds,
+            "negative_clip_embeds": negative_clip_embeds
+        }
+
+        return (clip_embeds_dict,)
         
 class WanVideoRealisDanceLatents:
     @classmethod
@@ -3528,6 +3612,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTextEncode": WanVideoTextEncode,
     "WanVideoTextEncodeSingle": WanVideoTextEncodeSingle,
     "WanVideoClipVisionEncode": WanVideoClipVisionEncode,
+    "WanVideoClipVisionEncodeV2": WanVideoClipVisionEncodeV2,
     "WanVideoImageToVideoEncode": WanVideoImageToVideoEncode,
     "WanVideoEncode": WanVideoEncode,
     "WanVideoEncodeLatentBatch": WanVideoEncodeLatentBatch,
@@ -3573,6 +3658,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTextEncodeSingle": "WanVideo TextEncodeSingle",
     "WanVideoTextImageEncode": "WanVideo TextImageEncode (IP2V)",
     "WanVideoClipVisionEncode": "WanVideo ClipVision Encode",
+    "WanVideoClipVisionEncodeV2": "WanVideo ClipVision Encode V2",
     "WanVideoImageToVideoEncode": "WanVideo ImageToVideo Encode",
     "WanVideoEncode": "WanVideo Encode",
     "WanVideoEncodeLatentBatch": "WanVideo Encode Latent Batch",
