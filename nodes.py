@@ -1725,6 +1725,7 @@ class WanAnimatePlusSCAIL2Embeds:
             "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 32, "tooltip": "Width of the video to generate. SCAIL-2 inputs are aligned to multiples of 32."}),
             "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 32, "tooltip": "Height of the video to generate. SCAIL-2 inputs are aligned to multiples of 32."}),
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to generate"}),
+            "frame_window_size": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "SCAIL-2 chunk window length. Values smaller than num_frames enable built-in loop generation with 5-frame handoff."}),
             "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
             "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL pose stream"}),
             "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL reference stream"}),
@@ -1927,7 +1928,7 @@ class WanAnimatePlusSCAIL2Embeds:
             device=ref_latent.device, dtype=ref_latent.dtype,
         )
 
-    def process(self, vae, width, height, num_frames, force_offload, pose_strength, ref_strength,
+    def process(self, vae, width, height, num_frames, frame_window_size, force_offload, pose_strength, ref_strength,
                 pose_start_percent, pose_end_percent, ref_start_percent, ref_end_percent, replacement_mode,
                 clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
                 transition_video=None, pose_image_mask=None, reference_image_mask=None, tiled_vae=False,
@@ -1935,7 +1936,14 @@ class WanAnimatePlusSCAIL2Embeds:
                 single_frame_prefix_encoding=True, **kwargs):
         W = (width // 32) * 32
         H = (height // 32) * 32
-        num_frames = ((num_frames - 1) // 4) * 4 + 1
+        requested_frames = ((int(num_frames) - 1) // 4) * 4 + 1
+        frame_window_size = ((int(frame_window_size) - 1) // 4) * 4 + 1
+        frame_window_size = min(frame_window_size, requested_frames)
+        scail2_looping = frame_window_size < requested_frames
+        if scail2_looping and not single_frame_prefix_encoding:
+            log.info("SCAIL-2 loop mode forces single_frame_prefix_encoding on; legacy canvas prefix is not used for loop handoff.")
+            single_frame_prefix_encoding = True
+        num_frames = requested_frames
         bg_prefix_mask_pixel_frames = 0
         bg_prefix_mask_index = None
         crop_main_ref_background = (not replacement_mode) and (not preserve_main_ref_background)
@@ -2049,11 +2057,18 @@ class WanAnimatePlusSCAIL2Embeds:
         transition_px_range = None
         if transition_video is not None:
             transition_px_range = (17, 37) if canvas_prefix_frames is not None else (0, 21)
+        transition_match_ref = self._resize_bhwc(ref_image[:1, :, :, :3], W, H) if ref_image is not None else None
+        if transition_colormatch != "disabled" and transition_match_ref is None and (transition_video is not None or scail2_looping):
+            log.warning("SCAIL-2 transition_colormatch is enabled but ref_image is not connected. Skipping color match.")
 
         if canvas_expansion_px:
             num_frames += canvas_expansion_px
             trim = (num_frames - 1) % 4
-            num_frames -= trim
+            if trim:
+                if scail2_looping:
+                    num_frames += 4 - trim
+                else:
+                    num_frames -= trim
             if pose_images is not None:
                 pose_images = torch.cat([_sample_reversed_prefix_frames(pose_images, canvas_expansion_px), pose_images], dim=0)
             if pose_image_mask is not None:
@@ -2167,9 +2182,6 @@ class WanAnimatePlusSCAIL2Embeds:
         if canvas_expansion_px:
             freeze_canvas = torch.zeros(canvas_expansion_px, H, W, 3, device=device, dtype=vae.dtype)
             freeze_frame_mask = torch.zeros(canvas_expansion_px, device=device, dtype=vae.dtype)
-            transition_match_ref = self._resize_bhwc(ref_image[:1, :, :, :3], W, H) if ref_image is not None else None
-            if transition_colormatch != "disabled" and transition_match_ref is None:
-                log.warning("SCAIL-2 transition_colormatch is enabled but ref_image is not connected. Skipping color match.")
             if canvas_prefix_frames is not None:
                 prefix_pixels = self._build_prefix_pixels(canvas_prefix_frames)
                 actual_prefix_px = min(prefix_pixels.shape[0], 17)
@@ -2212,22 +2224,27 @@ class WanAnimatePlusSCAIL2Embeds:
                 transition_frame_mask[trans_start:trans_end] = 1
                 scail_transition_keep_mask = self._frame_mask_to_latent_mask(transition_frame_mask, target_latents)
 
+        scail2_pose_pixels = None
+        scail2_pose_mask_pixels = None
         if pose_images is not None:
             pose_images = self._fit_sequence(pose_images[:, :, :, :3], num_frames)
-            pose_latent = self._encode_scail_20ch(vae, pose_images, W // 2, H // 2, tiled_vae, scale=pose_strength).to(offload_device)
-            if scail_condition_zero_mask is not None:
-                target_len = pose_latent.shape[1]
-                zero_mask = torch.zeros(target_len, dtype=torch.bool, device=pose_latent.device)
-                copy_len = min(len(scail_condition_zero_mask), target_len)
-                zero_mask[:copy_len] = scail_condition_zero_mask[:copy_len].to(device=pose_latent.device, dtype=torch.bool)
-                if scail_transition_keep_mask is not None:
-                    keep_len = min(len(scail_transition_keep_mask), target_len)
-                    keep_mask = torch.zeros(target_len, dtype=torch.bool, device=pose_latent.device)
-                    keep_mask[:keep_len] = scail_transition_keep_mask[:keep_len].to(device=pose_latent.device, dtype=torch.bool)
-                    zero_mask &= ~keep_mask
-                pose_latent[:, zero_mask] = 0
-            scail_embeds["pose_latent"] = pose_latent
-            log.info(f"SCAIL-2 pose latent shape: {pose_latent.shape}")
+            if scail2_looping:
+                scail2_pose_pixels = self._resize_bhwc(pose_images, W // 2, H // 2).to(offload_device)
+            else:
+                pose_latent = self._encode_scail_20ch(vae, pose_images, W // 2, H // 2, tiled_vae, scale=pose_strength).to(offload_device)
+                if scail_condition_zero_mask is not None:
+                    target_len = pose_latent.shape[1]
+                    zero_mask = torch.zeros(target_len, dtype=torch.bool, device=pose_latent.device)
+                    copy_len = min(len(scail_condition_zero_mask), target_len)
+                    zero_mask[:copy_len] = scail_condition_zero_mask[:copy_len].to(device=pose_latent.device, dtype=torch.bool)
+                    if scail_transition_keep_mask is not None:
+                        keep_len = min(len(scail_transition_keep_mask), target_len)
+                        keep_mask = torch.zeros(target_len, dtype=torch.bool, device=pose_latent.device)
+                        keep_mask[:keep_len] = scail_transition_keep_mask[:keep_len].to(device=pose_latent.device, dtype=torch.bool)
+                        zero_mask &= ~keep_mask
+                    pose_latent[:, zero_mask] = 0
+                scail_embeds["pose_latent"] = pose_latent
+                log.info(f"SCAIL-2 pose latent shape: {pose_latent.shape}")
 
         if pose_image_mask is not None:
             pose_image_mask = self._fit_sequence(pose_image_mask[:, :, :, :3], num_frames)
@@ -2264,25 +2281,28 @@ class WanAnimatePlusSCAIL2Embeds:
 
         if pose_image_mask is not None:
             mask_video = self._resize_bhwc(pose_image_mask, W // 2, H // 2, mode="area")
-            sam_latents = self._extract_mask_to_28ch(mask_video).to(offload_device, vae.dtype)
-            if scail_condition_zero_mask is not None:
-                target_len = sam_latents.shape[1]
-                zero_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
-                copy_len = min(len(scail_condition_zero_mask), target_len)
-                zero_mask[:copy_len] = scail_condition_zero_mask[:copy_len].to(device=sam_latents.device, dtype=torch.bool)
-                if scail_sam_keep_mask is not None:
-                    keep_len = min(len(scail_sam_keep_mask), target_len)
-                    keep_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
-                    keep_mask[:keep_len] = scail_sam_keep_mask[:keep_len].to(device=sam_latents.device, dtype=torch.bool)
-                    zero_mask &= ~keep_mask
-                if scail_transition_keep_mask is not None:
-                    keep_len = min(len(scail_transition_keep_mask), target_len)
-                    keep_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
-                    keep_mask[:keep_len] = scail_transition_keep_mask[:keep_len].to(device=sam_latents.device, dtype=torch.bool)
-                    zero_mask &= ~keep_mask
-                sam_latents[:, zero_mask] = 0
-            scail_embeds["sam_latents"] = sam_latents
-            log.info(f"SCAIL-2 driving mask latents shape: {sam_latents.shape}")
+            if scail2_looping:
+                scail2_pose_mask_pixels = mask_video.to(offload_device)
+            else:
+                sam_latents = self._extract_mask_to_28ch(mask_video).to(offload_device, vae.dtype)
+                if scail_condition_zero_mask is not None:
+                    target_len = sam_latents.shape[1]
+                    zero_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
+                    copy_len = min(len(scail_condition_zero_mask), target_len)
+                    zero_mask[:copy_len] = scail_condition_zero_mask[:copy_len].to(device=sam_latents.device, dtype=torch.bool)
+                    if scail_sam_keep_mask is not None:
+                        keep_len = min(len(scail_sam_keep_mask), target_len)
+                        keep_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
+                        keep_mask[:keep_len] = scail_sam_keep_mask[:keep_len].to(device=sam_latents.device, dtype=torch.bool)
+                        zero_mask &= ~keep_mask
+                    if scail_transition_keep_mask is not None:
+                        keep_len = min(len(scail_transition_keep_mask), target_len)
+                        keep_mask = torch.zeros(target_len, dtype=torch.bool, device=sam_latents.device)
+                        keep_mask[:keep_len] = scail_transition_keep_mask[:keep_len].to(device=sam_latents.device, dtype=torch.bool)
+                        zero_mask &= ~keep_mask
+                    sam_latents[:, zero_mask] = 0
+                scail_embeds["sam_latents"] = sam_latents
+                log.info(f"SCAIL-2 driving mask latents shape: {sam_latents.shape}")
 
         if ref_masks and ref_mask_condition_used:
             ref_mask_prefix = torch.cat(ref_masks, dim=1)
@@ -2298,22 +2318,43 @@ class WanAnimatePlusSCAIL2Embeds:
             mm.soft_empty_cache()
             gc.collect()
 
-        target_shape = (16, target_latents, lat_h, lat_w)
+        window_latents = (frame_window_size - 1) // 4 + 1
+        target_shape = (16, window_latents if scail2_looping else target_latents, lat_h, lat_w)
         image_embeds = {
             "target_shape": target_shape,
             "clip_context": clip_embeds.get("clip_embeds", None) if clip_embeds is not None else None,
             "negative_clip_context": clip_embeds.get("negative_clip_embeds", None) if clip_embeds is not None else None,
-            "max_seq_len": math.ceil((lat_h * lat_w) / 4 * target_latents),
+            "max_seq_len": math.ceil((lat_h * lat_w) / 4 * target_shape[1]),
             "num_frames": num_frames,
+            "vae": vae,
+            "tiled_vae": tiled_vae,
+            "scail2_requested_frames": requested_frames,
+            "frame_window_size": frame_window_size,
+            "scail2_frame_window_size": frame_window_size,
+            "scail2_looping": scail2_looping,
+            "scail2_previous_frame_count": 5,
             "lat_h": lat_h,
             "lat_w": lat_w,
             "scail_embeds": scail_embeds,
             "canvas_expansion_px": canvas_expansion_px,
             "scail_prefix_prepend_latents": scail_prefix_prepend_latents,
+            "scail2_transition_colormatch": transition_colormatch,
         }
+        if transition_match_ref is not None:
+            image_embeds["scail2_transition_match_ref"] = transition_match_ref.to(offload_device)
         if scail_freeze_latents is not None:
             image_embeds["scail_freeze_latents"] = scail_freeze_latents
             image_embeds["scail_freeze_mask"] = scail_freeze_mask
+        if scail_condition_zero_mask is not None:
+            image_embeds["scail_condition_zero_mask"] = scail_condition_zero_mask
+        if scail_sam_keep_mask is not None:
+            image_embeds["scail_sam_keep_mask"] = scail_sam_keep_mask
+        if scail_transition_keep_mask is not None:
+            image_embeds["scail_transition_keep_mask"] = scail_transition_keep_mask
+        if scail2_pose_pixels is not None:
+            image_embeds["scail2_pose_pixels"] = scail2_pose_pixels
+        if scail2_pose_mask_pixels is not None:
+            image_embeds["scail2_pose_mask_pixels"] = scail2_pose_mask_pixels
         return (image_embeds,)
 
 

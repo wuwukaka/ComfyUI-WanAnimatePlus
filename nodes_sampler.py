@@ -32,7 +32,7 @@ from .WanMove.trajectory import replace_feature
 from contextlib import nullcontext
 
 from comfy import model_management as mm
-from comfy.utils import ProgressBar
+from comfy.utils import ProgressBar, common_upscale
 from comfy.cli_args import args, LatentPreviewMethod
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -571,6 +571,9 @@ class WanVideoSampler:
         # region WanAnim inputs
         frame_window_size = image_embeds.get("frame_window_size", 77)
         wananimate_loop = image_embeds.get("looping", False)
+        scail2_looping = bool(image_embeds.get("scail2_looping", False))
+        scail2_requested_frames = int(image_embeds.get("scail2_requested_frames", image_embeds.get("num_frames", 0)))
+        scail2_previous_frame_count = int(image_embeds.get("scail2_previous_frame_count", 5))
         # ============ Global transition_video read ============
         transition_latent = image_embeds.get("transition_latent", None)
         transition_mask_values = image_embeds.get("transition_mask_values", None)
@@ -593,6 +596,10 @@ class WanVideoSampler:
             log.info(f"Prefix frames: detected, will prepend {prefix_prepend_latents} latent frames to each non-first context window")
         if wananimate_loop and context_options is not None:
             raise Exception("context_options are not compatible or necessary with WanAnim looping, since it creates the video in a loop.")
+        if scail2_looping and context_options is not None:
+            raise Exception("context_options are not compatible with SCAIL-2 loop mode. Set frame_window_size >= num_frames to use context mode.")
+        if scail2_looping and samples is not None:
+            raise ValueError("Input latent samples are not supported with SCAIL-2 loop mode. Disconnect samples or set frame_window_size >= num_frames.")
         wananim_pose_latents = image_embeds.get("pose_latents", None)
         wananim_pose_strength = image_embeds.get("pose_strength", 1.0)
         wananim_face_strength = image_embeds.get("face_strength", 1.0)
@@ -831,7 +838,7 @@ class WanVideoSampler:
 
         # vid2vid
         noise_mask = original_image = scail_freeze_mask = None
-        if samples is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling:
+        if samples is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling and not scail2_looping:
             saved_generator_state = samples.get("generator_state", None)
             if saved_generator_state is not None:
                 seed_g.set_state(saved_generator_state)
@@ -866,7 +873,7 @@ class WanVideoSampler:
                     ).repeat(1, noise.shape[0], 1, 1, 1)
 
         scail_freeze_latents = image_embeds.get("scail_freeze_latents", None)
-        if scail_freeze_latents is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling:
+        if scail_freeze_latents is not None and not multitalk_sampling and not wananimate_loop and not everanimate_sampling and not scail2_looping:
             freeze_latents = scail_freeze_latents
             if freeze_latents.ndim == 5:
                 freeze_latents = freeze_latents.squeeze(0)
@@ -1380,7 +1387,8 @@ class WanVideoSampler:
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
                              wananim_face_pixels=None, wananim_num_anchor_latents=1, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,
-                             context_latents=None, context_roles=None, context_window_start=0, scail_context_prepend_latents=0,):
+                             context_latents=None, context_roles=None, context_window_start=0, scail_context_prepend_latents=0,
+                             scail_data_override=None,):
             nonlocal transformer
             nonlocal audio_cfg_scale
             nonlocal scail2_fast_path_fallback_logged
@@ -1614,8 +1622,9 @@ class WanVideoSampler:
                 if background_latents is not None or foreground_latents is not None:
                     z = torch.cat([z, foreground_latents.to(z), background_latents.to(z)], dim=0)
 
+                active_scail_data = scail_data_override if scail_data_override is not None else scail_data
                 scail_data_in = None
-                if scail_data is not None:
+                if active_scail_data is not None:
                     ref_concat_mask = torch.zeros_like(z[:4])
                     if scail_freeze_mask is not None:
                         history_mask = scail_freeze_mask[0, :4].to(z)
@@ -1646,22 +1655,22 @@ class WanVideoSampler:
                         ref_concat_mask = history_mask
                     z = torch.cat([z, ref_concat_mask])
                     if context_window is not None:
-                        scail_data_in = scail_data.copy()
-                        if scail_data.get("pose_latent", None) is not None:
+                        scail_data_in = active_scail_data.copy()
+                        if active_scail_data.get("pose_latent", None) is not None:
                             pose_parts = []
                             if scail_context_prepend_latents > 0:
-                                pose_parts.append(scail_data["pose_latent"][:, :scail_context_prepend_latents])
-                            pose_parts.append(scail_data["pose_latent"][:, context_window])
+                                pose_parts.append(active_scail_data["pose_latent"][:, :scail_context_prepend_latents])
+                            pose_parts.append(active_scail_data["pose_latent"][:, context_window])
                             scail_data_in["pose_latent"] = torch.cat(pose_parts, dim=1)
-                        if scail_data.get("sam_latents", None) is not None:
+                        if active_scail_data.get("sam_latents", None) is not None:
                             sam_parts = []
                             if scail_context_prepend_latents > 0:
-                                sam_parts.append(scail_data["sam_latents"][:, :scail_context_prepend_latents])
-                            sam_parts.append(scail_data["sam_latents"][:, context_window])
+                                sam_parts.append(active_scail_data["sam_latents"][:, :scail_context_prepend_latents])
+                            sam_parts.append(active_scail_data["sam_latents"][:, context_window])
                             scail_data_in["sam_latents"] = torch.cat(sam_parts, dim=1)
-                        ref_mask_latents = scail_data.get("ref_mask_latents", None)
+                        ref_mask_latents = active_scail_data.get("ref_mask_latents", None)
                         if ref_mask_latents is not None:
-                            ref_latent = scail_data.get("ref_latent_pos", scail_data.get("ref_latent_neg", None))
+                            ref_latent = active_scail_data.get("ref_latent_pos", active_scail_data.get("ref_latent_neg", None))
                             ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
                             ref_mask_prefix = ref_mask_latents[:, :ref_count]
                             ref_mask_target = ref_mask_latents[:, ref_count:]
@@ -1673,7 +1682,7 @@ class WanVideoSampler:
                                 ref_mask_target = torch.cat(target_parts, dim=1)
                             scail_data_in["ref_mask_latents"] = torch.cat([ref_mask_prefix, ref_mask_target], dim=1)
                     else:
-                        scail_data_in = scail_data
+                        scail_data_in = active_scail_data.copy()
 
                 if wanmove_embeds is not None and context_window is not None:
                     image_cond_input = replace_feature(image_cond_input.unsqueeze(0), track_pos[:, context_window].unsqueeze(0), wanmove_embeds.get("strength", 1.0))[0]
@@ -1849,7 +1858,7 @@ class WanVideoSampler:
                     and getattr(transformer, "vace_layers", None) is None
                     and not batched_cfg
                     and not bidirectional_sampling
-                    and loop_args is None
+                    and (loop_args is None or scail2_looping)
                     and qwenvl_embeds_pos is None
                     and qwenvl_embeds_neg is None
                     and control_latents is None
@@ -1943,7 +1952,7 @@ class WanVideoSampler:
                             fallback_reasons.append("batched CFG enabled")
                         if bidirectional_sampling:
                             fallback_reasons.append("bidirectional sampling enabled")
-                        if loop_args is not None:
+                        if loop_args is not None and not scail2_looping:
                             fallback_reasons.append("loop enabled")
                         if qwenvl_embeds_pos is not None or qwenvl_embeds_neg is not None:
                             fallback_reasons.append("QwenVL embeddings connected")
@@ -2400,7 +2409,7 @@ class WanVideoSampler:
             masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
 
         latent_shift_loop = False
-        if loop_args is not None:
+        if loop_args is not None and not scail2_looping:
             latent_shift_loop = is_looped = True
             latent_skip = loop_args["shift_skip"]
             latent_shift_start_percent = loop_args["start_percent"]
@@ -2817,6 +2826,441 @@ class WanVideoSampler:
                 return {"video": gen_video_samples.permute(1, 2, 3, 0)},
             finally:
                 _ea_restore_rope_state()
+
+        if scail2_looping:
+            if freeinit_args is not None:
+                raise ValueError("FreeInit is not supported with SCAIL-2 loop mode")
+            if vae is None:
+                raise ValueError("SCAIL-2 loop mode requires a VAE in image_embeds")
+
+            requested_output_frames = int(scail2_requested_frames)
+            total_generation_frames = int(num_frames)
+            chunk_frames = int(image_embeds.get("scail2_frame_window_size", frame_window_size))
+            chunk_frames = ((chunk_frames - 1) // 4) * 4 + 1
+            prev_frame_count = int(scail2_previous_frame_count)
+            if prev_frame_count <= 0:
+                raise ValueError("SCAIL-2 previous frame count must be positive")
+            if chunk_frames <= prev_frame_count:
+                raise ValueError("SCAIL-2 frame_window_size must be larger than the 5-frame handoff")
+            stride_frames = chunk_frames - prev_frame_count
+            chunk_latent_frames = (chunk_frames - 1) // 4 + 1
+            prev_latent_count = (prev_frame_count - 1) // 4 + 1
+            num_chunks = 1 if total_generation_frames <= chunk_frames else math.ceil((total_generation_frames - chunk_frames) / stride_frames) + 1
+
+            lat_h = int(image_embeds.get("lat_h", noise.shape[2]))
+            lat_w = int(image_embeds.get("lat_w", noise.shape[3]))
+            pose_pixels_all = image_embeds.get("scail2_pose_pixels", None)
+            pose_mask_pixels_all = image_embeds.get("scail2_pose_mask_pixels", None)
+            if pose_pixels_all is not None:
+                pose_pixels_all = pose_pixels_all.to(offload_device)
+            if pose_mask_pixels_all is not None:
+                pose_mask_pixels_all = pose_mask_pixels_all.to(offload_device)
+
+            freeze_latents_global = image_embeds.get("scail_freeze_latents", None)
+            freeze_mask_global = image_embeds.get("scail_freeze_mask", None)
+            scail_condition_zero_mask_global = image_embeds.get("scail_condition_zero_mask", None)
+            scail_sam_keep_mask_global = image_embeds.get("scail_sam_keep_mask", None)
+            scail_transition_keep_mask_global = image_embeds.get("scail_transition_keep_mask", None)
+            scail2_transition_colormatch = image_embeds.get("scail2_transition_colormatch", "disabled")
+            scail2_transition_match_ref = image_embeds.get("scail2_transition_match_ref", None)
+
+            outer_freqs = freqs
+            outer_rope_num_frames = getattr(transformer.rope_embedder, "num_frames", None)
+            outer_cached_freqs = getattr(transformer, "cached_freqs", None)
+            outer_cached_key = getattr(transformer, "cached_key", None)
+
+            def _scail2_restore_rope_state():
+                nonlocal freqs
+                freqs = outer_freqs
+                transformer.rope_embedder.num_frames = outer_rope_num_frames
+                transformer.cached_freqs = outer_cached_freqs
+                if hasattr(transformer, "cached_key"):
+                    transformer.cached_key = outer_cached_key
+
+            def _slice_with_last_pad(tensor, start, length, dim):
+                if tensor is None:
+                    return None
+                if tensor.shape[dim] <= 0:
+                    raise ValueError("SCAIL-2 loop input sequence contains no frames")
+                take = max(min(length, tensor.shape[dim] - start), 0)
+                if take > 0:
+                    out = tensor.narrow(dim, start, take)
+                else:
+                    out = tensor.narrow(dim, tensor.shape[dim] - 1, 1).narrow(dim, 0, 0)
+                if out.shape[dim] < length:
+                    pad_shape = [1] * tensor.ndim
+                    pad_shape[dim] = length - out.shape[dim]
+                    last = tensor.narrow(dim, tensor.shape[dim] - 1, 1).repeat(*pad_shape)
+                    out = torch.cat([out, last], dim=dim)
+                return out
+
+            def _fit_latent_time(tensor, length):
+                if tensor is None:
+                    return None
+                if tensor.shape[1] > length:
+                    return tensor[:, :length]
+                if tensor.shape[1] < length:
+                    pad = tensor[:, -1:].repeat(1, length - tensor.shape[1], 1, 1)
+                    return torch.cat([tensor, pad], dim=1)
+                return tensor
+
+            def _resize_latent_spatial(tensor, h, w):
+                if tensor is None or tensor.shape[2:] == (h, w):
+                    return tensor
+                return torch.nn.functional.interpolate(
+                    tensor.unsqueeze(0),
+                    size=(tensor.shape[1], h, w),
+                    mode="trilinear",
+                    align_corners=False,
+                )[0]
+
+            def _encode_video_window(video_bhwc, width, height, scale=1.0):
+                video_bhwc = video_bhwc[:, :, :, :3]
+                pixels = common_upscale(video_bhwc.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+                pixels = pixels.permute(3, 0, 1, 2).to(device=device, dtype=vae.dtype) * 2 - 1
+                vae.to(device)
+                lat = vae.encode([pixels], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+                mask = torch.ones_like(lat[:4])
+                if scale != 1.0:
+                    lat = lat * scale
+                return torch.cat([lat, mask], dim=0)
+
+            def _mask_pixels_to_latents(mask_bhwc):
+                T, Hm, Wm, _ = mask_bhwc.shape
+                on_thresh = 225.0 / 255.0
+                mask = mask_bhwc[:, :, :, :3].movedim(-1, 1).float()
+                r = (mask[:, 0:1] > on_thresh).float()
+                g = (mask[:, 1:2] > on_thresh).float()
+                b = (mask[:, 2:3] > on_thresh).float()
+                nr, ng, nb = 1 - r, 1 - g, 1 - b
+                binary_7ch = torch.cat([
+                    r * g * b,
+                    r * ng * nb,
+                    nr * g * nb,
+                    nr * ng * b,
+                    r * g * nb,
+                    r * ng * b,
+                    nr * g * b,
+                ], dim=1)
+                h_lat, w_lat = Hm, Wm
+                for _ in range(3):
+                    h_lat = (h_lat + 1) // 2
+                    w_lat = (w_lat + 1) // 2
+                binary_7ch = torch.nn.functional.interpolate(binary_7ch, size=(h_lat, w_lat), mode="area")
+                t_lat = (T - 1) // 4 + 1
+                padded = torch.cat([binary_7ch[:1].repeat(4, 1, 1, 1), binary_7ch[1:]], dim=0)
+                if padded.shape[0] < t_lat * 4:
+                    padded = torch.cat([padded, padded[-1:].repeat(t_lat * 4 - padded.shape[0], 1, 1, 1)], dim=0)
+                padded = padded[:t_lat * 4]
+                return padded.view(t_lat, 28, h_lat, w_lat).movedim(0, 1).contiguous().to(device=device, dtype=dtype)
+
+            def _frame_mask_to_latent_mask(frame_mask, latent_count):
+                frame_mask = frame_mask.flatten().to(device=device, dtype=dtype)
+                t_lat = (frame_mask.shape[0] - 1) // 4 + 1
+                padded = torch.cat([frame_mask[:1].repeat(4), frame_mask[1:]], dim=0)
+                if padded.shape[0] < t_lat * 4:
+                    padded = torch.cat([padded, padded[-1:].repeat(t_lat * 4 - padded.shape[0])], dim=0)
+                latent_mask = padded[:t_lat * 4].view(t_lat, 4).amax(dim=1)
+                if latent_mask.shape[0] < latent_count:
+                    latent_mask = torch.cat([latent_mask, torch.zeros(latent_count - latent_mask.shape[0], device=device, dtype=dtype)], dim=0)
+                return latent_mask[:latent_count]
+
+            def _slice_mask_window(mask, chunk_start, keep_mask=None):
+                if mask is None:
+                    return None
+                sliced = _slice_with_last_pad(mask, chunk_start // 4, chunk_latent_frames, 0).to(device=device, dtype=torch.bool)
+                if keep_mask is not None:
+                    keep = _slice_with_last_pad(keep_mask, chunk_start // 4, chunk_latent_frames, 0).to(device=device, dtype=torch.bool)
+                    sliced &= ~keep
+                return sliced
+
+            def _zero_condition_latents(latents, zero_mask):
+                if latents is None or zero_mask is None:
+                    return latents
+                copy_len = min(latents.shape[1], zero_mask.shape[0])
+                if copy_len > 0 and bool(zero_mask[:copy_len].any()):
+                    latents = latents.clone()
+                    zero_idx = zero_mask[:copy_len].nonzero(as_tuple=True)[0]
+                    latents[:, zero_idx] = 0
+                return latents
+
+            def _color_match_anchor_frames(anchor_cthw):
+                if scail2_transition_colormatch == "disabled" or scail2_transition_match_ref is None:
+                    return anchor_cthw
+                from color_matcher import ColorMatcher
+                cm = ColorMatcher()
+                ref_np = scail2_transition_match_ref[:1, :, :, :3].detach().cpu().float().numpy()[0]
+                anchor_bhwc = anchor_cthw.permute(1, 2, 3, 0).float().clamp(-1.0, 1.0).add(1.0).div(2.0)
+                matched = []
+                for frame in anchor_bhwc:
+                    out = cm.transfer(src=frame.detach().cpu().numpy(), ref=ref_np, method=scail2_transition_colormatch)
+                    matched.append(torch.from_numpy(out).to(device=device, dtype=torch.float32))
+                return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2)
+
+            def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
+                local_latents = torch.zeros(16, chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
+                local_mask = torch.zeros(chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
+
+                if first_chunk and global_latents is not None:
+                    g_lat = _fit_latent_time(global_latents.to(device, dtype), chunk_latent_frames)
+                    g_lat = _resize_latent_spatial(g_lat, lat_h, lat_w)
+                    copy_len = min(chunk_latent_frames, g_lat.shape[1])
+                    local_latents[:, :copy_len] = g_lat[:, :copy_len]
+                    if global_mask is not None:
+                        g_mask = global_mask
+                        if g_mask.ndim == 5:
+                            g_mask = g_mask.squeeze(0).squeeze(0)
+                        elif g_mask.ndim == 4:
+                            g_mask = g_mask.squeeze(0) if g_mask.shape[0] == 1 else g_mask[0]
+                        g_mask = g_mask.to(device, dtype)
+                        if g_mask.shape[0] < chunk_latent_frames:
+                            pad = torch.zeros(chunk_latent_frames - g_mask.shape[0], g_mask.shape[1], g_mask.shape[2], device=device, dtype=dtype)
+                            g_mask = torch.cat([g_mask, pad], dim=0)
+                        g_mask = g_mask[:chunk_latent_frames]
+                        if g_mask.shape[1:] != (lat_h, lat_w):
+                            g_mask = torch.nn.functional.interpolate(
+                                g_mask.unsqueeze(0).unsqueeze(0),
+                                size=(chunk_latent_frames, lat_h, lat_w),
+                                mode="trilinear",
+                                align_corners=False,
+                            )[0, 0]
+                        local_mask[:copy_len] = torch.maximum(local_mask[:copy_len], g_mask[:copy_len])
+
+                if prev_anchor_latents is not None:
+                    anchor = _fit_latent_time(prev_anchor_latents.to(device, dtype), prev_latent_count)
+                    anchor = _resize_latent_spatial(anchor, lat_h, lat_w)
+                    copy_len = min(prev_latent_count, chunk_latent_frames, anchor.shape[1])
+                    local_latents[:, :copy_len] = anchor[:, :copy_len]
+                    local_mask[:copy_len] = 1.0
+
+                if local_mask.any():
+                    return local_latents, local_mask
+                return None, None
+
+            def _build_chunk_scail_data(base_scail_data, chunk_start, local_freeze_mask, first_chunk):
+                chunk_data = base_scail_data.copy() if base_scail_data is not None else {}
+                chunk_latent_start = chunk_start // 4
+                zero_mask_source = scail_condition_zero_mask_global if first_chunk else None
+                if pose_pixels_all is not None:
+                    pose_window = _slice_with_last_pad(pose_pixels_all, chunk_start, chunk_frames, 0).to(device)
+                    pose_latent = _encode_video_window(
+                        pose_window,
+                        max(1, lat_w * vae_upscale_factor // 2),
+                        max(1, lat_h * vae_upscale_factor // 2),
+                        scale=float((base_scail_data or {}).get("pose_strength", 1.0)),
+                    )
+                    pose_zero_mask = _slice_mask_window(
+                        zero_mask_source,
+                        chunk_start,
+                        keep_mask=scail_transition_keep_mask_global,
+                    )
+                    pose_latent = _zero_condition_latents(pose_latent, pose_zero_mask)
+                    chunk_data["pose_latent"] = pose_latent
+                else:
+                    chunk_data.pop("pose_latent", None)
+
+                if pose_mask_pixels_all is not None:
+                    mask_window = _slice_with_last_pad(pose_mask_pixels_all, chunk_start, chunk_frames, 0).to(device)
+                    sam_latents = _mask_pixels_to_latents(mask_window)
+                    sam_zero_mask = _slice_mask_window(
+                        zero_mask_source,
+                        chunk_start,
+                        keep_mask=scail_transition_keep_mask_global,
+                    )
+                    sam_keep_mask = _slice_mask_window(
+                        scail_sam_keep_mask_global,
+                        chunk_start,
+                    )
+                    if sam_zero_mask is not None and sam_keep_mask is not None:
+                        sam_zero_mask &= ~sam_keep_mask
+                    sam_latents = _zero_condition_latents(sam_latents, sam_zero_mask)
+                    chunk_data["sam_latents"] = sam_latents
+                else:
+                    chunk_data.pop("sam_latents", None)
+
+                ref_mask_latents = chunk_data.get("ref_mask_latents", None)
+                if ref_mask_latents is not None:
+                    ref_latent = chunk_data.get("ref_latent_pos", chunk_data.get("ref_latent_neg", None))
+                    ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
+                    ref_mask_prefix = ref_mask_latents[:, :ref_count]
+                    ref_mask_target = ref_mask_latents[:, ref_count:]
+                    target_window = _slice_with_last_pad(ref_mask_target, chunk_latent_start, chunk_latent_frames, 1) if ref_mask_target.shape[1] > 0 else ref_mask_target
+                    chunk_data["ref_mask_latents"] = torch.cat([ref_mask_prefix, target_window], dim=1)
+                return chunk_data
+
+            def _encode_anchor_from_video(video_cthw):
+                anchor = video_cthw[:, -prev_frame_count:].to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
+                anchor = _color_match_anchor_frames(anchor)
+                vae.to(device)
+                return vae.encode([anchor.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+
+            if "comfy" in rope_function:
+                transformer.rope_embedder.num_frames = chunk_latent_frames
+                transformer.cached_freqs = None
+                if hasattr(transformer, "cached_key"):
+                    transformer.cached_key = None
+            elif context_latents is None and "default" in rope_function:
+                freqs = torch.cat([
+                    rope_params(1024, d - 4 * (d // 6), L_test=chunk_latent_frames, k=riflex_freq_index),
+                    rope_params(1024, 2 * (d // 6)),
+                    rope_params(1024, 2 * (d // 6)),
+                ], dim=1)
+
+            log.info(
+                f"SCAIL-2 loop sampling: {requested_output_frames} requested frames, {total_generation_frames} canvas frames, {num_chunks} chunks, "
+                f"{chunk_frames} frames/chunk, stride {stride_frames}, {prev_frame_count} frame handoff"
+            )
+
+            callback = prepare_callback(patcher, num_chunks * len(timesteps))
+            generated_chunks = []
+            prev_anchor_latents = None
+            chunk_seeds = []
+            step_iteration_count = 0
+
+            try:
+                for chunk_idx in range(num_chunks):
+                    chunk_start = chunk_idx * stride_frames
+                    chunk_seed = int.from_bytes(os.urandom(8), "little")
+                    chunk_seeds.append(chunk_seed)
+                    chunk_generator = torch.Generator(device=torch.device("cpu"))
+                    chunk_generator.manual_seed(chunk_seed)
+                    log.info(f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}: start={chunk_start}, seed={chunk_seed}")
+
+                    if isinstance(scheduler, dict):
+                        chunk_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
+                        chunk_timesteps = scheduler["timesteps"]
+                    else:
+                        chunk_scheduler, chunk_timesteps, _, _ = get_scheduler(
+                            scheduler, total_steps, start_step, end_step, shift, device,
+                            transformer.dim, denoise_strength, sigmas=sigmas,
+                        )
+                    if hasattr(chunk_scheduler, "timesteps"):
+                        chunk_scheduler.timesteps = chunk_timesteps
+                    chunk_step_args = dict(scheduler_step_args)
+                    chunk_step_args["generator"] = chunk_generator
+                    step_sig = inspect.signature(chunk_scheduler.step)
+                    for arg in list(chunk_step_args.keys()):
+                        if arg not in step_sig.parameters:
+                            chunk_step_args.pop(arg)
+
+                    latent = torch.randn(
+                        16,
+                        chunk_latent_frames,
+                        lat_h,
+                        lat_w,
+                        dtype=torch.float32,
+                        generator=chunk_generator,
+                        device=torch.device("cpu"),
+                    ).to(device)
+                    local_freeze_latents, local_freeze_mask = _make_local_freeze(
+                        freeze_latents_global,
+                        freeze_mask_global,
+                        chunk_start,
+                        prev_anchor_latents,
+                        chunk_idx == 0,
+                    )
+                    if local_freeze_latents is not None:
+                        freeze = local_freeze_mask.unsqueeze(0).to(latent)
+                        latent = (local_freeze_latents.to(latent) * freeze + latent * (1 - freeze)).detach()
+
+                    local_scail_data = _build_chunk_scail_data(scail_data, chunk_start, local_freeze_mask, chunk_idx == 0)
+                    local_scail_data = dict_to_device(local_scail_data, device, dtype)
+                    local_scail_freeze_mask = None
+                    if local_freeze_mask is not None:
+                        local_scail_freeze_mask = local_freeze_mask.unsqueeze(0).repeat(1, latent.shape[0], 1, 1, 1).to(device)
+
+                    self.cache_state = [None, None]
+                    seq_len = math.ceil((latent.shape[2] * latent.shape[3]) / 4 * latent.shape[1])
+                    chunk_pbar = tqdm(total=len(chunk_timesteps), desc=f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}", position=0, leave=True)
+                    old_scail_freeze_mask = scail_freeze_mask
+                    try:
+                        scail_freeze_mask = local_scail_freeze_mask
+                        for i, t in enumerate(chunk_timesteps):
+                            timestep = torch.tensor([t]).to(device)
+                            latent_model_input = latent.to(device)
+                            noise_pred, _, self.cache_state = predict_with_cfg(
+                                latent_model_input,
+                                cfg[min(i, len(cfg) - 1)],
+                                text_embeds["prompt_embeds"],
+                                text_embeds["negative_prompt_embeds"],
+                                timestep,
+                                i,
+                                clip_fea=clip_fea,
+                                cache_state=self.cache_state,
+                                scail_data_override=local_scail_data,
+                            )
+                            if use_tsr:
+                                noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
+                            latent = chunk_scheduler.step(
+                                noise_pred.unsqueeze(0),
+                                timestep,
+                                latent.unsqueeze(0).to(noise_pred.device),
+                                **chunk_step_args,
+                            )[0].squeeze(0).detach()
+                            if local_freeze_latents is not None and local_scail_freeze_mask is not None:
+                                mask = local_scail_freeze_mask[0].to(latent)
+                                latent = local_freeze_latents.to(latent) * mask + latent * (1 - mask)
+
+                            if callback is not None:
+                                callback_latent = (latent_model_input - noise_pred.to(device) * timestep.to(device) / 1000).detach()
+                                callback(step_iteration_count, callback_latent.permute(1, 0, 2, 3), None, num_chunks * len(chunk_timesteps))
+                                del callback_latent
+                            chunk_pbar.update(1)
+                            step_iteration_count += 1
+                            del noise_pred, latent_model_input, timestep
+                    finally:
+                        scail_freeze_mask = old_scail_freeze_mask
+                        chunk_pbar.close()
+
+                    if local_freeze_latents is not None:
+                        mask = local_freeze_mask.unsqueeze(0).to(latent)
+                        latent = local_freeze_latents.to(latent) * mask + latent * (1 - mask)
+
+                    vae.to(device)
+                    chunk_video = vae.decode(
+                        latent.unsqueeze(0).to(device, vae.dtype),
+                        device=device,
+                        tiled=tiled_vae,
+                        pbar=False,
+                    )[0].detach().cpu()
+                    if chunk_video.shape[1] > chunk_frames:
+                        chunk_video = chunk_video[:, :chunk_frames]
+
+                    prev_anchor_latents = _encode_anchor_from_video(chunk_video)
+                    generated_chunks.append(chunk_video if chunk_idx == 0 else chunk_video[:, prev_frame_count:])
+
+                    del latent, chunk_video, local_scail_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
+                    mm.soft_empty_cache()
+                    gc.collect()
+
+                gen_video_samples = torch.cat(generated_chunks, dim=1)
+                if canvas_expansion_px:
+                    if gen_video_samples.shape[1] > canvas_expansion_px:
+                        gen_video_samples = gen_video_samples[:, canvas_expansion_px:]
+                        log.info(f"SCAIL-2 loop: trimmed {canvas_expansion_px} canvas expansion pixel frames from output")
+                    else:
+                        log.warning(
+                            f"SCAIL-2 loop: canvas_expansion_px={canvas_expansion_px} is not smaller than output length {gen_video_samples.shape[1]}, skipping trim"
+                        )
+                if gen_video_samples.shape[1] > requested_output_frames:
+                    gen_video_samples = gen_video_samples[:, :requested_output_frames]
+                log.info(f"SCAIL-2 chunk seeds: {chunk_seeds}")
+
+                if force_offload:
+                    vae.to(offload_device)
+                    if not model["auto_cpu_offload"]:
+                        offload_transformer(transformer)
+                try:
+                    print_memory(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                except Exception:
+                    pass
+                return ({
+                    "video": gen_video_samples.permute(1, 2, 3, 0),
+                    "scail2_chunk_seeds": chunk_seeds,
+                },)
+            finally:
+                _scail2_restore_rope_state()
 
         # Main sampling loop with FreeInit iterations
         iterations = freeinit_args.get("freeinit_num_iters", 3) if freeinit_args is not None else 1
