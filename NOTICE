@@ -51,3 +51,10 @@ The wuwukasi/wuwukaka additions include, without limitation:
   helpers.
 - Custom linear operation registration safeguards and WanAnimatePlus-specific
   custom op handling.
+- ComfyUI native quantized linear loading support for NVFP4/FP8 checkpoints,
+  adapted from PR #2029 in this fork's upstream/original project,
+  kijai/ComfyUI-WanVideoWrapper
+  (https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029). Copyright in
+  the adapted upstream PR code remains with its author(s) and the upstream
+  ComfyUI-WanVideoWrapper contributors; WanAnimatePlus modifications include
+  package integration, loader safeguards, and CustomLinear dispatch adaptation.

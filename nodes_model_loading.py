@@ -1,3 +1,12 @@
+# Modified from nodes_model_loading.py in ComfyUI-WanVideoWrapper.
+# Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
+# This file also includes ComfyUI native quantized loading integration adapted
+# from PR #2029 in this fork's upstream/original project,
+# kijai/ComfyUI-WanVideoWrapper:
+# https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029
+# The upstream PR author's copyright remains with that author and the
+# ComfyUI-WanVideoWrapper contributors.
+# Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
 import os, gc, uuid
@@ -11,6 +20,7 @@ from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
+from .comfy_quant_linear import is_comfy_quant_state_dict, replace_with_comfy_quant_linear
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
@@ -811,6 +821,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
     block_idx = vace_block_idx = None
+    comfy_quant = is_comfy_quant_state_dict(sd)
 
     if gguf:
         log.info("Using GGUF to load and assign model weights to device...")
@@ -864,6 +875,10 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             transformer.gguf_patched = True
     else:
         log.info("Loading and assigning model weights to device...")
+        if comfy_quant and not getattr(transformer, "comfy_quant_patched", False):
+            log.info("ComfyUI-native quantized checkpoint detected; reconstructing QuantizedTensor weights...")
+            replace_with_comfy_quant_linear(transformer, sd, base_dtype, transformer_load_device)
+            transformer.comfy_quant_patched = True
     named_params = transformer.named_parameters()
 
     for name, param in tqdm(named_params,
@@ -890,6 +905,9 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             continue
 
         key = name.replace("_orig_mod.", "")
+        if comfy_quant and (key.rsplit(".", 1)[0] + ".comfy_quant") in sd:
+            pbar.update(1)
+            continue
         value=sd[key]
         keep_fp32 = ["patch_embedding", "motion_encoder", "condition_embedding"]
 
@@ -1182,9 +1200,13 @@ class WanVideoModelLoader:
                 if new_key != key:
                     sd[new_key] = sd.pop(key)
 
+        comfy_quant = is_comfy_quant_state_dict(sd)
+        if comfy_quant and merge_loras:
+            raise ValueError("ComfyUI-native quantized models do not support LoRA merging. Disable merge_loras in the LoRA select node.")
+
         is_scaled_fp8 = False
 
-        if quantization == "disabled":
+        if quantization == "disabled" and not comfy_quant:
             for k, v in sd.items():
                 if isinstance(v, torch.Tensor):
                     if v.dtype == torch.float8_e4m3fn:
@@ -1201,7 +1223,7 @@ class WanVideoModelLoader:
                         break
 
         scale_weights = {}
-        if "fp8" in quantization:
+        if "fp8" in quantization and not comfy_quant:
             for k, v in sd.items():
                 if k.endswith(".scale_weight") or k.endswith(".weight_scale"):
                     is_scaled_fp8 = True
@@ -1597,7 +1619,8 @@ class WanVideoModelLoader:
             sd.update(extra_sd)
             del extra_sd
 
-        sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
+        if not is_comfy_quant_state_dict(sd):
+            sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
 
         # FlashVSR
         if "LQ_proj_in.norm1.gamma" in sd:
@@ -1713,7 +1736,7 @@ class WanVideoModelLoader:
         patcher.model.is_patched = False
 
         scale_weights = {}
-        if "fp8" in quantization:
+        if "fp8" in quantization and not comfy_quant:
             for k, v in sd.items():
                 if k.endswith(".scale_weight"):
                     scale_weights[k] = v.to(device, base_dtype)
@@ -1757,11 +1780,11 @@ class WanVideoModelLoader:
                     patcher.patches.clear()
                 transformer.patched_linear = False
                 sd = None
-            elif "scaled" in quantization or lora is not None:
+            elif "scaled" in quantization or lora is not None or comfy_quant:
                 transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights, compile_args=compile_args)
                 transformer.patched_linear = True
 
-        if "fast" in quantization:
+        if "fast" in quantization and not comfy_quant:
             if lora is not None and not merge_loras:
                 raise NotImplementedError("fp8_fast is not supported with unmerged LoRAs")
             from .fp8_optimization import convert_fp8_linear

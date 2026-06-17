@@ -4,6 +4,9 @@
 #   - Added guarded custom op registration for duplicate imports/stale bytecode.
 #   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
 #   - Added MXFP8/block-wise scale_weight expansion before linear forward.
+#   - Added ComfyUI native quantized weight passthrough adapted from PR #2029
+#     in this fork's upstream/original project, kijai/ComfyUI-WanVideoWrapper:
+#     https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn
@@ -269,7 +272,9 @@ class CustomLinear(nn.Linear):
         return weight
 
     def _prepare_weight(self, input):
-        """Prepare weight tensor - handles both regular and GGUF weights"""
+        """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
+        if getattr(self, "_comfy_quant_format", None) is not None:
+            return self.weight
         if self.is_gguf:
             weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
         else:
