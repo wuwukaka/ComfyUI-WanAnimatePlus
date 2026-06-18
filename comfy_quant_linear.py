@@ -248,6 +248,29 @@ def find_comfy_quant_prefix(sd, prefix):
     return None
 
 
+def find_comfy_quant_prefix_by_shape(sd, weight_shape, logical_shape):
+    """Find native quant metadata when module and state_dict names disagree."""
+    if sd is None or weight_shape is None or logical_shape is None:
+        return None
+    weight_shape = tuple(weight_shape)
+    logical_shape = tuple(logical_shape)
+    for quant_key in sd:
+        if not quant_key.endswith(".comfy_quant"):
+            continue
+        prefix = quant_key[:-len("comfy_quant")]
+        weight = sd.get(prefix + "weight")
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if tuple(weight.shape) != weight_shape:
+            continue
+        try:
+            if tuple(get_state_dict_weight_shape(sd, prefix + "weight")) == logical_shape:
+                return prefix
+        except Exception:
+            continue
+    return None
+
+
 def bind_comfy_quant_metadata_for_prefix(module, sd, prefix, compute_dtype, device=torch.device("cpu")):
     """Attach native quant metadata for one module if the state_dict has it."""
     matched_prefix = find_comfy_quant_prefix(sd, prefix)
@@ -265,6 +288,20 @@ def bind_comfy_quant_metadata_for_prefix(module, sd, prefix, compute_dtype, devi
     if len(logical_shape) == 2:
         module.out_features, module.in_features = logical_shape
     return True
+
+
+def bind_comfy_quant_metadata_for_lora(module, sd, prefix, compute_dtype, device, lora_shape=None):
+    """Attach native quant metadata for a LoRA target, falling back to shape match."""
+    if bind_comfy_quant_metadata_for_prefix(module, sd, prefix, compute_dtype, device):
+        return True
+
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        return False
+    matched_prefix = find_comfy_quant_prefix_by_shape(sd, tuple(weight.shape), lora_shape)
+    if matched_prefix is None:
+        return False
+    return bind_comfy_quant_metadata_for_prefix(module, sd, matched_prefix, compute_dtype, device)
 
 
 def rebind_comfy_quant_metadata(model, sd, compute_dtype, device=torch.device("cpu"), prefix=""):

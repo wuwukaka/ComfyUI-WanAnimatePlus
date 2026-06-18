@@ -13,6 +13,7 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from .comfy_quant_linear import (
     bind_comfy_quant_metadata,
+    bind_comfy_quant_metadata_for_lora,
     bind_comfy_quant_metadata_for_prefix,
     dequantize_comfy_quant_weight,
     get_comfy_quant_metadata,
@@ -189,12 +190,21 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
                     continue
             lora_strengths = [p[0] for p in patch]
             if state_dict is not None:
-                bind_comfy_quant_metadata_for_prefix(
+                lora_shape = None
+                for diff in lora_diffs:
+                    if isinstance(diff, tuple) and len(diff) > 1:
+                        lora_shape = (
+                            diff[0].flatten(start_dim=1).shape[0],
+                            diff[1].flatten(start_dim=1).shape[1],
+                        )
+                        break
+                bind_comfy_quant_metadata_for_lora(
                     module,
                     state_dict,
-                    module_prefix,
+                    key,
                     compute_dtype if compute_dtype is not None else module.compute_dtype,
                     device,
+                    lora_shape=lora_shape,
                 )
             module.set_lora_diffs(lora_diffs, device=device)
             module.set_lora_strengths(lora_strengths, device=device)
