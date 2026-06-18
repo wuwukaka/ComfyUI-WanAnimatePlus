@@ -1781,7 +1781,31 @@ class WanAnimatePlusSCAIL2Embeds:
 
     @staticmethod
     def _resize_bhwc(images, width, height, mode="lanczos", crop="disabled"):
-        return common_upscale(images[:, :, :, :3].movedim(-1, 1), width, height, mode, crop).movedim(1, -1)
+        images = images[:, :, :, :3]
+        if images.shape[1] == height and images.shape[2] == width:
+            return images
+        chunk_size = WanAnimatePlusSCAIL2Embeds._safe_frame_chunk_size(
+            images.shape[0],
+            images.shape[1],
+            images.shape[2],
+            width,
+            height,
+            3,
+        )
+        if images.shape[0] <= chunk_size:
+            return common_upscale(images.movedim(-1, 1), width, height, mode, crop).movedim(1, -1)
+        resized = []
+        for start in range(0, images.shape[0], chunk_size):
+            chunk = images[start:start + chunk_size]
+            resized.append(common_upscale(chunk.movedim(-1, 1), width, height, mode, crop).movedim(1, -1))
+        return torch.cat(resized, dim=0)
+
+    @staticmethod
+    def _safe_frame_chunk_size(frame_count, in_height, in_width, out_width, out_height, channels):
+        # Keep CUDA pooling/interpolate calls well below the int32 element limit.
+        element_budget = 64 * 1024 * 1024
+        per_frame = max(in_height * in_width * channels, out_height * out_width * channels, 1)
+        return max(1, min(frame_count, element_budget // per_frame))
 
     @staticmethod
     def _to_cthw_pixels(images):
@@ -1895,25 +1919,31 @@ class WanAnimatePlusSCAIL2Embeds:
         # Colored RGB mask (T,H,W,3) in [0,1] -> [28,T_lat,H/8,W/8].
         T, H, W, _ = rgb_video.shape
         on_thresh = 225.0 / 255.0
-        mask = rgb_video[:, :, :, :3].movedim(-1, 1).float()
-        r = (mask[:, 0:1] > on_thresh).float()
-        g = (mask[:, 1:2] > on_thresh).float()
-        b = (mask[:, 2:3] > on_thresh).float()
-        nr, ng, nb = 1 - r, 1 - g, 1 - b
-        binary_7ch = torch.cat([
-            r * g * b,      # white
-            r * ng * nb,    # red
-            nr * g * nb,    # green
-            nr * ng * b,    # blue
-            r * g * nb,     # yellow
-            r * ng * b,     # magenta
-            nr * g * b,     # cyan
-        ], dim=1)
         h_lat, w_lat = H, W
         for _ in range(3):
             h_lat = (h_lat + 1) // 2
             w_lat = (w_lat + 1) // 2
-        binary_7ch = F.interpolate(binary_7ch, size=(h_lat, w_lat), mode="area")
+
+        chunk_size = WanAnimatePlusSCAIL2Embeds._safe_frame_chunk_size(T, H, W, w_lat, h_lat, 7)
+        binary_chunks = []
+        for start in range(0, T, chunk_size):
+            mask = rgb_video[start:start + chunk_size, :, :, :3].movedim(-1, 1).float()
+            r = (mask[:, 0:1] > on_thresh).float()
+            g = (mask[:, 1:2] > on_thresh).float()
+            b = (mask[:, 2:3] > on_thresh).float()
+            nr, ng, nb = 1 - r, 1 - g, 1 - b
+            binary_7ch = torch.cat([
+                r * g * b,      # white
+                r * ng * nb,    # red
+                nr * g * nb,    # green
+                nr * ng * b,    # blue
+                r * g * nb,     # yellow
+                r * ng * b,     # magenta
+                nr * g * b,     # cyan
+            ], dim=1)
+            binary_chunks.append(F.interpolate(binary_7ch, size=(h_lat, w_lat), mode="area"))
+        binary_7ch = torch.cat(binary_chunks, dim=0)
+
         t_lat = (T - 1) // 4 + 1
         padded = torch.cat([binary_7ch[:1].repeat(4, 1, 1, 1), binary_7ch[1:]], dim=0)
         if padded.shape[0] < t_lat * 4:
