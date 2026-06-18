@@ -103,9 +103,11 @@ Restart ComfyUI after installation.
 
 ## Attribution for Videos
 
-If you publish workflow introduction videos, tutorial videos, or similar instructional content made with WanAnimatePlus nodes, you must clearly state that the nodes come from this project and provide the project link:
+As an attribution condition for using the WanAnimatePlus-specific nodes in published workflow introduction videos, tutorial videos, or similar instructional content, you must clearly state that the nodes come from this project and provide the project link:
 
 https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
+
+This attribution notice applies to WanAnimatePlus-specific additions and does not modify the Apache License 2.0 terms for the upstream Apache-licensed portions.
 
 ## Nodes
 

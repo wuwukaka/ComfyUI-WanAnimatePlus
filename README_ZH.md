@@ -103,9 +103,11 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 
 ## 视频 / 教程署名要求
 
-如果你发布使用 WanAnimatePlus 节点制作的工作流介绍视频、教学视频或类似教程内容，必须明确说明节点来自本项目，并提供项目链接：
+作为使用 WanAnimatePlus 专属节点制作并发布工作流介绍视频、教学视频或类似教程内容时的署名条件，你必须明确说明这些节点来自本项目，并提供项目链接：
 
 https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
+
+本署名说明适用于 WanAnimatePlus 专属新增/修改部分，不修改上游 Apache License 2.0 授权部分的 Apache 2.0 条款。
 
 ## 节点说明
 
