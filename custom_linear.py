@@ -11,6 +11,7 @@
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
+from .comfy_quant_linear import get_state_dict_weight_shape
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
 if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
@@ -96,8 +97,7 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
             if weight_key not in state_dict:
                 continue
 
-            in_features = state_dict[weight_key].shape[1]
-            out_features = state_dict[weight_key].shape[0]
+            out_features, in_features = get_state_dict_weight_shape(state_dict, weight_key)
 
             is_gguf = isinstance(state_dict[weight_key], GGUFParameter)
 

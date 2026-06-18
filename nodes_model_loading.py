@@ -20,7 +20,7 @@ from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
-from .comfy_quant_linear import is_comfy_quant_state_dict, replace_with_comfy_quant_linear
+from .comfy_quant_linear import get_state_dict_weight_shape, is_comfy_quant_state_dict, replace_with_comfy_quant_linear
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
@@ -1283,16 +1283,14 @@ class WanVideoModelLoader:
         else:
             raise ValueError("No patch_embedding weight found, is the selected model a full WanVideo model?")
 
-        in_features = sd["blocks.0.self_attn.k.weight"].shape[1]
-        out_features = sd["blocks.0.self_attn.k.weight"].shape[0]
+        out_features, in_features = get_state_dict_weight_shape(sd, "blocks.0.self_attn.k.weight")
         log.info(f"Detected model in_channels: {in_channels}")
 
         if "blocks.0.ffn.0.bias" in sd:
             ffn_dim = sd["blocks.0.ffn.0.bias"].shape[0]
-            ffn2_dim = sd["blocks.0.ffn.2.weight"].shape[1]
+            ffn2_dim = get_state_dict_weight_shape(sd, "blocks.0.ffn.2.weight")[1]
         else:
-            ffn_dim = sd["blocks.0.ffn.w1.weight"].shape[0]
-            ffn2_dim = sd["blocks.0.ffn.w1.weight"].shape[1]
+            ffn_dim, ffn2_dim = get_state_dict_weight_shape(sd, "blocks.0.ffn.w1.weight")
 
         patch_size=(1, 2, 2)
         if "patch_embedding.0.weight" in sd:
@@ -1507,7 +1505,10 @@ class WanVideoModelLoader:
         # FantasyPortrait https://github.com/Fantasy-AMAP/fantasy-portrait/
         if fantasyportrait_model is not None and "blocks.0.cross_attn.emo_k_proj.weight" not in sd:
             log.info("FantasyPortrait model detected, patching model...")
-            context_dim = fantasyportrait_model["sd"]["ip_adapter.blocks.0.cross_attn.ip_adapter_single_stream_k_proj.weight"].shape[1]
+            context_dim = get_state_dict_weight_shape(
+                fantasyportrait_model["sd"],
+                "ip_adapter.blocks.0.cross_attn.ip_adapter_single_stream_k_proj.weight",
+            )[1]
 
             with init_empty_weights():
                 for block in transformer.blocks:
@@ -1523,7 +1524,7 @@ class WanVideoModelLoader:
         # FlashPortrait
         if "blocks.0.cross_attn.emo_k_proj.weight" in sd:
             log.info("FlashPortrait model detected, patching model...")
-            context_dim = sd["blocks.0.cross_attn.emo_k_proj.weight"].shape[1]
+            context_dim = get_state_dict_weight_shape(sd, "blocks.0.cross_attn.emo_k_proj.weight")[1]
 
             sd = {k.replace("emo_k_proj", "ip_adapter_single_stream_k_proj"): v for k, v in sd.items()}
             sd = {k.replace("emo_v_proj", "ip_adapter_single_stream_v_proj"): v for k, v in sd.items()}
@@ -1640,8 +1641,8 @@ class WanVideoModelLoader:
         # Bindweave text_projection
         if "text_projection.0.weight" in sd:
             log.info("Bindweave model detected, adding text_projection to the model")
-            text_dim = sd["text_projection.0.weight"].shape[0]
-            transformer.text_projection = nn.Sequential(nn.Linear(sd["text_projection.0.weight"].shape[1], text_dim), nn.GELU(approximate='tanh'), nn.Linear(text_dim, text_dim))
+            text_dim, text_in_dim = get_state_dict_weight_shape(sd, "text_projection.0.weight")
+            transformer.text_projection = nn.Sequential(nn.Linear(text_in_dim, text_dim), nn.GELU(approximate='tanh'), nn.Linear(text_dim, text_dim))
 
         latent_format=Wan22 if dim == 3072 else Wan21
         comfy_model = WanVideoModel(WanVideoModelConfig(latent_format=latent_format), device=device, transformer=transformer)

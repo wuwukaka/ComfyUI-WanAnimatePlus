@@ -57,6 +57,25 @@ def _logical_weight_shape(fmt, packed_weight):
     return out_features, in_features
 
 
+def get_state_dict_weight_shape(sd, weight_key):
+    """Return the logical Linear weight shape for regular or Comfy quant weights."""
+    if sd is None:
+        raise ValueError("state dict is required")
+    if not weight_key.endswith("weight"):
+        return tuple(sd[weight_key].shape)
+
+    shape = tuple(sd[weight_key].shape)
+
+    quant_key = weight_key[:-len("weight")] + "comfy_quant"
+    if quant_key not in sd:
+        return shape
+
+    fmt = _decode_comfy_quant(sd[quant_key]).get("format")
+    if fmt == "nvfp4":
+        return _logical_weight_shape(fmt, sd[weight_key])
+    return shape
+
+
 def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     fmt = _decode_comfy_quant(sd[prefix + "comfy_quant"])["format"]
     qcfg = QUANT_ALGOS[fmt]
@@ -64,7 +83,7 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     layout = get_layout_class(layout_name)
 
     weight = sd[prefix + "weight"].to(device=device, dtype=qcfg["storage_t"])
-    out_features, in_features = _logical_weight_shape(fmt, weight)
+    out_features, in_features = get_state_dict_weight_shape(sd, prefix + "weight")
 
     if fmt == "nvfp4":
         tensor_scale = sd[prefix + "weight_scale_2"].to(device=device)
@@ -100,8 +119,10 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
         if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
             continue
 
+        weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
         qt, fmt = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
         module.weight = nn.Parameter(qt, requires_grad=False)
+        module.out_features, module.in_features = weight_shape
 
         bias_key = child_prefix + "bias"
         if module.bias is not None and bias_key in sd:
