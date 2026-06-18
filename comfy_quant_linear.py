@@ -215,6 +215,38 @@ def bind_comfy_quant_metadata(module, metadata):
         module.is_gguf = False
 
 
+def rebind_comfy_quant_metadata(model, sd, compute_dtype, device=torch.device("cpu"), prefix=""):
+    """Reattach native quant metadata to existing Linear/CustomLinear modules."""
+    if sd is None:
+        return 0
+    if prefix == "":
+        _ensure_comfy_quant_backend()
+
+    rebound = 0
+    for name, module in model.named_children():
+        child_prefix = (prefix + name + ".").replace("_orig_mod.", "")
+        rebound += rebind_comfy_quant_metadata(module, sd, compute_dtype, device, child_prefix)
+
+        if not isinstance(module, nn.Linear):
+            continue
+        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+            continue
+
+        weight = getattr(module, "weight", None)
+        metadata_device = device
+        if isinstance(weight, torch.Tensor) and weight.device.type != "meta":
+            metadata_device = weight.device
+        metadata = get_comfy_quant_metadata(sd, child_prefix, metadata_device, compute_dtype)
+        bind_comfy_quant_metadata(module, metadata)
+
+        logical_shape = tuple(metadata["logical_shape"])
+        if len(logical_shape) == 2:
+            module.out_features, module.in_features = logical_shape
+        rebound += 1
+
+    return rebound
+
+
 def _slice_logical_shape(weight, logical_shape):
     if logical_shape is None or len(weight.shape) < 2:
         return weight

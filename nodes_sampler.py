@@ -21,6 +21,7 @@ from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
 from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
+from .comfy_quant_linear import is_comfy_quant_state_dict, rebind_comfy_quant_metadata
 from .multitalk.multitalk import add_noise
 from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling, offload_transformer, init_blockswap)
@@ -226,6 +227,8 @@ class WanVideoSampler:
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
             if not merge_loras and fp8_matmul:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
+            if is_comfy_quant_state_dict(patcher.model["sd"]):
+                rebind_comfy_quant_metadata(transformer, patcher.model["sd"], dtype, device)
             set_lora_params(transformer, patcher.patches)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
