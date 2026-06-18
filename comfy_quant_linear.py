@@ -227,6 +227,14 @@ def find_comfy_quant_prefix(sd, prefix):
     """Find a state_dict prefix for native quant metadata across known wrappers."""
     if sd is None:
         return None
+
+    for candidate in _metadata_prefix_candidates(prefix):
+        if candidate + "comfy_quant" in sd:
+            return candidate
+    return None
+
+
+def _metadata_prefix_candidates(prefix):
     prefix = _normalize_metadata_prefix(prefix)
     candidates = []
 
@@ -241,11 +249,60 @@ def find_comfy_quant_prefix(sd, prefix):
             add(prefix[len(wrapper):])
         else:
             add(wrapper + prefix)
+    return candidates
 
-    for candidate in candidates:
-        if candidate + "comfy_quant" in sd:
+
+def _get_nvfp4_metadata_from_prefix(sd, prefix, device, compute_dtype, logical_shape=None):
+    if prefix + "weight_scale" not in sd or prefix + "weight_scale_2" not in sd:
+        return None
+    _ensure_comfy_quant_backend()
+    if "nvfp4" not in QUANT_ALGOS:
+        return None
+
+    weight = sd.get(prefix + "weight")
+    if logical_shape is None:
+        if not isinstance(weight, torch.Tensor):
+            return None
+        logical_shape = _logical_weight_shape("nvfp4", weight)
+
+    return {
+        "format": "nvfp4",
+        "layout": QUANT_ALGOS["nvfp4"]["comfy_tensor_layout"],
+        "logical_shape": tuple(logical_shape),
+        "backend": _COMFY_QUANT_BACKEND,
+        "weight_scale": sd[prefix + "weight_scale_2"].to(device=device),
+        "block_scale": sd[prefix + "weight_scale"].to(device=device).view(dtype=torch.float8_e4m3fn),
+    }
+
+
+def find_nvfp4_scale_prefix(sd, prefix):
+    """Find an NVFP4 scale prefix when comfy_quant metadata is unavailable."""
+    if sd is None:
+        return None
+    for candidate in _metadata_prefix_candidates(prefix):
+        if candidate + "weight_scale" in sd and candidate + "weight_scale_2" in sd:
             return candidate
     return None
+
+
+def find_nvfp4_scale_prefix_by_shape(sd, weight_shape, logical_shape):
+    if sd is None or weight_shape is None or logical_shape is None:
+        return None
+    weight_shape = tuple(weight_shape)
+    logical_shape = tuple(logical_shape)
+    matches = []
+    for weight_key, weight in sd.items():
+        if not weight_key.endswith(".weight") or not isinstance(weight, torch.Tensor):
+            continue
+        prefix = weight_key[:-len("weight")]
+        if prefix + "weight_scale" not in sd or prefix + "weight_scale_2" not in sd:
+            continue
+        if tuple(weight.shape) != weight_shape:
+            continue
+        if tuple(_logical_weight_shape("nvfp4", weight)) != logical_shape:
+            continue
+        matches.append(prefix)
+    return matches[0] if len(matches) == 1 else None
 
 
 def find_comfy_quant_prefix_by_shape(sd, weight_shape, logical_shape):
@@ -274,14 +331,24 @@ def find_comfy_quant_prefix_by_shape(sd, weight_shape, logical_shape):
 def bind_comfy_quant_metadata_for_prefix(module, sd, prefix, compute_dtype, device=torch.device("cpu")):
     """Attach native quant metadata for one module if the state_dict has it."""
     matched_prefix = find_comfy_quant_prefix(sd, prefix)
-    if matched_prefix is None:
-        return False
-
     weight = getattr(module, "weight", None)
     metadata_device = device
     if isinstance(weight, torch.Tensor) and weight.device.type != "meta":
         metadata_device = weight.device
-    metadata = get_comfy_quant_metadata(sd, matched_prefix, metadata_device, compute_dtype)
+
+    if matched_prefix is not None:
+        metadata = get_comfy_quant_metadata(sd, matched_prefix, metadata_device, compute_dtype)
+    else:
+        matched_prefix = find_nvfp4_scale_prefix(sd, prefix)
+        if matched_prefix is None:
+            return False
+        logical_shape = None
+        if isinstance(weight, torch.Tensor) and weight.dtype == torch.uint8:
+            logical_shape = _logical_weight_shape("nvfp4", weight)
+        metadata = _get_nvfp4_metadata_from_prefix(sd, matched_prefix, metadata_device, compute_dtype, logical_shape)
+        if metadata is None:
+            return False
+
     bind_comfy_quant_metadata(module, metadata)
 
     logical_shape = tuple(metadata["logical_shape"])
@@ -299,9 +366,21 @@ def bind_comfy_quant_metadata_for_lora(module, sd, prefix, compute_dtype, device
     if not isinstance(weight, torch.Tensor):
         return False
     matched_prefix = find_comfy_quant_prefix_by_shape(sd, tuple(weight.shape), lora_shape)
+    if matched_prefix is not None:
+        return bind_comfy_quant_metadata_for_prefix(module, sd, matched_prefix, compute_dtype, device)
+
+    matched_prefix = find_nvfp4_scale_prefix_by_shape(sd, tuple(weight.shape), lora_shape)
     if matched_prefix is None:
         return False
-    return bind_comfy_quant_metadata_for_prefix(module, sd, matched_prefix, compute_dtype, device)
+    metadata_device = weight.device if weight.device.type != "meta" else device
+    metadata = _get_nvfp4_metadata_from_prefix(sd, matched_prefix, metadata_device, compute_dtype, lora_shape)
+    if metadata is None:
+        return False
+    bind_comfy_quant_metadata(module, metadata)
+    logical_shape = tuple(metadata["logical_shape"])
+    if len(logical_shape) == 2:
+        module.out_features, module.in_features = logical_shape
+    return True
 
 
 def rebind_comfy_quant_metadata(model, sd, compute_dtype, device=torch.device("cpu"), prefix=""):

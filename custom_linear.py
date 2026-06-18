@@ -132,7 +132,16 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
 
     return model
 
-def _force_direct_lora_if_needed(module):
+def _lora_diff_shape(diff):
+    if not isinstance(diff, (tuple, list)) or len(diff) <= 1:
+        return None
+    return (
+        diff[0].flatten(start_dim=1).shape[0],
+        diff[1].flatten(start_dim=1).shape[1],
+    )
+
+
+def _force_direct_lora_if_needed(module, state_dict=None, compute_dtype=None, device=torch.device("cpu"), prefix=None):
     if getattr(module, "_comfy_quant_format", None) is not None:
         module._apply_lora_impl = module._apply_lora_direct
         module._apply_single_lora_impl = module._apply_single_lora_direct
@@ -151,6 +160,19 @@ def _force_direct_lora_if_needed(module):
             lora_diff_1.flatten(start_dim=1).shape[1],
         )
         if len(weight.shape) == 2 and lora_shape[0] == weight.shape[0] and lora_shape[1] == weight.shape[1] * 2:
+            if state_dict is not None:
+                if bind_comfy_quant_metadata_for_lora(
+                    module,
+                    state_dict,
+                    prefix or "",
+                    compute_dtype if compute_dtype is not None else module.compute_dtype,
+                    device,
+                    lora_shape=lora_shape,
+                ):
+                    module._apply_lora_impl = module._apply_lora_direct
+                    module._apply_single_lora_impl = module._apply_single_lora_direct
+                    module._linear_forward_impl = module._linear_forward_direct
+                    return
             raise RuntimeError(
                 "Native quantized LoRA target is missing Comfy quant metadata: "
                 f"weight={tuple(weight.shape)}, lora={lora_shape}. Reload the model so "
@@ -192,11 +214,8 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
             if state_dict is not None:
                 lora_shape = None
                 for diff in lora_diffs:
-                    if isinstance(diff, tuple) and len(diff) > 1:
-                        lora_shape = (
-                            diff[0].flatten(start_dim=1).shape[0],
-                            diff[1].flatten(start_dim=1).shape[1],
-                        )
+                    lora_shape = _lora_diff_shape(diff)
+                    if lora_shape is not None:
                         break
                 bind_comfy_quant_metadata_for_lora(
                     module,
@@ -208,7 +227,7 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
                 )
             module.set_lora_diffs(lora_diffs, device=device)
             module.set_lora_strengths(lora_strengths, device=device)
-            _force_direct_lora_if_needed(module)
+            _force_direct_lora_if_needed(module, state_dict, compute_dtype, device, key)
             module._step.fill_(0)   # Initialize step for LoRA scheduling
 
 
