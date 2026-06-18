@@ -30,6 +30,12 @@ minimum:
   files, and add new prominent notices for downstream changes.
 - Avoid implying endorsement by kijai, wuwukasi/wuwukaka, or other contributors.
 
+If a workflow, demo, introduction video, or tutorial video is created using the
+nodes from this project, the published material must clearly state that the
+nodes come from ComfyUI-WanAnimatePlus and provide the project link:
+
+https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
+
 The wuwukasi/wuwukaka additions include, without limitation:
 
 - WanAnimatePlus-specific node registration, node renaming, and integration

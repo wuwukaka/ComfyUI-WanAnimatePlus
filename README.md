@@ -101,6 +101,12 @@ Restart ComfyUI after installation.
 4. Connect `prefix_frames` and/or `transition_video` inputs as needed
 5. Example workflows are available in the `example_workflows/` directory
 
+## Attribution for Videos
+
+If you publish workflow introduction videos, tutorial videos, or similar instructional content made with WanAnimatePlus nodes, you must clearly state that the nodes come from this project and provide the project link:
+
+https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
+
 ## Nodes
 
 WanAnimatePlus exposes a complete workflow chain to avoid cross-package object mixing with the original WanVideoWrapper nodes.

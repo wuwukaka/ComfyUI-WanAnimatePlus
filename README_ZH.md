@@ -101,6 +101,12 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 4. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
 5. 示例工作流见 `example_workflows/` 目录
 
+## 视频 / 教程署名要求
+
+如果你发布使用 WanAnimatePlus 节点制作的工作流介绍视频、教学视频或类似教程内容，必须明确说明节点来自本项目，并提供项目链接：
+
+https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
+
 ## 节点说明
 
 WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanVideoWrapper 节点跨包混用。
