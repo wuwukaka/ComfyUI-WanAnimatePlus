@@ -19,6 +19,7 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from comfy.cli_args import args, LatentPreviewMethod
 from ..nodes_model_loading import load_weights
+from ..comfy_quant_linear import is_comfy_quant_state_dict, rebind_comfy_quant_metadata
 from ..nodes_sampler import offload_transformer, init_blockswap
 from ..custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
 
@@ -185,7 +186,9 @@ class WanVideoDiffusionForcingSampler:
             log.info(f"Using {len(patcher.patches)} LoRA weight patches for WanVideo model")
             if not merge_loras and fp8_matmul:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
-            set_lora_params(transformer, patcher.patches)
+            if is_comfy_quant_state_dict(patcher.model["sd"]):
+                rebind_comfy_quant_metadata(transformer, patcher.model["sd"], dtype, device)
+            set_lora_params(transformer, patcher.patches, state_dict=patcher.model["sd"], compute_dtype=dtype)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
 
