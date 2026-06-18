@@ -229,7 +229,7 @@ class WanVideoSampler:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             if is_comfy_quant_state_dict(patcher.model["sd"]):
                 rebind_comfy_quant_metadata(transformer, patcher.model["sd"], dtype, device)
-            set_lora_params(transformer, patcher.patches)
+            set_lora_params(transformer, patcher.patches, state_dict=patcher.model["sd"], compute_dtype=dtype)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
 

@@ -13,6 +13,7 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from .comfy_quant_linear import (
     bind_comfy_quant_metadata,
+    bind_comfy_quant_metadata_for_prefix,
     dequantize_comfy_quant_weight,
     get_comfy_quant_metadata,
     get_state_dict_weight_shape,
@@ -155,7 +156,7 @@ def _force_direct_lora_if_needed(module):
                 "WanAnimatePlus can bind the native quant metadata before sampling."
             )
 
-def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu")):
+def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"), state_dict=None, compute_dtype=None):
     remove_lora_from_module(module)
     # Recursively set lora_diffs and lora_strengths for all CustomLinear layers
     for name, child in module.named_children():
@@ -165,7 +166,7 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
         else:
             device = torch.device("cpu")
         child_prefix = (f"{module_prefix}{name}.")
-        set_lora_params(child, patches, child_prefix, device)
+        set_lora_params(child, patches, child_prefix, device, state_dict, compute_dtype)
     if isinstance(module, CustomLinear):
         key = f"diffusion_model.{module_prefix}weight"
         patch = patches.get(key, [])
@@ -187,6 +188,14 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
                 else:
                     continue
             lora_strengths = [p[0] for p in patch]
+            if state_dict is not None:
+                bind_comfy_quant_metadata_for_prefix(
+                    module,
+                    state_dict,
+                    module_prefix,
+                    compute_dtype if compute_dtype is not None else module.compute_dtype,
+                    device,
+                )
             module.set_lora_diffs(lora_diffs, device=device)
             module.set_lora_strengths(lora_strengths, device=device)
             _force_direct_lora_if_needed(module)

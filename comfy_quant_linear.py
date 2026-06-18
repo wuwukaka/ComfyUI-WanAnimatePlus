@@ -215,6 +215,58 @@ def bind_comfy_quant_metadata(module, metadata):
         module.is_gguf = False
 
 
+def _normalize_metadata_prefix(prefix):
+    if prefix.endswith("weight"):
+        prefix = prefix[:-len("weight")]
+    if prefix and not prefix.endswith("."):
+        prefix += "."
+    return prefix
+
+
+def find_comfy_quant_prefix(sd, prefix):
+    """Find a state_dict prefix for native quant metadata across known wrappers."""
+    if sd is None:
+        return None
+    prefix = _normalize_metadata_prefix(prefix)
+    candidates = []
+
+    def add(candidate):
+        candidate = _normalize_metadata_prefix(candidate)
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    add(prefix)
+    for wrapper in ("diffusion_model.", "model.diffusion_model.", "model."):
+        if prefix.startswith(wrapper):
+            add(prefix[len(wrapper):])
+        else:
+            add(wrapper + prefix)
+
+    for candidate in candidates:
+        if candidate + "comfy_quant" in sd:
+            return candidate
+    return None
+
+
+def bind_comfy_quant_metadata_for_prefix(module, sd, prefix, compute_dtype, device=torch.device("cpu")):
+    """Attach native quant metadata for one module if the state_dict has it."""
+    matched_prefix = find_comfy_quant_prefix(sd, prefix)
+    if matched_prefix is None:
+        return False
+
+    weight = getattr(module, "weight", None)
+    metadata_device = device
+    if isinstance(weight, torch.Tensor) and weight.device.type != "meta":
+        metadata_device = weight.device
+    metadata = get_comfy_quant_metadata(sd, matched_prefix, metadata_device, compute_dtype)
+    bind_comfy_quant_metadata(module, metadata)
+
+    logical_shape = tuple(metadata["logical_shape"])
+    if len(logical_shape) == 2:
+        module.out_features, module.in_features = logical_shape
+    return True
+
+
 def rebind_comfy_quant_metadata(model, sd, compute_dtype, device=torch.device("cpu"), prefix=""):
     """Reattach native quant metadata to existing Linear/CustomLinear modules."""
     if sd is None:
@@ -229,20 +281,10 @@ def rebind_comfy_quant_metadata(model, sd, compute_dtype, device=torch.device("c
 
         if not isinstance(module, nn.Linear):
             continue
-        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+        if "loras" in child_prefix:
             continue
-
-        weight = getattr(module, "weight", None)
-        metadata_device = device
-        if isinstance(weight, torch.Tensor) and weight.device.type != "meta":
-            metadata_device = weight.device
-        metadata = get_comfy_quant_metadata(sd, child_prefix, metadata_device, compute_dtype)
-        bind_comfy_quant_metadata(module, metadata)
-
-        logical_shape = tuple(metadata["logical_shape"])
-        if len(logical_shape) == 2:
-            module.out_features, module.in_features = logical_shape
-        rebound += 1
+        if bind_comfy_quant_metadata_for_prefix(module, sd, child_prefix, compute_dtype, device):
+            rebound += 1
 
     return rebound
 
