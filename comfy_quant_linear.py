@@ -98,6 +98,28 @@ def _logical_weight_shape(fmt, packed_weight):
     return out_features, in_features
 
 
+def _first_existing_prefixed_tensor(sd, prefix, suffixes):
+    for suffix in suffixes:
+        key = prefix + suffix
+        value = sd.get(key)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _get_nvfp4_scale_tensors(sd, prefix):
+    if sd is None:
+        return None, None
+    tensor_scale = _first_existing_prefixed_tensor(sd, prefix, ("weight_scale_2", "scale_weight_2"))
+    block_scale = _first_existing_prefixed_tensor(sd, prefix, ("weight_scale", "scale_weight"))
+    return tensor_scale, block_scale
+
+
+def _has_nvfp4_scale_tensors(sd, prefix):
+    tensor_scale, block_scale = _get_nvfp4_scale_tensors(sd, prefix)
+    return tensor_scale is not None and block_scale is not None
+
+
 def get_state_dict_weight_shape(sd, weight_key):
     """Return the logical Linear weight shape for regular or Comfy quant weights."""
     if sd is None:
@@ -130,8 +152,11 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     out_features, in_features = get_state_dict_weight_shape(sd, prefix + "weight")
 
     if fmt == "nvfp4":
-        tensor_scale = sd[prefix + "weight_scale_2"].to(device=device)
-        block_scale = sd[prefix + "weight_scale"].to(device=device).view(dtype=torch.float8_e4m3fn)
+        tensor_scale, block_scale = _get_nvfp4_scale_tensors(sd, prefix)
+        if tensor_scale is None or block_scale is None:
+            raise RuntimeError(f"NVFP4 native quant metadata is missing scale tensors for {prefix}")
+        tensor_scale = tensor_scale.to(device=device)
+        block_scale = block_scale.to(device=device).view(dtype=torch.float8_e4m3fn)
         params = layout.Params(
             scale=tensor_scale,
             block_scale=block_scale,
@@ -172,8 +197,11 @@ def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
     weight_shape = tuple(get_state_dict_weight_shape(sd, prefix + "weight"))
 
     if fmt == "nvfp4":
-        tensor_scale = sd[prefix + "weight_scale_2"].to(device=device)
-        block_scale = sd[prefix + "weight_scale"].to(device=device).view(dtype=torch.float8_e4m3fn)
+        tensor_scale, block_scale = _get_nvfp4_scale_tensors(sd, prefix)
+        if tensor_scale is None or block_scale is None:
+            raise RuntimeError(f"NVFP4 native quant metadata is missing scale tensors for {prefix}")
+        tensor_scale = tensor_scale.to(device=device)
+        block_scale = block_scale.to(device=device).view(dtype=torch.float8_e4m3fn)
     else:
         tensor_scale = sd[prefix + "weight_scale"].to(device=device)
         if fmt == "mxfp8" and hasattr(torch, "float8_e8m0fnu"):
@@ -253,7 +281,8 @@ def _metadata_prefix_candidates(prefix):
 
 
 def _get_nvfp4_metadata_from_prefix(sd, prefix, device, compute_dtype, logical_shape=None):
-    if prefix + "weight_scale" not in sd or prefix + "weight_scale_2" not in sd:
+    tensor_scale, block_scale = _get_nvfp4_scale_tensors(sd, prefix)
+    if tensor_scale is None or block_scale is None:
         return None
     _ensure_comfy_quant_backend()
     if "nvfp4" not in QUANT_ALGOS:
@@ -270,8 +299,8 @@ def _get_nvfp4_metadata_from_prefix(sd, prefix, device, compute_dtype, logical_s
         "layout": QUANT_ALGOS["nvfp4"]["comfy_tensor_layout"],
         "logical_shape": tuple(logical_shape),
         "backend": _COMFY_QUANT_BACKEND,
-        "weight_scale": sd[prefix + "weight_scale_2"].to(device=device),
-        "block_scale": sd[prefix + "weight_scale"].to(device=device).view(dtype=torch.float8_e4m3fn),
+        "weight_scale": tensor_scale.to(device=device),
+        "block_scale": block_scale.to(device=device).view(dtype=torch.float8_e4m3fn),
     }
 
 
@@ -280,7 +309,7 @@ def find_nvfp4_scale_prefix(sd, prefix):
     if sd is None:
         return None
     for candidate in _metadata_prefix_candidates(prefix):
-        if candidate + "weight_scale" in sd and candidate + "weight_scale_2" in sd:
+        if _has_nvfp4_scale_tensors(sd, candidate):
             return candidate
     return None
 
@@ -295,7 +324,7 @@ def find_nvfp4_scale_prefix_by_shape(sd, weight_shape, logical_shape):
         if not weight_key.endswith(".weight") or not isinstance(weight, torch.Tensor):
             continue
         prefix = weight_key[:-len("weight")]
-        if prefix + "weight_scale" not in sd or prefix + "weight_scale_2" not in sd:
+        if not _has_nvfp4_scale_tensors(sd, prefix):
             continue
         if tuple(weight.shape) != weight_shape:
             continue

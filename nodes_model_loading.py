@@ -49,6 +49,19 @@ except Exception:
 attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
                     "sageattn_ultravico", "comfy"]
 
+def add_weight_scale_aliases(sd):
+    aliased_sd = dict(sd)
+    for key, value in sd.items():
+        if key.endswith(".weight_scale"):
+            aliased_sd.setdefault(key[:-len(".weight_scale")] + ".scale_weight", value)
+        elif key.endswith(".weight_scale_2"):
+            aliased_sd.setdefault(key[:-len(".weight_scale_2")] + ".scale_weight_2", value)
+        elif key.endswith(".scale_weight"):
+            aliased_sd.setdefault(key[:-len(".scale_weight")] + ".weight_scale", value)
+        elif key.endswith(".scale_weight_2"):
+            aliased_sd.setdefault(key[:-len(".scale_weight_2")] + ".weight_scale_2", value)
+    return aliased_sd
+
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
@@ -1621,7 +1634,7 @@ class WanVideoModelLoader:
             del extra_sd
 
         if not is_comfy_quant_state_dict(sd):
-            sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
+            sd = add_weight_scale_aliases(sd)
 
         # FlashVSR
         if "LQ_proj_in.norm1.gamma" in sd:
