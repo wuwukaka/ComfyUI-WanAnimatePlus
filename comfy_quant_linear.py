@@ -30,20 +30,61 @@ import torch.nn as nn
 
 log = logging.getLogger(__name__)
 
+_COMFY_QUANT_IMPORT_ERRORS = []
+
 try:
     from comfy.quant_ops import QUANT_ALGOS, get_layout_class, QuantizedTensor
-    _COMFY_QUANT_AVAILABLE = True
+    _COMFY_QUANT_BACKEND = "comfy.quant_ops"
 except Exception as e:
-    _COMFY_QUANT_AVAILABLE = False
-    QuantizedTensor = None
-    logging.getLogger(__name__).warning(f"comfy.quant_ops unavailable, native NVFP4/FP8 support off: {e}")
+    _COMFY_QUANT_IMPORT_ERRORS.append(f"comfy.quant_ops: {e}")
+    try:
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import get_layout_class, QuantizedTensor
+
+        QUANT_ALGOS = {
+            "float8_e4m3fn": {
+                "storage_t": torch.float8_e4m3fn,
+                "comfy_tensor_layout": "TensorCoreFP8Layout",
+            },
+            "float8_e5m2": {
+                "storage_t": torch.float8_e5m2,
+                "comfy_tensor_layout": "TensorCoreFP8Layout",
+            },
+            "nvfp4": {
+                "storage_t": torch.uint8,
+                "comfy_tensor_layout": "TensorCoreNVFP4Layout",
+            },
+            "mxfp8": {
+                "storage_t": torch.float8_e4m3fn,
+                "comfy_tensor_layout": "TensorCoreMXFP8Layout",
+            },
+        }
+        _COMFY_QUANT_BACKEND = "comfy_kitchen.tensor"
+    except Exception as kitchen_e:
+        _COMFY_QUANT_IMPORT_ERRORS.append(f"comfy_kitchen.tensor: {kitchen_e}")
+        QUANT_ALGOS = {}
+        QuantizedTensor = None
+        get_layout_class = None
+        ck = None
+        _COMFY_QUANT_BACKEND = None
 
 
 def is_comfy_quant_state_dict(sd) -> bool:
     """Return True when a state dict uses ComfyUI native quant metadata."""
-    if not _COMFY_QUANT_AVAILABLE or sd is None:
+    if sd is None:
         return False
     return any(k.endswith(".comfy_quant") for k in sd)
+
+
+def _ensure_comfy_quant_backend():
+    if _COMFY_QUANT_BACKEND is not None:
+        return
+    details = "; ".join(_COMFY_QUANT_IMPORT_ERRORS) or "no backend import attempted"
+    raise RuntimeError(
+        "ComfyUI-native quantized checkpoint detected, but no native quant backend "
+        f"is available ({details}). Update ComfyUI/comfy_kitchen or use a non-native "
+        "quantized checkpoint."
+    )
 
 
 def _decode_comfy_quant(t: torch.Tensor) -> dict:
@@ -77,7 +118,10 @@ def get_state_dict_weight_shape(sd, weight_key):
 
 
 def _build_quantized_tensor(sd, prefix, device, compute_dtype):
+    _ensure_comfy_quant_backend()
     fmt = _decode_comfy_quant(sd[prefix + "comfy_quant"])["format"]
+    if fmt not in QUANT_ALGOS:
+        raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     qcfg = QUANT_ALGOS[fmt]
     layout_name = qcfg["comfy_tensor_layout"]
     layout = get_layout_class(layout_name)
@@ -94,6 +138,17 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
             orig_dtype=compute_dtype,
             orig_shape=(out_features, in_features),
         )
+    elif fmt == "mxfp8":
+        scale = sd[prefix + "weight_scale"].to(device=device)
+        if hasattr(torch, "float8_e8m0fnu"):
+            scale = scale.view(dtype=torch.float8_e8m0fnu)
+        params = layout.Params(
+            scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=(out_features, in_features),
+        )
+        tensor_scale = scale
+        block_scale = None
     else:
         scale = sd[prefix + "weight_scale"].to(device=device)
         params = layout.Params(
@@ -101,14 +156,63 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
             orig_dtype=compute_dtype,
             orig_shape=(out_features, in_features),
         )
+        tensor_scale = scale
+        block_scale = None
 
-    return QuantizedTensor(weight, layout_name, params), fmt
+    return QuantizedTensor(weight, layout_name, params), fmt, layout_name, tensor_scale, block_scale
+
+
+def _slice_logical_shape(weight, logical_shape):
+    if logical_shape is None or len(weight.shape) < 2:
+        return weight
+    slices = tuple(slice(0, s) for s in logical_shape)
+    if tuple(weight.shape[:2]) != tuple(logical_shape):
+        weight = weight[slices]
+    return weight
+
+
+def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_scale=None, logical_shape=None):
+    """Dequantize one Comfy native quantized weight tensor for LoRA/fallback paths."""
+    if hasattr(weight, "_qdata") and hasattr(weight, "_params") and hasattr(weight, "dequantize"):
+        weight = weight.dequantize()
+    else:
+        try:
+            import comfy_kitchen as ck_local
+        except Exception as e:
+            raise RuntimeError(
+                "ComfyUI-native quant weight lost QuantizedTensor dispatch, and "
+                f"comfy_kitchen is unavailable for fallback dequantization: {e}"
+            ) from e
+
+        if fmt == "nvfp4":
+            if scale is None or block_scale is None:
+                raise RuntimeError("NVFP4 fallback dequantization requires weight_scale and weight_scale_2")
+            weight = ck_local.dequantize_nvfp4(
+                weight.to(device=scale.device, dtype=torch.uint8),
+                scale,
+                block_scale.view(dtype=torch.float8_e4m3fn),
+                compute_dtype,
+            )
+        elif fmt == "mxfp8":
+            if scale is None:
+                raise RuntimeError("MXFP8 fallback dequantization requires weight_scale")
+            weight = ck_local.dequantize_mxfp8(weight.to(device=scale.device), scale, compute_dtype)
+        elif fmt in ("float8_e4m3fn", "float8_e5m2"):
+            if scale is None:
+                raise RuntimeError(f"{fmt} fallback dequantization requires weight_scale")
+            weight = ck_local.dequantize_per_tensor_fp8(weight.to(device=scale.device), scale, compute_dtype)
+        else:
+            raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
+
+    return _slice_logical_shape(weight, logical_shape)
 
 
 def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefix=""):
     """Assign QuantizedTensor weights to matching Linear/CustomLinear modules."""
-    if not _COMFY_QUANT_AVAILABLE or sd is None:
+    if sd is None:
         return model
+    if prefix == "":
+        _ensure_comfy_quant_backend()
 
     for name, module in model.named_children():
         child_prefix = (prefix + name + ".").replace("_orig_mod.", "")
@@ -120,7 +224,7 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
             continue
 
         weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
-        qt, fmt = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
+        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
         module.weight = nn.Parameter(qt, requires_grad=False)
         module.out_features, module.in_features = weight_shape
 
@@ -129,6 +233,18 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
             module.bias = nn.Parameter(sd[bias_key].to(device=load_device, dtype=compute_dtype), requires_grad=False)
 
         module._comfy_quant_format = fmt
+        module._comfy_quant_layout = layout_name
+        module._comfy_quant_logical_shape = tuple(weight_shape)
+        module._comfy_quant_backend = _COMFY_QUANT_BACKEND
+        if hasattr(module, "_comfy_quant_weight_scale"):
+            module._buffers["_comfy_quant_weight_scale"] = tensor_scale
+        else:
+            module.register_buffer("_comfy_quant_weight_scale", tensor_scale, persistent=False)
+        if block_scale is not None:
+            if hasattr(module, "_comfy_quant_block_scale"):
+                module._buffers["_comfy_quant_block_scale"] = block_scale
+            else:
+                module.register_buffer("_comfy_quant_block_scale", block_scale, persistent=False)
         if hasattr(module, "_linear_forward_direct"):
             module._linear_forward_impl = module._linear_forward_direct
             module._apply_lora_impl = module._apply_lora_direct

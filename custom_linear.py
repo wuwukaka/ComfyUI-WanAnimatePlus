@@ -11,7 +11,7 @@
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from .comfy_quant_linear import get_state_dict_weight_shape
+from .comfy_quant_linear import dequantize_comfy_quant_weight, get_state_dict_weight_shape
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
 if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
@@ -274,7 +274,10 @@ class CustomLinear(nn.Linear):
     def _prepare_weight(self, input):
         """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
         if getattr(self, "_comfy_quant_format", None) is not None:
-            return self.weight
+            weight = self.weight
+            if weight.device != input.device:
+                weight = weight.to(device=input.device)
+            return weight
         if self.is_gguf:
             weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
         else:
@@ -284,14 +287,65 @@ class CustomLinear(nn.Linear):
     def _has_lora_diffs(self):
         return hasattr(self, "lora_diff_0_0")
 
+    def _dequantize_comfy_quant_weight(self, weight, input):
+        fmt = getattr(self, "_comfy_quant_format", None)
+        if fmt is None:
+            return weight
+        scale = getattr(self, "_comfy_quant_weight_scale", None)
+        block_scale = getattr(self, "_comfy_quant_block_scale", None)
+        if scale is not None and scale.device != weight.device:
+            scale = scale.to(device=weight.device)
+        if block_scale is not None and block_scale.device != weight.device:
+            block_scale = block_scale.to(device=weight.device)
+        logical_shape = getattr(self, "_comfy_quant_logical_shape", None)
+        dtype = self.compute_dtype if self.compute_dtype is not None else input.dtype
+        weight = dequantize_comfy_quant_weight(
+            weight,
+            fmt,
+            dtype,
+            scale=scale,
+            block_scale=block_scale,
+            logical_shape=logical_shape,
+        )
+        return weight.to(input)
+
+    def _is_comfy_quant_tensor(self, weight):
+        return hasattr(weight, "_qdata") and hasattr(weight, "_params")
+
+    def _is_raw_comfy_quant_weight(self, weight):
+        fmt = getattr(self, "_comfy_quant_format", None)
+        if fmt is None or self._is_comfy_quant_tensor(weight):
+            return False
+        if fmt == "nvfp4":
+            return weight.dtype == torch.uint8
+        if fmt in ("float8_e4m3fn", "mxfp8"):
+            return weight.dtype == torch.float8_e4m3fn
+        if fmt == "float8_e5m2":
+            return weight.dtype == torch.float8_e5m2
+        return False
+
     def _dequantize_comfy_quant_for_lora(self, weight, input):
         if getattr(self, "_comfy_quant_format", None) is None or not self._has_lora_diffs():
             return weight
-        if weight.device != input.device:
-            weight = weight.to(device=input.device)
-        if not hasattr(weight, "dequantize"):
+        if self._is_comfy_quant_tensor(weight) or self._is_raw_comfy_quant_weight(weight):
+            return self._dequantize_comfy_quant_weight(weight, input)
+        return weight
+
+    def _ensure_comfy_quant_forward_weight(self, weight, input):
+        if getattr(self, "_comfy_quant_format", None) is None:
             return weight
-        return weight.dequantize().to(input)
+        if self._is_raw_comfy_quant_weight(weight):
+            weight = self._dequantize_comfy_quant_weight(weight, input)
+        elif weight.shape[-1] == input.shape[-1]:
+            return weight
+        else:
+            weight = self._dequantize_comfy_quant_weight(weight, input)
+        if weight.shape[-1] != input.shape[-1]:
+            raise RuntimeError(
+                "ComfyUI-native quantized Linear weight has incompatible shape after "
+                f"fallback dequantization: weight={tuple(weight.shape)}, input={tuple(input.shape)}"
+            )
+        return weight
 
     def _align_scale_weight_to_weight(self, weight):
         sw = self.scale_weight.to(weight.device, weight.dtype)
@@ -310,6 +364,7 @@ class CustomLinear(nn.Linear):
 
     def forward(self, input):
         weight = self._prepare_weight(input)
+        weight = self._ensure_comfy_quant_forward_weight(weight, input)
         weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
         if self.bias is not None:
