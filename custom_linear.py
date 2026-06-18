@@ -251,7 +251,7 @@ class CustomLinear(nn.Linear):
 
     def _get_weight_with_lora(self, weight):
         """Apply LoRA using custom ops to avoid graph breaks"""
-        if not hasattr(self, "lora_diff_0_0"):
+        if not self._has_lora_diffs():
             return weight
 
         for idx, lora_diff_names in enumerate(self.lora_diffs):
@@ -281,6 +281,18 @@ class CustomLinear(nn.Linear):
             weight = self.weight.to(input)
         return weight
 
+    def _has_lora_diffs(self):
+        return hasattr(self, "lora_diff_0_0")
+
+    def _dequantize_comfy_quant_for_lora(self, weight, input):
+        if getattr(self, "_comfy_quant_format", None) is None or not self._has_lora_diffs():
+            return weight
+        if weight.device != input.device:
+            weight = weight.to(device=input.device)
+        if not hasattr(weight, "dequantize"):
+            return weight
+        return weight.dequantize().to(input)
+
     def _align_scale_weight_to_weight(self, weight):
         sw = self.scale_weight.to(weight.device, weight.dtype)
 
@@ -298,6 +310,7 @@ class CustomLinear(nn.Linear):
 
     def forward(self, input):
         weight = self._prepare_weight(input)
+        weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
         if self.bias is not None:
             bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
