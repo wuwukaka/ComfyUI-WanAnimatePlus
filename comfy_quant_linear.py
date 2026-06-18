@@ -162,6 +162,59 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     return QuantizedTensor(weight, layout_name, params), fmt, layout_name, tensor_scale, block_scale
 
 
+def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
+    """Return native quant metadata needed by CustomLinear fallback paths."""
+    _ensure_comfy_quant_backend()
+    fmt = _decode_comfy_quant(sd[prefix + "comfy_quant"])["format"]
+    if fmt not in QUANT_ALGOS:
+        raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
+    layout_name = QUANT_ALGOS[fmt]["comfy_tensor_layout"]
+    weight_shape = tuple(get_state_dict_weight_shape(sd, prefix + "weight"))
+
+    if fmt == "nvfp4":
+        tensor_scale = sd[prefix + "weight_scale_2"].to(device=device)
+        block_scale = sd[prefix + "weight_scale"].to(device=device).view(dtype=torch.float8_e4m3fn)
+    else:
+        tensor_scale = sd[prefix + "weight_scale"].to(device=device)
+        if fmt == "mxfp8" and hasattr(torch, "float8_e8m0fnu"):
+            tensor_scale = tensor_scale.view(dtype=torch.float8_e8m0fnu)
+        block_scale = None
+
+    return {
+        "format": fmt,
+        "layout": layout_name,
+        "logical_shape": weight_shape,
+        "backend": _COMFY_QUANT_BACKEND,
+        "weight_scale": tensor_scale,
+        "block_scale": block_scale,
+    }
+
+
+def bind_comfy_quant_metadata(module, metadata):
+    """Attach native quant metadata to a Linear/CustomLinear module."""
+    module._comfy_quant_format = metadata["format"]
+    module._comfy_quant_layout = metadata["layout"]
+    module._comfy_quant_logical_shape = tuple(metadata["logical_shape"])
+    module._comfy_quant_backend = metadata["backend"]
+    tensor_scale = metadata["weight_scale"]
+    block_scale = metadata["block_scale"]
+    if hasattr(module, "_comfy_quant_weight_scale"):
+        module._buffers["_comfy_quant_weight_scale"] = tensor_scale
+    else:
+        module.register_buffer("_comfy_quant_weight_scale", tensor_scale, persistent=False)
+    if block_scale is not None:
+        if hasattr(module, "_comfy_quant_block_scale"):
+            module._buffers["_comfy_quant_block_scale"] = block_scale
+        else:
+            module.register_buffer("_comfy_quant_block_scale", block_scale, persistent=False)
+    if hasattr(module, "_linear_forward_direct"):
+        module._linear_forward_impl = module._linear_forward_direct
+        module._apply_lora_impl = module._apply_lora_direct
+        module._apply_single_lora_impl = module._apply_single_lora_direct
+        module.scale_weight = None
+        module.is_gguf = False
+
+
 def _slice_logical_shape(weight, logical_shape):
     if logical_shape is None or len(weight.shape) < 2:
         return weight
@@ -232,24 +285,13 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
         if module.bias is not None and bias_key in sd:
             module.bias = nn.Parameter(sd[bias_key].to(device=load_device, dtype=compute_dtype), requires_grad=False)
 
-        module._comfy_quant_format = fmt
-        module._comfy_quant_layout = layout_name
-        module._comfy_quant_logical_shape = tuple(weight_shape)
-        module._comfy_quant_backend = _COMFY_QUANT_BACKEND
-        if hasattr(module, "_comfy_quant_weight_scale"):
-            module._buffers["_comfy_quant_weight_scale"] = tensor_scale
-        else:
-            module.register_buffer("_comfy_quant_weight_scale", tensor_scale, persistent=False)
-        if block_scale is not None:
-            if hasattr(module, "_comfy_quant_block_scale"):
-                module._buffers["_comfy_quant_block_scale"] = block_scale
-            else:
-                module.register_buffer("_comfy_quant_block_scale", block_scale, persistent=False)
-        if hasattr(module, "_linear_forward_direct"):
-            module._linear_forward_impl = module._linear_forward_direct
-            module._apply_lora_impl = module._apply_lora_direct
-            module._apply_single_lora_impl = module._apply_single_lora_direct
-            module.scale_weight = None
-            module.is_gguf = False
+        bind_comfy_quant_metadata(module, {
+            "format": fmt,
+            "layout": layout_name,
+            "logical_shape": tuple(weight_shape),
+            "backend": _COMFY_QUANT_BACKEND,
+            "weight_scale": tensor_scale,
+            "block_scale": block_scale,
+        })
 
     return model

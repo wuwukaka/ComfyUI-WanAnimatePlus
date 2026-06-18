@@ -11,7 +11,12 @@
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from .comfy_quant_linear import dequantize_comfy_quant_weight, get_state_dict_weight_shape
+from .comfy_quant_linear import (
+    bind_comfy_quant_metadata,
+    dequantize_comfy_quant_weight,
+    get_comfy_quant_metadata,
+    get_state_dict_weight_shape,
+)
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
 if not hasattr(torch.ops.wananimateplus, 'apply_lora'):
@@ -118,8 +123,37 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
                 )
             model._modules[name].source_cls = type(module)
             model._modules[name].requires_grad_(False)
+            quant_key = module_prefix + "comfy_quant"
+            if quant_key in state_dict:
+                metadata = get_comfy_quant_metadata(state_dict, module_prefix, torch.device("cpu"), compute_dtype)
+                bind_comfy_quant_metadata(model._modules[name], metadata)
 
     return model
+
+def _force_direct_lora_if_needed(module):
+    if getattr(module, "_comfy_quant_format", None) is not None:
+        module._apply_lora_impl = module._apply_lora_direct
+        module._apply_single_lora_impl = module._apply_single_lora_direct
+        module._linear_forward_impl = module._linear_forward_direct
+        return
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.dtype != torch.uint8:
+        return
+    for lora_diff_names in getattr(module, "lora_diffs", []):
+        if not isinstance(lora_diff_names, tuple):
+            continue
+        lora_diff_0 = getattr(module, lora_diff_names[0])
+        lora_diff_1 = getattr(module, lora_diff_names[1])
+        lora_shape = (
+            lora_diff_0.flatten(start_dim=1).shape[0],
+            lora_diff_1.flatten(start_dim=1).shape[1],
+        )
+        if len(weight.shape) == 2 and lora_shape[0] == weight.shape[0] and lora_shape[1] == weight.shape[1] * 2:
+            raise RuntimeError(
+                "Native quantized LoRA target is missing Comfy quant metadata: "
+                f"weight={tuple(weight.shape)}, lora={lora_shape}. Reload the model so "
+                "WanAnimatePlus can bind the native quant metadata before sampling."
+            )
 
 def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu")):
     remove_lora_from_module(module)
@@ -155,6 +189,7 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
             lora_strengths = [p[0] for p in patch]
             module.set_lora_diffs(lora_diffs, device=device)
             module.set_lora_strengths(lora_strengths, device=device)
+            _force_direct_lora_if_needed(module)
             module._step.fill_(0)   # Initialize step for LoRA scheduling
 
 
