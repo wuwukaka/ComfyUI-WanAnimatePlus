@@ -20,7 +20,12 @@ from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
-from .comfy_quant_linear import get_state_dict_weight_shape, is_comfy_quant_state_dict, replace_with_comfy_quant_linear
+from .comfy_quant_linear import (
+    get_state_dict_weight_shape,
+    has_comfy_quant_meta_weights,
+    is_comfy_quant_state_dict,
+    replace_with_comfy_quant_linear,
+)
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
@@ -888,10 +893,15 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             transformer.gguf_patched = True
     else:
         log.info("Loading and assigning model weights to device...")
-        if comfy_quant and not getattr(transformer, "comfy_quant_patched", False):
-            log.info("ComfyUI-native quantized checkpoint detected; reconstructing QuantizedTensor weights...")
-            replace_with_comfy_quant_linear(transformer, sd, base_dtype, transformer_load_device)
-            transformer.comfy_quant_patched = True
+        if comfy_quant:
+            needs_quant_rebuild = not getattr(transformer, "comfy_quant_patched", False)
+            if not needs_quant_rebuild:
+                needs_quant_rebuild = has_comfy_quant_meta_weights(transformer, sd)
+
+            if needs_quant_rebuild:
+                log.info("ComfyUI-native quantized checkpoint detected; reconstructing QuantizedTensor weights...")
+                replace_with_comfy_quant_linear(transformer, sd, base_dtype, transformer_load_device)
+                transformer.comfy_quant_patched = True
     named_params = transformer.named_parameters()
 
     for name, param in tqdm(named_params,

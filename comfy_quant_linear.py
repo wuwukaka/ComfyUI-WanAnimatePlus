@@ -479,6 +479,56 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
     return _slice_logical_shape(weight, logical_shape)
 
 
+def _contains_meta_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.device.type == "meta"
+    if isinstance(value, (tuple, list)):
+        return any(_contains_meta_tensor(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_meta_tensor(item) for item in value.values())
+    if hasattr(value, "_asdict"):
+        return any(_contains_meta_tensor(item) for item in value._asdict().values())
+    if hasattr(value, "__dict__"):
+        return any(_contains_meta_tensor(item) for item in vars(value).values())
+    return False
+
+
+def has_comfy_quant_meta_weights(model, sd, prefix=""):
+    """Return True if native quant Linear weights need rebuilding from state_dict."""
+    if sd is None:
+        return False
+    if prefix == "":
+        _ensure_comfy_quant_backend()
+
+    for name, module in model.named_children():
+        child_prefix = (prefix + name + ".").replace("_orig_mod.", "")
+        if has_comfy_quant_meta_weights(module, sd, child_prefix):
+            return True
+
+        if not isinstance(module, nn.Linear):
+            continue
+        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+            continue
+
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return True
+        if weight.device.type == "meta":
+            return True
+        if not (hasattr(weight, "_qdata") and hasattr(weight, "_params")):
+            return True
+        if _contains_meta_tensor(getattr(weight, "_qdata", None)):
+            return True
+        if _contains_meta_tensor(getattr(weight, "_params", None)):
+            return True
+        if _contains_meta_tensor(getattr(module, "_comfy_quant_weight_scale", None)):
+            return True
+        if _contains_meta_tensor(getattr(module, "_comfy_quant_block_scale", None)):
+            return True
+
+    return False
+
+
 def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefix=""):
     """Assign QuantizedTensor weights to matching Linear/CustomLinear modules."""
     if sd is None:
