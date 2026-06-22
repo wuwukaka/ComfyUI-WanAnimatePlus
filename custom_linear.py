@@ -15,6 +15,7 @@ from .comfy_quant_linear import (
     bind_comfy_quant_metadata,
     bind_comfy_quant_metadata_for_lora,
     bind_comfy_quant_metadata_for_prefix,
+    contains_meta_tensor,
     dequantize_comfy_quant_weight,
     get_comfy_quant_metadata,
     get_state_dict_weight_shape,
@@ -348,6 +349,17 @@ class CustomLinear(nn.Linear):
         """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
         if getattr(self, "_comfy_quant_format", None) is not None:
             weight = self.weight
+            if weight.device.type == "meta" or contains_meta_tensor(getattr(weight, "_qdata", None)):
+                raise RuntimeError(
+                    "ComfyUI-native quantized Linear weight is still a meta tensor. "
+                    "WanAnimatePlus should materialize native quant weights from the model state_dict "
+                    "before forward; reload the model or report the layer path that skipped load_weights."
+                )
+            if contains_meta_tensor(getattr(weight, "_params", None)):
+                raise RuntimeError(
+                    "ComfyUI-native quantized Linear weight has meta quantization params. "
+                    "WanAnimatePlus should materialize native quant weights before forward."
+                )
             if weight.device != input.device:
                 weight = weight.to(device=input.device)
             return weight

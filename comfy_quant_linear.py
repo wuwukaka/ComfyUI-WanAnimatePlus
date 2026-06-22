@@ -479,6 +479,115 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
     return _slice_logical_shape(weight, logical_shape)
 
 
+def contains_meta_tensor(value, _seen=None):
+    if _seen is None:
+        _seen = set()
+    value_id = id(value)
+    if value_id in _seen:
+        return False
+    _seen.add(value_id)
+
+    if isinstance(value, torch.Tensor):
+        return value.device.type == "meta"
+    if isinstance(value, (tuple, list)):
+        return any(contains_meta_tensor(item, _seen) for item in value)
+    if isinstance(value, dict):
+        return any(contains_meta_tensor(item, _seen) for item in value.values())
+    if hasattr(value, "_asdict"):
+        return any(contains_meta_tensor(item, _seen) for item in value._asdict().values())
+    if hasattr(value, "__dict__") and not isinstance(value, nn.Module):
+        return any(contains_meta_tensor(item, _seen) for item in vars(value).values())
+    return False
+
+
+def is_comfy_quant_weight_materialized(module):
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        return False
+    if weight.device.type == "meta":
+        return False
+    if not (hasattr(weight, "_qdata") and hasattr(weight, "_params")):
+        return False
+    if contains_meta_tensor(getattr(weight, "_qdata", None)):
+        return False
+    if contains_meta_tensor(getattr(weight, "_params", None)):
+        return False
+    if contains_meta_tensor(getattr(module, "_comfy_quant_weight_scale", None)):
+        return False
+    if contains_meta_tensor(getattr(module, "_comfy_quant_block_scale", None)):
+        return False
+
+    bias = getattr(module, "bias", None)
+    if isinstance(bias, torch.Tensor) and bias.device.type == "meta":
+        return False
+    return True
+
+
+def has_comfy_quant_meta_weights(model, sd, prefix=""):
+    return ensure_comfy_quant_linear_materialized(
+        model,
+        sd,
+        compute_dtype=None,
+        load_device=None,
+        prefix=prefix,
+        dry_run=True,
+    ) > 0
+
+
+def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device, prefix="", dry_run=False):
+    """Rebuild missing/meta native quant Linear weights from a state_dict."""
+    if sd is None:
+        return 0
+    if prefix == "":
+        _ensure_comfy_quant_backend()
+
+    rebuilt = 0
+    for name, module in model.named_children():
+        child_prefix = (prefix + name + ".").replace("_orig_mod.", "")
+        rebuilt += ensure_comfy_quant_linear_materialized(
+            module,
+            sd,
+            compute_dtype,
+            load_device,
+            child_prefix,
+            dry_run=dry_run,
+        )
+        if dry_run and rebuilt:
+            return rebuilt
+
+        if not isinstance(module, nn.Linear):
+            continue
+        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+            continue
+        if is_comfy_quant_weight_materialized(module):
+            continue
+        if dry_run:
+            return rebuilt + 1
+        if compute_dtype is None or load_device is None:
+            raise RuntimeError("ComfyUI-native quantized Linear materialization requires dtype and device")
+
+        weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
+        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
+        module.weight = nn.Parameter(qt, requires_grad=False)
+        module.out_features, module.in_features = weight_shape
+
+        bias_key = child_prefix + "bias"
+        if module.bias is not None and bias_key in sd:
+            module.bias = nn.Parameter(sd[bias_key].to(device=load_device, dtype=compute_dtype), requires_grad=False)
+
+        bind_comfy_quant_metadata(module, {
+            "format": fmt,
+            "layout": layout_name,
+            "logical_shape": tuple(weight_shape),
+            "backend": _COMFY_QUANT_BACKEND,
+            "weight_scale": tensor_scale,
+            "block_scale": block_scale,
+        })
+        rebuilt += 1
+
+    return rebuilt
+
+
 def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefix=""):
     """Assign QuantizedTensor weights to matching Linear/CustomLinear modules."""
     if sd is None:

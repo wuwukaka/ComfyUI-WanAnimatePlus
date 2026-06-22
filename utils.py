@@ -72,7 +72,11 @@ def offload_transformer(transformer, remove_lora=True):
             for subname in subnames[:-1]:
                 module = getattr(module, subname)
             attr_name = subnames[-1]
-            if param.data.is_floating_point():
+            if hasattr(param.data, "_qdata") and hasattr(param.data, "_params"):
+                meta_param = torch.nn.Parameter(torch.empty(param.shape, dtype=param.dtype, device='meta'), requires_grad=False)
+                setattr(module, attr_name, meta_param)
+                transformer.comfy_quant_patched = False
+            elif param.data.is_floating_point():
                 meta_param = torch.nn.Parameter(torch.empty_like(param.data, device='meta'), requires_grad=False)
                 setattr(module, attr_name, meta_param)
             elif isinstance(param.data, GGUFParameter):
