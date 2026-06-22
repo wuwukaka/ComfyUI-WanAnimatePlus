@@ -2551,6 +2551,7 @@ class WanModel(torch.nn.Module):
                 last_step=last_step,
                 clip_fea=clip_fea,
                 control_lora_enabled=control_lora_enabled,
+                uni3c_data=uni3c_data,
                 transformer_options=transformer_options,
                 ntk_alphas=ntk_alphas,
                 context_window_start=kwargs.get("context_window_start", 0),
@@ -3665,7 +3666,7 @@ class WanModel(torch.nn.Module):
 
     def _forward_scail2_fast(self, x, t, context, seq_len, freqs, scail_input,
                              is_uncond=False, current_step_percentage=0.0, current_step=0, last_step=False,
-                             clip_fea=None, control_lora_enabled=False, transformer_options={},
+                             clip_fea=None, control_lora_enabled=False, uni3c_data=None, transformer_options={},
                              ntk_alphas=None, context_window_start=0):
         """Streamlined SCAIL-2 forward for the local CFG sampler path."""
         device = self.main_device
@@ -3697,6 +3698,21 @@ class WanModel(torch.nn.Module):
                 F += scail_ref_frames
                 prefix_frames += scail_ref_frames
                 suffix_frames += scail_ref_frames
+
+        render_latent = None
+        if uni3c_data is not None:
+            render_latent = uni3c_data["render_latent"].to(device=device, dtype=self.base_dtype)
+            hidden_states = x[0].unsqueeze(0).clone().float()
+            if hidden_states.shape[1] == 16:
+                hidden_states = torch.cat([hidden_states, torch.zeros_like(hidden_states[:, :4])], dim=1)
+            if hidden_states.shape[2] != render_latent.shape[2]:
+                render_latent = nn.functional.interpolate(
+                    render_latent,
+                    size=(hidden_states.shape[2], hidden_states.shape[3], hidden_states.shape[4]),
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            render_latent = torch.cat([hidden_states[:, :20], render_latent], dim=1)
 
         patch_embedding = self.expanded_patch_embedding if control_lora_enabled else self.original_patch_embedding
         _module_to_if_needed(patch_embedding, device)
@@ -3839,6 +3855,23 @@ class WanModel(torch.nn.Module):
             transformer_options=transformer_options,
         )
 
+        uni3c_controlnet_states = None
+        if uni3c_data is not None:
+            if (uni3c_data["start"] <= current_step_percentage <= uni3c_data["end"]) or (
+                    uni3c_data["end"] > 0 and current_step == 0 and current_step_percentage >= uni3c_data["start"]):
+                if uni3c_data["offload"] or self.uni3c_controlnet.device != self.main_device:
+                    self.uni3c_controlnet.to(self.main_device)
+                with torch.autocast(device_type=mm.get_autocast_device(device), dtype=self.base_dtype, enabled=self.uni3c_controlnet.quantized):
+                    uni3c_controlnet_states = self.uni3c_controlnet(
+                        render_latent=render_latent.to(self.main_device, self.uni3c_controlnet.dtype),
+                        render_mask=uni3c_data["render_mask"],
+                        camera_embedding=uni3c_data["camera_embedding"],
+                        temb=e.to(self.main_device),
+                        out_device=self.offload_device if uni3c_data["offload"] else device,
+                    )
+                if uni3c_data["offload"]:
+                    self.uni3c_controlnet.to(self.offload_device)
+
         if torch.cuda.is_available():
             cuda_stream = None
             events = [torch.cuda.Event() for _ in self.blocks]
@@ -3899,6 +3932,9 @@ class WanModel(torch.nn.Module):
                 to_cpu_transfer_end = time.perf_counter()
                 to_cpu_transfer_time = to_cpu_transfer_end - to_cpu_transfer_start
                 log.info(f"Block {b}: transfer_time={transfer_time:.4f}s, compute_time={compute_time:.4f}s, to_cpu_transfer_time={to_cpu_transfer_time:.4f}s")
+
+            if uni3c_controlnet_states is not None and b < len(uni3c_controlnet_states):
+                x[:, :self.original_seq_len] += uni3c_controlnet_states[b].to(x) * uni3c_data["controlnet_weight"]
 
         x = x[:, :self.original_seq_len]
         x = self.head(x, e_raw.to(device), temp_length=F)

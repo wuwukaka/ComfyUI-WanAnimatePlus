@@ -1880,13 +1880,11 @@ class WanVideoSampler:
                     and humo_audio is None
                     and wananim_pose_latents is None
                     and wananim_face_pixels is None
-                    and uni3c_data is None
                     and latent_model_input_ovi is None
                     and flashvsr_LQ_latent is None
                     and base_params['fun_ref'] is None
                     and base_params['fun_camera'] is None
                     and base_params['audio_proj'] is None
-                    and base_params['uni3c_data'] is None
                     and base_params['controlnet'] is None
                     and base_params['add_cond'] is None
                     and not base_params['nag_params']
@@ -1981,8 +1979,6 @@ class WanVideoSampler:
                             fallback_reasons.append("HuMo input connected")
                         if wananim_pose_latents is not None or wananim_face_pixels is not None:
                             fallback_reasons.append("WanAnimate input connected")
-                        if uni3c_data is not None:
-                            fallback_reasons.append("Uni3C input connected")
                         if latent_model_input_ovi is not None:
                             fallback_reasons.append("OVI latent input connected")
                         if flashvsr_LQ_latent is not None:
