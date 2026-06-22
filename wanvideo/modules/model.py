@@ -3861,12 +3861,17 @@ class WanModel(torch.nn.Module):
                     uni3c_data["end"] > 0 and current_step == 0 and current_step_percentage >= uni3c_data["start"]):
                 if uni3c_data["offload"] or self.uni3c_controlnet.device != self.main_device:
                     self.uni3c_controlnet.to(self.main_device)
+                if e_raw.dim() != 2:
+                    raise RuntimeError(
+                        "SCAIL-2 fast path Uni3C expects raw 2D time embedding for controlnet "
+                        f"temb, got shape {tuple(e_raw.shape)}"
+                    )
                 with torch.autocast(device_type=mm.get_autocast_device(device), dtype=self.base_dtype, enabled=self.uni3c_controlnet.quantized):
                     uni3c_controlnet_states = self.uni3c_controlnet(
                         render_latent=render_latent.to(self.main_device, self.uni3c_controlnet.dtype),
                         render_mask=uni3c_data["render_mask"],
                         camera_embedding=uni3c_data["camera_embedding"],
-                        temb=e.to(self.main_device),
+                        temb=e_raw.to(self.main_device),
                         out_device=self.offload_device if uni3c_data["offload"] else device,
                     )
                 if uni3c_data["offload"]:
