@@ -1026,9 +1026,9 @@ class WanVideoSampler:
         uni3c_data = uni3c_data_input = None
         if uni3c_embeds is not None:
             transformer.uni3c_controlnet = uni3c_embeds["controlnet"]
-            render_latent = uni3c_embeds["render_latent"].to(device)
+            render_latent = uni3c_embeds["render_latent"].to(offload_device if scail2_looping else device)
             uni3c_data = uni3c_embeds.copy()
-            if render_latent.shape != noise.shape:
+            if not scail2_looping and render_latent.shape != noise.shape:
                 # If temporal is shorter (prefix/transition expansion), pad with first frame at beginning
                 if has_prefix and render_latent.shape[2] < noise.shape[1]:
                     pad_len = noise.shape[1] - render_latent.shape[2]
@@ -3091,6 +3091,48 @@ class WanVideoSampler:
                     chunk_data["ref_mask_latents"] = torch.cat([ref_mask_prefix, target_window], dim=1)
                 return chunk_data
 
+            def _build_chunk_uni3c_data(chunk_start, first_chunk):
+                if uni3c_data is None:
+                    return None
+                render_latent = uni3c_data.get("render_latent", None)
+                if render_latent is None:
+                    return None
+
+                handoff_latents = 0 if first_chunk else min(prev_latent_count, chunk_latent_frames)
+                valid_len = chunk_latent_frames - handoff_latents
+                valid_start = chunk_start // 4 + handoff_latents
+
+                if valid_len > 0:
+                    valid = _slice_with_last_pad(render_latent, valid_start, valid_len, 2)
+                else:
+                    valid = _slice_with_last_pad(render_latent, chunk_start // 4, 1, 2).narrow(2, 0, 0)
+
+                if handoff_latents > 0:
+                    if valid.shape[2] > 0:
+                        pad_source = valid[:, :, :1]
+                    else:
+                        pad_source = _slice_with_last_pad(render_latent, chunk_start // 4, 1, 2)
+                    handoff = pad_source.repeat(1, 1, handoff_latents, 1, 1)
+                    local_render_latent = torch.cat([handoff, valid], dim=2)
+                else:
+                    local_render_latent = valid
+
+                if local_render_latent.shape[2] != chunk_latent_frames:
+                    local_render_latent = _slice_with_last_pad(local_render_latent, 0, chunk_latent_frames, 2)
+                if local_render_latent.shape[2:] != (chunk_latent_frames, lat_h, lat_w):
+                    local_render_latent = torch.nn.functional.interpolate(
+                        local_render_latent,
+                        size=(chunk_latent_frames, lat_h, lat_w),
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+
+                chunk_data = {"render_latent": local_render_latent.to(device)}
+                for k, v in uni3c_data.items():
+                    if k != "render_latent":
+                        chunk_data[k] = v
+                return chunk_data
+
             def _encode_anchor_from_video(video_cthw):
                 anchor = video_cthw[:, -prev_frame_count:].to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
                 anchor = _color_match_anchor_frames(anchor)
@@ -3168,6 +3210,7 @@ class WanVideoSampler:
 
                     local_scail_data = _build_chunk_scail_data(scail_data, chunk_start, local_freeze_mask, chunk_idx == 0)
                     local_scail_data = dict_to_device(local_scail_data, device, dtype)
+                    local_uni3c_data = _build_chunk_uni3c_data(chunk_start, chunk_idx == 0)
                     local_scail_freeze_mask = None
                     if local_freeze_mask is not None:
                         local_scail_freeze_mask = local_freeze_mask.unsqueeze(0).repeat(1, latent.shape[0], 1, 1, 1).to(device)
@@ -3191,6 +3234,7 @@ class WanVideoSampler:
                                 clip_fea=clip_fea,
                                 cache_state=self.cache_state,
                                 scail_data_override=local_scail_data,
+                                uni3c_data=local_uni3c_data,
                             )
                             if use_tsr:
                                 noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
@@ -3232,7 +3276,7 @@ class WanVideoSampler:
                     prev_anchor_latents = _encode_anchor_from_video(chunk_video)
                     generated_chunks.append(chunk_video if chunk_idx == 0 else chunk_video[:, prev_frame_count:])
 
-                    del latent, chunk_video, local_scail_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
+                    del latent, chunk_video, local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
                     mm.soft_empty_cache()
                     gc.collect()
 
