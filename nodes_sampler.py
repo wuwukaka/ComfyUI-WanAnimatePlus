@@ -2983,18 +2983,20 @@ class WanVideoSampler:
                     latents[:, zero_idx] = 0
                 return latents
 
-            def _color_match_anchor_frames(anchor_cthw):
+            def _color_match_video_frames(video_cthw):
                 if scail2_transition_colormatch == "disabled" or scail2_transition_match_ref is None:
-                    return anchor_cthw
+                    return video_cthw
+                if video_cthw is None or video_cthw.shape[1] == 0:
+                    return video_cthw
                 from color_matcher import ColorMatcher
                 cm = ColorMatcher()
                 ref_np = scail2_transition_match_ref[:1, :, :, :3].detach().cpu().float().numpy()[0]
-                anchor_bhwc = anchor_cthw.permute(1, 2, 3, 0).float().clamp(-1.0, 1.0).add(1.0).div(2.0)
+                video_bhwc = video_cthw.float().clamp(-1.0, 1.0).permute(1, 2, 3, 0).add(1.0).div(2.0)
                 matched = []
-                for frame in anchor_bhwc:
+                for frame in video_bhwc:
                     out = cm.transfer(src=frame.detach().cpu().numpy(), ref=ref_np, method=scail2_transition_colormatch)
-                    matched.append(torch.from_numpy(out).to(device=device, dtype=torch.float32))
-                return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2)
+                    matched.append(torch.from_numpy(out).to(device=video_cthw.device, dtype=torch.float32))
+                return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
 
             def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
                 local_latents = torch.zeros(16, chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
@@ -3131,7 +3133,6 @@ class WanVideoSampler:
 
             def _encode_anchor_from_video(video_cthw):
                 anchor = video_cthw[:, -prev_frame_count:].to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
-                anchor = _color_match_anchor_frames(anchor)
                 vae.to(device)
                 return vae.encode([anchor.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
 
@@ -3269,10 +3270,20 @@ class WanVideoSampler:
                     if chunk_video.shape[1] > chunk_frames:
                         chunk_video = chunk_video[:, :chunk_frames]
 
-                    prev_anchor_latents = _encode_anchor_from_video(chunk_video)
-                    generated_chunks.append(chunk_video if chunk_idx == 0 else chunk_video[:, prev_frame_count:])
+                    output_chunk = chunk_video if chunk_idx == 0 else chunk_video[:, prev_frame_count:].contiguous()
+                    del chunk_video
 
-                    del latent, chunk_video, local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
+                    if output_chunk.shape[1] > 0:
+                        matched_output_chunk = _color_match_video_frames(output_chunk)
+                        del output_chunk
+
+                        prev_anchor_latents = _encode_anchor_from_video(matched_output_chunk)
+                        generated_chunks.append(matched_output_chunk)
+                        del matched_output_chunk
+                    else:
+                        del output_chunk
+
+                    del latent, local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
                     mm.soft_empty_cache()
                     gc.collect()
 
