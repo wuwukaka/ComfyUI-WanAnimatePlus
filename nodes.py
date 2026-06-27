@@ -1729,10 +1729,6 @@ class WanAnimatePlusSCAIL2Embeds:
             "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
             "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL pose stream"}),
             "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL reference stream"}),
-            "pose_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage for pose conditioning"}),
-            "pose_end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percentage for pose conditioning"}),
-            "ref_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage for reference conditioning"}),
-            "ref_end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percentage for reference conditioning"}),
             "replacement_mode": ("BOOLEAN", {"default": False, "tooltip": "False = animation mode (pose mask black bg, reference mask white bg). True = replacement mode (pose mask white bg, reference mask black bg)."}),
             },
             "optional": {
@@ -1963,8 +1959,7 @@ class WanAnimatePlusSCAIL2Embeds:
         )
 
     def process(self, vae, width, height, num_frames, frame_window_size, force_offload, pose_strength, ref_strength,
-                pose_start_percent, pose_end_percent, ref_start_percent, ref_end_percent, replacement_mode,
-                clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
+                replacement_mode, clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
                 transition_video=None, pose_image_mask=None, reference_image_mask=None, tiled_vae=False,
                 transition_colormatch='disabled', prefix_alpha_crop=False, preserve_main_ref_background=True,
                 single_frame_prefix_encoding=True, loop_colormatch_reference='previous_matched_frame', **kwargs):
@@ -2136,10 +2131,10 @@ class WanAnimatePlusSCAIL2Embeds:
 
         scail_embeds = {
             "pose_strength": pose_strength,
-            "pose_start_percent": pose_start_percent,
-            "pose_end_percent": pose_end_percent,
-            "ref_start_percent": ref_start_percent,
-            "ref_end_percent": ref_end_percent,
+            "pose_start_percent": 0.0,
+            "pose_end_percent": 1.0,
+            "ref_start_percent": 0.0,
+            "ref_end_percent": 1.0,
             "ref_mask_flag": not replacement_mode,
         }
 
