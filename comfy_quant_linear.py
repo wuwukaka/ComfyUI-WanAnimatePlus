@@ -539,6 +539,50 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
     return _slice_logical_shape(weight, logical_shape)
 
 
+def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_scale=None, logical_shape=None, layout_name=None):
+    """Wrap a raw native quantized storage tensor as a QuantizedTensor."""
+    _ensure_comfy_quant_backend()
+    if fmt not in QUANT_ALGOS:
+        raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
+    if logical_shape is None:
+        logical_shape = _logical_weight_shape(fmt, weight)
+    layout_name = layout_name or QUANT_ALGOS[fmt]["comfy_tensor_layout"]
+    layout = get_layout_class(layout_name)
+
+    qcfg = QUANT_ALGOS[fmt]
+    weight = weight.to(dtype=qcfg["storage_t"])
+
+    if fmt == "nvfp4":
+        if scale is None or block_scale is None:
+            raise RuntimeError("NVFP4 QuantizedTensor rebuild requires weight_scale and weight_scale_2")
+        params = layout.Params(
+            scale=scale,
+            block_scale=block_scale.view(dtype=torch.float8_e4m3fn),
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(logical_shape),
+        )
+    elif fmt == "mxfp8":
+        if scale is None:
+            raise RuntimeError("MXFP8 QuantizedTensor rebuild requires weight_scale")
+        if hasattr(torch, "float8_e8m0fnu"):
+            scale = scale.view(dtype=torch.float8_e8m0fnu)
+        params = layout.Params(
+            scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(logical_shape),
+        )
+    else:
+        if scale is None:
+            raise RuntimeError(f"{fmt} QuantizedTensor rebuild requires weight_scale")
+        params = layout.Params(
+            scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(logical_shape),
+        )
+
+    return QuantizedTensor(weight, layout_name, params)
+
+
 def contains_meta_tensor(value, _seen=None):
     if _seen is None:
         _seen = set()

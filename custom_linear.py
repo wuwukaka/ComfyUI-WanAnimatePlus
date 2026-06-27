@@ -17,6 +17,7 @@ from .comfy_quant_linear import (
     contains_meta_tensor,
     dequantize_comfy_quant_weight,
     get_state_dict_weight_shape,
+    quantize_raw_comfy_quant_weight,
 )
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
@@ -347,6 +348,64 @@ class CustomLinear(nn.Linear):
                 weight = self._apply_single_lora_impl(weight, lora_diff, lora_strength)
         return weight
 
+    def _lora_tuple_matrices(self, lora_diff_0, lora_diff_1):
+        return lora_diff_0.flatten(start_dim=1), lora_diff_1.flatten(start_dim=1)
+
+    def _lora_alpha(self, lora_diff_1, lora_diff_2):
+        alpha = float(lora_diff_2) if lora_diff_2 is not None else 0.0
+        return alpha / lora_diff_1.shape[0] if alpha != 0.0 else 1.0
+
+    def _can_apply_lora_to_output(self, weight, input):
+        if not self._has_lora_diffs():
+            return False
+        if getattr(self, "_comfy_quant_format", None) is None:
+            return False
+        if not self._is_comfy_quant_tensor(weight):
+            return False
+        if self.scale_weight is not None:
+            return False
+        if weight.ndim != 2 or weight.shape[-1] != input.shape[-1]:
+            return False
+
+        out_features, in_features = weight.shape
+        for lora_diff_names in self.lora_diffs:
+            if isinstance(lora_diff_names, tuple):
+                lora_diff_0 = getattr(self, lora_diff_names[0])
+                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_a, lora_b = self._lora_tuple_matrices(lora_diff_0, lora_diff_1)
+                if lora_a.ndim != 2 or lora_b.ndim != 2:
+                    return False
+                if lora_a.shape[0] != out_features or lora_b.shape[1] != in_features:
+                    return False
+                if lora_a.shape[1] != lora_b.shape[0]:
+                    return False
+            else:
+                lora_diff = getattr(self, lora_diff_names)
+                if tuple(lora_diff.shape) != tuple(weight.shape):
+                    return False
+        return True
+
+    def _apply_lora_to_output(self, input, out):
+        # Equivalent to F.linear(input, weight + A @ B), without materializing A @ B.
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            lora_strength = self._get_lora_strength(idx)
+
+            if isinstance(lora_diff_names, tuple):
+                lora_diff_0 = getattr(self, lora_diff_names[0])
+                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_diff_2 = getattr(self, lora_diff_names[2])
+                lora_a, lora_b = self._lora_tuple_matrices(lora_diff_0, lora_diff_1)
+                alpha = self._lora_alpha(lora_diff_1, lora_diff_2)
+                delta = torch.nn.functional.linear(
+                    torch.nn.functional.linear(input, lora_b),
+                    lora_a,
+                )
+                out = out + delta * (lora_strength * alpha)
+            else:
+                lora_diff = getattr(self, lora_diff_names)
+                out = out + torch.nn.functional.linear(input, lora_diff) * lora_strength
+        return out
+
     def _prepare_weight(self, input):
         """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
         if getattr(self, "_comfy_quant_format", None) is not None:
@@ -410,6 +469,27 @@ class CustomLinear(nn.Linear):
         )
         return weight.to(input)
 
+    def _quantize_raw_comfy_quant_weight(self, weight, input):
+        fmt = getattr(self, "_comfy_quant_format", None)
+        if fmt is None:
+            return weight
+        scale = getattr(self, "_comfy_quant_weight_scale", None)
+        block_scale = getattr(self, "_comfy_quant_block_scale", None)
+        if scale is not None and scale.device != weight.device:
+            scale = scale.to(device=weight.device)
+        if block_scale is not None and block_scale.device != weight.device:
+            block_scale = block_scale.to(device=weight.device)
+        dtype = self.compute_dtype if self.compute_dtype is not None else input.dtype
+        return quantize_raw_comfy_quant_weight(
+            weight,
+            fmt,
+            dtype,
+            scale=scale,
+            block_scale=block_scale,
+            logical_shape=getattr(self, "_comfy_quant_logical_shape", None),
+            layout_name=getattr(self, "_comfy_quant_layout", None),
+        )
+
     def _is_comfy_quant_tensor(self, weight):
         return hasattr(weight, "_qdata") and hasattr(weight, "_params")
 
@@ -436,7 +516,7 @@ class CustomLinear(nn.Linear):
         if getattr(self, "_comfy_quant_format", None) is None:
             return weight
         if self._is_raw_comfy_quant_weight(weight):
-            weight = self._dequantize_comfy_quant_weight(weight, input)
+            weight = self._quantize_raw_comfy_quant_weight(weight, input)
         elif weight.shape[-1] == input.shape[-1]:
             return weight
         else:
@@ -484,12 +564,20 @@ class CustomLinear(nn.Linear):
     def forward(self, input):
         weight = self._prepare_weight(input)
         weight = self._ensure_comfy_quant_forward_weight(weight, input)
-        weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
         if self.bias is not None:
             bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
         else:
             bias = None
+
+        if self._can_apply_lora_to_output(weight, input):
+            self._check_linear_weight_shape(weight, input)
+            out = self._linear_forward_impl(input, weight, bias)
+            out = self._apply_lora_to_output(input, out)
+            del weight, input, bias
+            return out
+
+        weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
