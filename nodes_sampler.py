@@ -2998,16 +2998,16 @@ class WanVideoSampler:
                 if ref.numel() == 0:
                     return None
                 if ref.ndim == 4:
-                    if ref.shape[-1] >= 3:
+                    if ref.shape[-1] in (3, 4):
                         ref = ref[0, :, :, :3]
-                    elif ref.shape[1] >= 3:
+                    elif ref.shape[1] in (3, 4):
                         ref = ref[0, :3].permute(1, 2, 0)
                     else:
                         return None
                 elif ref.ndim == 3:
-                    if ref.shape[-1] >= 3:
+                    if ref.shape[-1] in (3, 4):
                         ref = ref[:, :, :3]
-                    elif ref.shape[0] >= 3:
+                    elif ref.shape[0] in (3, 4):
                         ref = ref[:3].permute(1, 2, 0)
                     else:
                         return None
@@ -3017,7 +3017,7 @@ class WanVideoSampler:
                     ref = ref.clamp(-1.0, 1.0).add(1.0).div(2.0)
                 else:
                     ref = ref.clamp(0.0, 1.0)
-                return ref.numpy()
+                return ref.contiguous().numpy()
 
             def _color_match_video_frames(video_cthw, ref_frame):
                 if video_cthw is None or video_cthw.shape[1] == 0:
@@ -3029,8 +3029,31 @@ class WanVideoSampler:
                 cm = ColorMatcher()
                 video_bhwc = video_cthw.float().clamp(-1.0, 1.0).permute(1, 2, 3, 0).add(1.0).div(2.0)
                 matched = []
+                warned_error = False
+                warned_shape = False
+                warned_nonfinite = False
                 for frame in video_bhwc:
-                    out = cm.transfer(src=frame.detach().cpu().numpy(), ref=ref_np, method=scail2_transition_colormatch)
+                    frame_np = frame.detach().cpu().contiguous().numpy()
+                    try:
+                        out = np.asarray(cm.transfer(src=frame_np, ref=ref_np, method=scail2_transition_colormatch), dtype=np.float32)
+                    except Exception as e:
+                        if not warned_error:
+                            log.warning(f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} failed; keeping original frame: {e}")
+                            warned_error = True
+                        out = frame_np
+                    if out.shape != frame_np.shape:
+                        if not warned_shape:
+                            log.warning(
+                                f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} returned shape {out.shape}, "
+                                f"expected {frame_np.shape}; keeping original frame"
+                            )
+                            warned_shape = True
+                        out = frame_np
+                    elif not np.isfinite(out).all():
+                        if not warned_nonfinite:
+                            log.warning(f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} returned non-finite values; keeping finite pixels only")
+                            warned_nonfinite = True
+                        out = np.where(np.isfinite(out), out, frame_np)
                     matched.append(torch.from_numpy(out).to(device=video_cthw.device, dtype=torch.float32))
                 return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
 
@@ -3334,7 +3357,16 @@ class WanVideoSampler:
                         if match_ref is not None:
                             output_chunk = _color_match_video_frames(output_chunk, match_ref)
 
-                        last_matched_ref_frame = output_chunk[:, -1].detach().cpu()
+                        last_matched_ref_frame = (
+                            output_chunk[:, -1:]
+                            .float()
+                            .clamp(-1.0, 1.0)
+                            .permute(1, 2, 3, 0)
+                            .add(1.0)
+                            .div(2.0)
+                            .detach()
+                            .cpu()
+                        )
                         prev_anchor_latents = _encode_anchor_from_video(output_chunk)
                         generated_chunks.append(output_chunk)
                         del output_chunk
