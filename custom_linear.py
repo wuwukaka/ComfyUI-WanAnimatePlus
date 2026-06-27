@@ -386,7 +386,14 @@ class CustomLinear(nn.Linear):
         return True
 
     def _apply_lora_to_output(self, input, out):
-        # Equivalent to F.linear(input, weight + A @ B), without materializing A @ B.
+        # Equivalent to F.linear(input, weight + A @ B), without materializing A @ B
+        # or a full-size output delta.
+        if out.device != input.device:
+            raise RuntimeError(
+                f"LoRA output path device mismatch: input={input.device}, out={out.device}"
+            )
+        if not out.is_contiguous():
+            out = out.contiguous()
         for idx, lora_diff_names in enumerate(self.lora_diffs):
             lora_strength = self._get_lora_strength(idx)
 
@@ -395,14 +402,20 @@ class CustomLinear(nn.Linear):
                 lora_diff_1 = getattr(self, lora_diff_names[1])
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 lora_a, lora_b = self._lora_tuple_matrices(lora_diff_0, lora_diff_1)
+                lora_a = lora_a.to(device=input.device, dtype=out.dtype)
+                lora_b = lora_b.to(device=input.device, dtype=input.dtype)
+                lora_strength = lora_strength.to(device=input.device, dtype=out.dtype)
                 alpha = self._lora_alpha(lora_diff_1, lora_diff_2)
-                delta = torch.nn.functional.linear(
-                    torch.nn.functional.linear(input, lora_b),
-                    lora_a,
-                )
-                out = out + delta * (lora_strength * alpha)
+                rank_states = torch.nn.functional.linear(input, lora_b)
+                if rank_states.dtype != out.dtype:
+                    rank_states = rank_states.to(dtype=out.dtype)
+                rank_states = rank_states.reshape(-1, rank_states.shape[-1])
+                out_2d = out.view(-1, out.shape[-1])
+                out_2d.addmm_(rank_states, (lora_a * (lora_strength * alpha)).t())
             else:
                 lora_diff = getattr(self, lora_diff_names)
+                lora_diff = lora_diff.to(device=input.device, dtype=input.dtype)
+                lora_strength = lora_strength.to(device=input.device, dtype=input.dtype)
                 out = out + torch.nn.functional.linear(input, lora_diff) * lora_strength
         return out
 
