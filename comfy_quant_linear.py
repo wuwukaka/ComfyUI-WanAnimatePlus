@@ -151,6 +151,37 @@ def is_scale_only_nvfp4_weight_key(sd, weight_key):
     return prefix is not None and is_scale_only_nvfp4_prefix(sd, prefix)
 
 
+def get_comfy_quant_format(sd, prefix):
+    if sd is None:
+        return None
+    quant_key = prefix + "comfy_quant"
+    if quant_key in sd:
+        return _decode_comfy_quant(sd[quant_key]).get("format")
+    if is_scale_only_nvfp4_prefix(sd, prefix):
+        return "nvfp4"
+    return None
+
+
+def is_nvfp4_comfy_quant_prefix(sd, prefix):
+    return get_comfy_quant_format(sd, prefix) == "nvfp4"
+
+
+def is_nvfp4_comfy_quant_weight_key(sd, weight_key):
+    prefix = _prefix_from_weight_key(weight_key)
+    return prefix is not None and is_nvfp4_comfy_quant_prefix(sd, prefix)
+
+
+def is_nvfp4_comfy_quant_state_dict(sd):
+    if sd is None:
+        return False
+    for key in sd:
+        if key.endswith(".comfy_quant"):
+            prefix = key[:-len("comfy_quant")]
+            if get_comfy_quant_format(sd, prefix) == "nvfp4":
+                return True
+    return any(is_scale_only_nvfp4_weight_key(sd, k) for k in sd)
+
+
 def is_native_quant_prefix(sd, prefix):
     if sd is None:
         return False
@@ -638,7 +669,7 @@ def has_comfy_quant_meta_weights(model, sd, prefix=""):
     ) > 0
 
 
-def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device, prefix="", dry_run=False):
+def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device, prefix="", dry_run=False, device_resolver=None):
     """Rebuild missing/meta native quant Linear weights from a state_dict."""
     if sd is None:
         return 0
@@ -655,6 +686,7 @@ def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device
             load_device,
             child_prefix,
             dry_run=dry_run,
+            device_resolver=device_resolver,
         )
         if dry_run and rebuilt:
             return rebuilt
@@ -663,21 +695,36 @@ def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device
             continue
         if "loras" in child_prefix or not is_native_quant_prefix(sd, child_prefix):
             continue
-        if is_comfy_quant_weight_materialized(module):
-            continue
         if dry_run:
+            if is_comfy_quant_weight_materialized(module):
+                continue
             return rebuilt + 1
-        if compute_dtype is None or load_device is None:
+
+        resolved_device = device_resolver(child_prefix) if device_resolver is not None else None
+        materialize_device = resolved_device if resolved_device is not None else load_device
+        if is_comfy_quant_weight_materialized(module):
+            if resolved_device is not None:
+                needs_move = getattr(module.weight, "device", None) != materialize_device
+                for attr in ("_comfy_quant_weight_scale", "_comfy_quant_block_scale"):
+                    tensor = getattr(module, attr, None)
+                    if isinstance(tensor, torch.Tensor) and tensor.device != materialize_device:
+                        needs_move = True
+                        break
+                if needs_move:
+                    module.to(materialize_device)
+            continue
+
+        if compute_dtype is None or materialize_device is None:
             raise RuntimeError("ComfyUI-native quantized Linear materialization requires dtype and device")
 
         weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
-        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
+        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, materialize_device, compute_dtype)
         module.weight = nn.Parameter(qt, requires_grad=False)
         module.out_features, module.in_features = weight_shape
 
         bias_key = child_prefix + "bias"
         if module.bias is not None and bias_key in sd:
-            module.bias = nn.Parameter(sd[bias_key].to(device=load_device, dtype=compute_dtype), requires_grad=False)
+            module.bias = nn.Parameter(sd[bias_key].to(device=materialize_device, dtype=compute_dtype), requires_grad=False)
 
         bind_comfy_quant_metadata(module, {
             "format": fmt,

@@ -24,6 +24,8 @@ from .comfy_quant_linear import (
     ensure_comfy_quant_linear_materialized,
     get_state_dict_weight_shape,
     is_comfy_quant_state_dict,
+    is_nvfp4_comfy_quant_prefix,
+    is_nvfp4_comfy_quant_state_dict,
     is_native_quant_weight_key,
 )
 
@@ -45,6 +47,40 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
+
+def _module_index_from_prefix(prefix, module_name):
+    marker = module_name + "."
+    if not prefix.startswith(marker):
+        return None
+    try:
+        return int(prefix[len(marker):].split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+def _resolve_block_swap_load_device(prefix, transformer, block_swap_args, default_device):
+    if block_swap_args is None:
+        return default_device
+
+    block_idx = _module_index_from_prefix(prefix, "blocks")
+    if block_idx is not None and "face" not in prefix and "controlnet_blocks." not in prefix:
+        blocks_to_swap = max(0, min(block_swap_args.get("blocks_to_swap", 0), len(transformer.blocks)))
+        swap_start_idx = len(transformer.blocks) - blocks_to_swap
+        return offload_device if block_idx >= swap_start_idx else device
+
+    vace_block_idx = _module_index_from_prefix(prefix, "vace_blocks")
+    if vace_block_idx is not None and hasattr(transformer, "vace_blocks"):
+        vace_blocks_to_swap = block_swap_args.get("vace_blocks_to_swap", 0)
+        if (
+            vace_blocks_to_swap == 0
+            and getattr(transformer, "vace_layers", None) is not None
+            and block_swap_args.get("blocks_to_swap", 0) != -1
+        ):
+            vace_blocks_to_swap = 1
+        vace_blocks_to_swap = max(0, min(vace_blocks_to_swap, len(transformer.vace_blocks)))
+        vace_swap_start_idx = len(transformer.vace_blocks) - vace_blocks_to_swap
+        return offload_device if vace_block_idx >= vace_swap_start_idx else device
+
+    return device
 
 try:
     from server import PromptServer
@@ -840,6 +876,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
     pbar = ProgressBar(param_count)
     block_idx = vace_block_idx = None
     comfy_quant = is_comfy_quant_state_dict(sd)
+    nvfp4_comfy_quant = is_nvfp4_comfy_quant_state_dict(sd)
 
     if gguf:
         log.info("Using GGUF to load and assign model weights to device...")
@@ -894,7 +931,21 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
     else:
         log.info("Loading and assigning model weights to device...")
         if comfy_quant:
-            rebuilt_quant = ensure_comfy_quant_linear_materialized(transformer, sd, base_dtype, transformer_load_device)
+            comfy_quant_device_resolver = None
+            if nvfp4_comfy_quant and block_swap_args is not None:
+                def comfy_quant_device_resolver(prefix):
+                    if is_nvfp4_comfy_quant_prefix(sd, prefix):
+                        return _resolve_block_swap_load_device(
+                            prefix, transformer, block_swap_args, transformer_load_device
+                        )
+                    return None
+            rebuilt_quant = ensure_comfy_quant_linear_materialized(
+                transformer,
+                sd,
+                base_dtype,
+                transformer_load_device,
+                device_resolver=comfy_quant_device_resolver,
+            )
             if rebuilt_quant:
                 log.info(f"ComfyUI-native quantized checkpoint detected; materialized {rebuilt_quant} QuantizedTensor weights.")
             transformer.comfy_quant_patched = True
@@ -904,17 +955,18 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             desc=f"Loading transformer parameters to {transformer_load_device}",
             total=param_count,
             leave=True):
-        block_idx = vace_block_idx = None
-        if name.startswith("vace_blocks."):
-            try:
-                vace_block_idx = int(name.split("vace_blocks.")[1].split(".")[0])
-            except Exception:
-                vace_block_idx = None
-        elif name.startswith("blocks.") and "face" not in name and "controlnet_blocks." not in name:
-            try:
-                block_idx = int(name.split("blocks.")[1].split(".")[0])
-            except Exception:
-                block_idx = None
+        if not nvfp4_comfy_quant:
+            block_idx = vace_block_idx = None
+            if name.startswith("vace_blocks."):
+                try:
+                    vace_block_idx = int(name.split("vace_blocks.")[1].split(".")[0])
+                except Exception:
+                    vace_block_idx = None
+            elif name.startswith("blocks.") and "face" not in name and "controlnet_blocks." not in name:
+                try:
+                    block_idx = int(name.split("blocks.")[1].split(".")[0])
+                except Exception:
+                    block_idx = None
 
         if "loras" in name or "uni3c" in name:
             continue
@@ -945,15 +997,18 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             if "modulation" in name or "norm" in name:
                 dtype_to_use = value.dtype if value.dtype == torch.float32 else base_dtype
 
-        load_device = transformer_load_device
-        if block_swap_args is not None:
-            load_device = device
-            if block_idx is not None:
-                if block_idx >= len(transformer.blocks) - block_swap_args.get("blocks_to_swap", 0):
-                    load_device = offload_device
-            elif vace_block_idx is not None:
-                if vace_block_idx >= len(transformer.vace_blocks) - block_swap_args.get("vace_blocks_to_swap", 0):
-                    load_device = offload_device
+        if nvfp4_comfy_quant:
+            load_device = _resolve_block_swap_load_device(name, transformer, block_swap_args, transformer_load_device)
+        else:
+            load_device = transformer_load_device
+            if block_swap_args is not None:
+                load_device = device
+                if block_idx is not None:
+                    if block_idx >= len(transformer.blocks) - block_swap_args.get("blocks_to_swap", 0):
+                        load_device = offload_device
+                elif vace_block_idx is not None:
+                    if vace_block_idx >= len(transformer.vace_blocks) - block_swap_args.get("vace_blocks_to_swap", 0):
+                        load_device = offload_device
         # Set tensor to device
         set_module_tensor_to_device(transformer, name, device=load_device, dtype=dtype_to_use, value=value)
         pbar.update(1)

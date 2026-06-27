@@ -456,6 +456,39 @@ class CustomLinear(nn.Linear):
                 out = out + torch.nn.functional.linear(input, lora_diff) * lora_strength
         return out
 
+    def _raise_comfy_quant_device_mismatch(self, input, mismatches):
+        layer = getattr(self, "_wan_layer_prefix", "<unknown>")
+        details = ", ".join(f"{name}={dev}" for name, dev in mismatches)
+        raise RuntimeError(
+            "ComfyUI-native quantized Linear device mismatch before forward. "
+            "Block swap must move the whole module to the input device before computation; "
+            f"layer={layer}, input_device={input.device}, {details}"
+        )
+
+    def _check_comfy_quant_forward_devices(self, weight, input):
+        if getattr(self, "_comfy_quant_format", None) != "nvfp4":
+            return
+
+        mismatches = []
+
+        def check_tensor(name, tensor):
+            if isinstance(tensor, torch.Tensor) and tensor.device != input.device:
+                mismatches.append((name, tensor.device))
+
+        check_tensor("weight", weight)
+        check_tensor("weight._qdata", getattr(weight, "_qdata", None))
+
+        params = getattr(weight, "_params", None)
+        if params is not None:
+            check_tensor("weight._params.scale", getattr(params, "scale", None))
+            check_tensor("weight._params.block_scale", getattr(params, "block_scale", None))
+
+        check_tensor("_comfy_quant_weight_scale", getattr(self, "_comfy_quant_weight_scale", None))
+        check_tensor("_comfy_quant_block_scale", getattr(self, "_comfy_quant_block_scale", None))
+
+        if mismatches:
+            self._raise_comfy_quant_device_mismatch(input, mismatches)
+
     def _prepare_weight(self, input):
         """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
         if getattr(self, "_comfy_quant_format", None) is not None:
@@ -471,8 +504,11 @@ class CustomLinear(nn.Linear):
                     "ComfyUI-native quantized Linear weight has meta quantization params. "
                     "WanAnimatePlus should materialize native quant weights before forward."
                 )
-            if weight.device != input.device:
+            if weight.device != input.device and getattr(self, "_comfy_quant_format", None) == "nvfp4":
+                self._raise_comfy_quant_device_mismatch(input, [("weight", weight.device)])
+            elif weight.device != input.device:
                 weight = weight.to(device=input.device)
+            self._check_comfy_quant_forward_devices(weight, input)
             return weight
         if self.is_gguf:
             weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
@@ -619,6 +655,7 @@ class CustomLinear(nn.Linear):
             bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
         else:
             bias = None
+        self._check_comfy_quant_forward_devices(weight, input)
 
         lora_output_reject_reason = self._native_quant_lora_output_reject_reason(weight, input)
         if lora_output_reject_reason is None:

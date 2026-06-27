@@ -98,6 +98,19 @@ def offload_transformer(transformer, remove_lora=True):
     gc.collect()
 
 
+def _model_uses_nvfp4_comfy_quant(model):
+    if not isinstance(model, dict):
+        return False
+    sd = model.get("sd")
+    if sd is None:
+        return False
+    try:
+        from .comfy_quant_linear import is_nvfp4_comfy_quant_state_dict
+        return is_nvfp4_comfy_quant_state_dict(sd)
+    except Exception:
+        return False
+
+
 def init_blockswap(transformer, block_swap_args, model):
     if not transformer.patched_linear:
         if block_swap_args is not None:
@@ -126,6 +139,20 @@ def init_blockswap(transformer, block_swap_args, model):
             transformer.head.modulation = torch.nn.Parameter(transformer.head.modulation.to(device))
         else:
             transformer.to(device)
+    elif block_swap_args is not None and _model_uses_nvfp4_comfy_quant(model):
+        if block_swap_args.get("offload_txt_emb", False) and hasattr(transformer, "text_embedding"):
+            transformer.text_embedding.to(offload_device, non_blocking=getattr(transformer, "use_non_blocking", False))
+        if block_swap_args.get("offload_img_emb", False) and hasattr(transformer, "img_emb"):
+            transformer.img_emb.to(offload_device, non_blocking=getattr(transformer, "use_non_blocking", False))
+
+        transformer.block_swap(
+            block_swap_args.get("blocks_to_swap", 0),
+            block_swap_args.get("offload_txt_emb", False),
+            block_swap_args.get("offload_img_emb", False),
+            vace_blocks_to_swap=block_swap_args.get("vace_blocks_to_swap", 0),
+            prefetch_blocks=block_swap_args.get("prefetch_blocks", 0),
+            block_swap_debug=block_swap_args.get("block_swap_debug", False),
+        )
 
 def check_device_same(first_device, second_device):
     if first_device.type != second_device.type:
