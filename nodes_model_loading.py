@@ -24,6 +24,7 @@ from .comfy_quant_linear import (
     ensure_comfy_quant_linear_materialized,
     get_state_dict_weight_shape,
     is_comfy_quant_state_dict,
+    is_native_quant_weight_key,
 )
 
 from accelerate import init_empty_weights
@@ -923,7 +924,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             continue
 
         key = name.replace("_orig_mod.", "")
-        if comfy_quant and (key.rsplit(".", 1)[0] + ".comfy_quant") in sd:
+        if not gguf and is_native_quant_weight_key(sd, key):
             pbar.update(1)
             continue
         value=sd[key]

@@ -17,9 +17,11 @@
 """Load ComfyUI-native quantized checkpoints in WanAnimatePlus.
 
 ComfyUI native NVFP4/FP8 checkpoints store packed linear weights together with
-``*.comfy_quant`` JSON metadata and scale tensors. This module reconstructs those
-weights as ComfyUI ``QuantizedTensor`` instances so regular ``F.linear`` dispatches
-to comfy_kitchen kernels through the tensor subclass.
+``*.comfy_quant`` JSON metadata and scale tensors. Some NVFP4 checkpoints only
+store packed uint8 weights plus scale tensors; this module treats those as native
+quant weights too. It reconstructs weights as ComfyUI ``QuantizedTensor``
+instances so regular ``F.linear`` dispatches to comfy_kitchen kernels through the
+tensor subclass.
 """
 
 import json
@@ -73,7 +75,9 @@ def is_comfy_quant_state_dict(sd) -> bool:
     """Return True when a state dict uses ComfyUI native quant metadata."""
     if sd is None:
         return False
-    return any(k.endswith(".comfy_quant") for k in sd)
+    if any(k.endswith(".comfy_quant") for k in sd):
+        return True
+    return any(is_scale_only_nvfp4_weight_key(sd, k) for k in sd)
 
 
 def _ensure_comfy_quant_backend():
@@ -98,6 +102,16 @@ def _logical_weight_shape(fmt, packed_weight):
     return out_features, in_features
 
 
+def _is_weight_key(weight_key):
+    return weight_key == "weight" or weight_key.endswith(".weight")
+
+
+def _prefix_from_weight_key(weight_key):
+    if not _is_weight_key(weight_key):
+        return None
+    return weight_key[:-len("weight")]
+
+
 def _first_existing_prefixed_tensor(sd, prefix, suffixes):
     for suffix in suffixes:
         key = prefix + suffix
@@ -120,17 +134,48 @@ def _has_nvfp4_scale_tensors(sd, prefix):
     return tensor_scale is not None and block_scale is not None
 
 
+def is_scale_only_nvfp4_prefix(sd, prefix):
+    """Return True for NVFP4 packed weights that lack a comfy_quant key."""
+    if sd is None or prefix + "comfy_quant" in sd:
+        return False
+    weight = sd.get(prefix + "weight")
+    if not isinstance(weight, torch.Tensor):
+        return False
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        return False
+    return _has_nvfp4_scale_tensors(sd, prefix)
+
+
+def is_scale_only_nvfp4_weight_key(sd, weight_key):
+    prefix = _prefix_from_weight_key(weight_key)
+    return prefix is not None and is_scale_only_nvfp4_prefix(sd, prefix)
+
+
+def is_native_quant_prefix(sd, prefix):
+    if sd is None:
+        return False
+    return prefix + "comfy_quant" in sd or is_scale_only_nvfp4_prefix(sd, prefix)
+
+
+def is_native_quant_weight_key(sd, weight_key):
+    prefix = _prefix_from_weight_key(weight_key)
+    return prefix is not None and is_native_quant_prefix(sd, prefix)
+
+
 def get_state_dict_weight_shape(sd, weight_key):
     """Return the logical Linear weight shape for regular or Comfy quant weights."""
     if sd is None:
         raise ValueError("state dict is required")
-    if not weight_key.endswith("weight"):
+    if not _is_weight_key(weight_key):
         return tuple(sd[weight_key].shape)
 
     shape = tuple(sd[weight_key].shape)
+    prefix = _prefix_from_weight_key(weight_key)
 
-    quant_key = weight_key[:-len("weight")] + "comfy_quant"
+    quant_key = prefix + "comfy_quant"
     if quant_key not in sd:
+        if is_scale_only_nvfp4_prefix(sd, prefix):
+            return _logical_weight_shape("nvfp4", sd[weight_key])
         return shape
 
     fmt = _decode_comfy_quant(sd[quant_key]).get("format")
@@ -141,7 +186,13 @@ def get_state_dict_weight_shape(sd, weight_key):
 
 def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     _ensure_comfy_quant_backend()
-    fmt = _decode_comfy_quant(sd[prefix + "comfy_quant"])["format"]
+    quant_key = prefix + "comfy_quant"
+    if quant_key in sd:
+        fmt = _decode_comfy_quant(sd[quant_key])["format"]
+    elif is_scale_only_nvfp4_prefix(sd, prefix):
+        fmt = "nvfp4"
+    else:
+        raise RuntimeError(f"No ComfyUI-native quant metadata found for {prefix}")
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     qcfg = QUANT_ALGOS[fmt]
@@ -190,7 +241,16 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
 def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
     """Return native quant metadata needed by CustomLinear fallback paths."""
     _ensure_comfy_quant_backend()
-    fmt = _decode_comfy_quant(sd[prefix + "comfy_quant"])["format"]
+    quant_key = prefix + "comfy_quant"
+    if quant_key in sd:
+        fmt = _decode_comfy_quant(sd[quant_key])["format"]
+    elif is_scale_only_nvfp4_prefix(sd, prefix):
+        metadata = _get_nvfp4_metadata_from_prefix(sd, prefix, device, compute_dtype)
+        if metadata is None:
+            raise RuntimeError(f"NVFP4 native quant metadata is missing scale tensors for {prefix}")
+        return metadata
+    else:
+        raise RuntimeError(f"No ComfyUI-native quant metadata found for {prefix}")
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     layout_name = QUANT_ALGOS[fmt]["comfy_tensor_layout"]
@@ -557,7 +617,7 @@ def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device
 
         if not isinstance(module, nn.Linear):
             continue
-        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+        if "loras" in child_prefix or not is_native_quant_prefix(sd, child_prefix):
             continue
         if is_comfy_quant_weight_materialized(module):
             continue
@@ -601,7 +661,7 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
 
         if not isinstance(module, nn.Linear):
             continue
-        if "loras" in child_prefix or (child_prefix + "comfy_quant") not in sd:
+        if "loras" in child_prefix or not is_native_quant_prefix(sd, child_prefix):
             continue
 
         weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")

@@ -12,12 +12,10 @@ import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from .comfy_quant_linear import (
-    bind_comfy_quant_metadata,
     bind_comfy_quant_metadata_for_lora,
     bind_comfy_quant_metadata_for_prefix,
     contains_meta_tensor,
     dequantize_comfy_quant_weight,
-    get_comfy_quant_metadata,
     get_state_dict_weight_shape,
 )
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
@@ -126,10 +124,14 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
                 )
             model._modules[name].source_cls = type(module)
             model._modules[name].requires_grad_(False)
-            quant_key = module_prefix + "comfy_quant"
-            if quant_key in state_dict:
-                metadata = get_comfy_quant_metadata(state_dict, module_prefix, torch.device("cpu"), compute_dtype)
-                bind_comfy_quant_metadata(model._modules[name], metadata)
+            if not is_gguf:
+                bind_comfy_quant_metadata_for_prefix(
+                    model._modules[name],
+                    state_dict,
+                    module_prefix,
+                    compute_dtype,
+                    torch.device("cpu"),
+                )
 
     return model
 
@@ -366,6 +368,20 @@ class CustomLinear(nn.Linear):
         if self.is_gguf:
             weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
         else:
+            raw_weight = self.weight
+            if (
+                getattr(self, "_comfy_quant_format", None) is None
+                and isinstance(raw_weight, torch.Tensor)
+                and raw_weight.ndim == 2
+                and raw_weight.dtype == torch.uint8
+                and raw_weight.shape[-1] * 2 == input.shape[-1]
+            ):
+                raise RuntimeError(
+                    "Detected a half-width uint8 Linear weight entering a non-quantized path: "
+                    f"weight={tuple(raw_weight.shape)}, input={tuple(input.shape)}. "
+                    "This looks like an NVFP4 packed weight, but WanAnimatePlus did not bind "
+                    "its weight_scale/weight_scale_2 metadata before forward."
+                )
             weight = self.weight.to(input)
         return weight
 
@@ -447,6 +463,24 @@ class CustomLinear(nn.Linear):
                 sw = sw.repeat_interleave(weight.shape[-1] // sw.shape[0])
         return sw
 
+    def _check_linear_weight_shape(self, weight, input):
+        if weight.shape[-1] == input.shape[-1]:
+            return
+        if (
+            weight.ndim == 2
+            and weight.shape[-1] * 2 == input.shape[-1]
+            and getattr(self, "_comfy_quant_format", None) is None
+        ):
+            raise RuntimeError(
+                "Half-width Linear weight reached F.linear without NVFP4 metadata: "
+                f"weight={tuple(weight.shape)}, input={tuple(input.shape)}. "
+                "The model loader must bind native quant scale metadata for this layer."
+            )
+        raise RuntimeError(
+            "Linear weight/input feature mismatch before F.linear: "
+            f"weight={tuple(weight.shape)}, input={tuple(input.shape)}"
+        )
+
     def forward(self, input):
         weight = self._prepare_weight(input)
         weight = self._ensure_comfy_quant_forward_weight(weight, input)
@@ -468,6 +502,7 @@ class CustomLinear(nn.Linear):
                 ) from e
 
         weight = self._get_weight_with_lora(weight)
+        self._check_linear_weight_shape(weight, input)
         out = self._linear_forward_impl(input, weight, bias)
         del weight, input, bias
         return out
