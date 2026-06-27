@@ -2862,6 +2862,12 @@ class WanVideoSampler:
             scail_transition_keep_mask_global = image_embeds.get("scail_transition_keep_mask", None)
             scail2_transition_colormatch = image_embeds.get("scail2_transition_colormatch", "disabled")
             scail2_transition_match_ref = image_embeds.get("scail2_transition_match_ref", None)
+            scail2_transition_raw_last_frame = image_embeds.pop("scail2_transition_raw_last_frame", None)
+            scail2_loop_colormatch_reference = image_embeds.get("scail2_loop_colormatch_reference", "previous_matched_frame")
+            if scail2_loop_colormatch_reference not in ("previous_matched_frame", "main_ref_image"):
+                log.warning(f"Unknown SCAIL-2 loop_colormatch_reference={scail2_loop_colormatch_reference!r}; using previous_matched_frame")
+                scail2_loop_colormatch_reference = "previous_matched_frame"
+            scail2_has_transition_video = bool(image_embeds.get("scail2_has_transition_video", False))
 
             outer_freqs = freqs
             outer_rope_num_frames = getattr(transformer.rope_embedder, "num_frames", None)
@@ -2983,20 +2989,65 @@ class WanVideoSampler:
                     latents[:, zero_idx] = 0
                 return latents
 
-            def _color_match_video_frames(video_cthw):
-                if scail2_transition_colormatch == "disabled" or scail2_transition_match_ref is None:
-                    return video_cthw
+            def _color_match_ref_to_numpy(ref_frame):
+                if ref_frame is None:
+                    return None
+                if not isinstance(ref_frame, torch.Tensor):
+                    return None
+                ref = ref_frame.detach().cpu().float()
+                if ref.numel() == 0:
+                    return None
+                if ref.ndim == 4:
+                    if ref.shape[-1] >= 3:
+                        ref = ref[0, :, :, :3]
+                    elif ref.shape[1] >= 3:
+                        ref = ref[0, :3].permute(1, 2, 0)
+                    else:
+                        return None
+                elif ref.ndim == 3:
+                    if ref.shape[-1] >= 3:
+                        ref = ref[:, :, :3]
+                    elif ref.shape[0] >= 3:
+                        ref = ref[:3].permute(1, 2, 0)
+                    else:
+                        return None
+                else:
+                    return None
+                if ref.min().item() < 0.0:
+                    ref = ref.clamp(-1.0, 1.0).add(1.0).div(2.0)
+                else:
+                    ref = ref.clamp(0.0, 1.0)
+                return ref.numpy()
+
+            def _color_match_video_frames(video_cthw, ref_frame):
                 if video_cthw is None or video_cthw.shape[1] == 0:
+                    return video_cthw
+                ref_np = _color_match_ref_to_numpy(ref_frame)
+                if ref_np is None:
                     return video_cthw
                 from color_matcher import ColorMatcher
                 cm = ColorMatcher()
-                ref_np = scail2_transition_match_ref[:1, :, :, :3].detach().cpu().float().numpy()[0]
                 video_bhwc = video_cthw.float().clamp(-1.0, 1.0).permute(1, 2, 3, 0).add(1.0).div(2.0)
                 matched = []
                 for frame in video_bhwc:
                     out = cm.transfer(src=frame.detach().cpu().numpy(), ref=ref_np, method=scail2_transition_colormatch)
                     matched.append(torch.from_numpy(out).to(device=video_cthw.device, dtype=torch.float32))
                 return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
+
+            def _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame):
+                if scail2_transition_colormatch == "disabled":
+                    return None
+                if chunk_idx == 0:
+                    if not scail2_has_transition_video:
+                        return None
+                    if scail2_loop_colormatch_reference == "main_ref_image":
+                        return scail2_transition_match_ref
+                    return scail2_transition_raw_last_frame
+                if scail2_loop_colormatch_reference == "main_ref_image":
+                    return scail2_transition_match_ref
+                if chunk_idx > 0 and last_matched_ref_frame is not None:
+                    return last_matched_ref_frame
+                return scail2_transition_match_ref
 
             def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
                 local_latents = torch.zeros(16, chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
@@ -3156,6 +3207,7 @@ class WanVideoSampler:
             callback = prepare_callback(patcher, num_chunks * len(timesteps))
             generated_chunks = []
             prev_anchor_latents = None
+            last_matched_ref_frame = None
             chunk_seeds = []
             step_iteration_count = 0
 
@@ -3270,25 +3322,33 @@ class WanVideoSampler:
                     if chunk_video.shape[1] > chunk_frames:
                         chunk_video = chunk_video[:, :chunk_frames]
 
-                    output_chunk = chunk_video if chunk_idx == 0 else chunk_video[:, prev_frame_count:].contiguous()
+                    if chunk_idx == 0:
+                        overlap_frames = min(max(int(canvas_expansion_px), 0), chunk_video.shape[1]) if scail2_has_transition_video else 0
+                        output_chunk = chunk_video[:, overlap_frames:].contiguous() if overlap_frames > 0 else chunk_video
+                    else:
+                        output_chunk = chunk_video[:, prev_frame_count:].contiguous()
                     del chunk_video
 
                     if output_chunk.shape[1] > 0:
-                        matched_output_chunk = _color_match_video_frames(output_chunk)
-                        del output_chunk
+                        match_ref = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
+                        if match_ref is not None:
+                            output_chunk = _color_match_video_frames(output_chunk, match_ref)
 
-                        prev_anchor_latents = _encode_anchor_from_video(matched_output_chunk)
-                        generated_chunks.append(matched_output_chunk)
-                        del matched_output_chunk
+                        last_matched_ref_frame = output_chunk[:, -1].detach().cpu()
+                        prev_anchor_latents = _encode_anchor_from_video(output_chunk)
+                        generated_chunks.append(output_chunk)
+                        del output_chunk
                     else:
                         del output_chunk
+                    if chunk_idx == 0:
+                        scail2_transition_raw_last_frame = None
 
                     del latent, local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
                     mm.soft_empty_cache()
                     gc.collect()
 
                 gen_video_samples = torch.cat(generated_chunks, dim=1)
-                if canvas_expansion_px:
+                if canvas_expansion_px and not scail2_has_transition_video:
                     if gen_video_samples.shape[1] > canvas_expansion_px:
                         gen_video_samples = gen_video_samples[:, canvas_expansion_px:]
                         log.info(f"SCAIL-2 loop: trimmed {canvas_expansion_px} canvas expansion pixel frames from output")

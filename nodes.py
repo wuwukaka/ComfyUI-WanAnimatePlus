@@ -1755,6 +1755,10 @@ class WanAnimatePlusSCAIL2Embeds:
                     'hm-mvgd-hm',
                     'hm-mkl-hm',
                 ], {"default": 'disabled', "tooltip": "Color match transition_video to ref_image."}),
+                "loop_colormatch_reference": ([
+                    'previous_matched_frame',
+                    'main_ref_image',
+                ], {"default": 'previous_matched_frame', "tooltip": "SCAIL-2 loop color match reference. The first chunk is not color matched when transition_video is not connected."}),
                 "prefix_alpha_crop": ("BOOLEAN", {"default": False, "tooltip": "Off keeps prefix masks as white-background reference masks in animation mode. On uses black-background masks and alpha-crops prefix_frames. Replacement mode always uses black-background reference masks."}),
                 "preserve_main_ref_background": ("BOOLEAN", {"default": True, "tooltip": "Animation mode only. Keep the main reference image background. When off, reference_image_mask is normalized to black background and used to alpha-crop ref_image. Ignored in replacement mode."}),
                 "single_frame_prefix_encoding": ("BOOLEAN", {"default": True, "tooltip": "Encode prefix images as individual full-resolution reference latents instead of expanding the canvas."}),
@@ -1963,7 +1967,7 @@ class WanAnimatePlusSCAIL2Embeds:
                 clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
                 transition_video=None, pose_image_mask=None, reference_image_mask=None, tiled_vae=False,
                 transition_colormatch='disabled', prefix_alpha_crop=False, preserve_main_ref_background=True,
-                single_frame_prefix_encoding=True, **kwargs):
+                single_frame_prefix_encoding=True, loop_colormatch_reference='previous_matched_frame', **kwargs):
         W = (width // 32) * 32
         H = (height // 32) * 32
         requested_frames = ((int(num_frames) - 1) // 4) * 4 + 1
@@ -2088,7 +2092,13 @@ class WanAnimatePlusSCAIL2Embeds:
         if transition_video is not None:
             transition_px_range = (17, 37) if canvas_prefix_frames is not None else (0, 21)
         transition_match_ref = self._resize_bhwc(ref_image[:1, :, :, :3], W, H) if ref_image is not None else None
-        if transition_colormatch != "disabled" and transition_match_ref is None and (transition_video is not None or scail2_looping):
+        transition_raw_last_frame = (
+            transition_video[-1:, :, :, :3].detach().to(offload_device)
+            if transition_video is not None and scail2_looping else None
+        )
+        if transition_colormatch != "disabled" and transition_match_ref is None and (
+            transition_video is not None or (scail2_looping and loop_colormatch_reference == "main_ref_image")
+        ):
             log.warning("SCAIL-2 transition_colormatch is enabled but ref_image is not connected. Skipping color match.")
 
         if canvas_expansion_px:
@@ -2369,9 +2379,13 @@ class WanAnimatePlusSCAIL2Embeds:
             "canvas_expansion_px": canvas_expansion_px,
             "scail_prefix_prepend_latents": scail_prefix_prepend_latents,
             "scail2_transition_colormatch": transition_colormatch,
+            "scail2_loop_colormatch_reference": loop_colormatch_reference,
+            "scail2_has_transition_video": transition_video is not None,
         }
         if transition_match_ref is not None:
             image_embeds["scail2_transition_match_ref"] = transition_match_ref.to(offload_device)
+        if transition_raw_last_frame is not None:
+            image_embeds["scail2_transition_raw_last_frame"] = transition_raw_last_frame
         if scail_freeze_latents is not None:
             image_embeds["scail_freeze_latents"] = scail_freeze_latents
             image_embeds["scail_freeze_mask"] = scail_freeze_mask
