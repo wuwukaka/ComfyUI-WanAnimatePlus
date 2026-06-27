@@ -124,6 +124,7 @@ def _replace_linear(model, compute_dtype, state_dict, prefix="", patches=None, s
                     is_gguf=is_gguf
                 )
             model._modules[name].source_cls = type(module)
+            model._modules[name]._wan_layer_prefix = module_prefix
             model._modules[name].requires_grad_(False)
             if not is_gguf:
                 bind_comfy_quant_metadata_for_prefix(
@@ -356,34 +357,70 @@ class CustomLinear(nn.Linear):
         return alpha / lora_diff_1.shape[0] if alpha != 0.0 else 1.0
 
     def _can_apply_lora_to_output(self, weight, input):
+        return self._native_quant_lora_output_reject_reason(weight, input) is None
+
+    def _native_quant_lora_output_reject_reason(self, weight, input):
         if not self._has_lora_diffs():
-            return False
+            return "no LoRA diffs are registered"
         if getattr(self, "_comfy_quant_format", None) is None:
-            return False
+            return "module is not a ComfyUI-native quantized Linear"
         if not self._is_comfy_quant_tensor(weight):
-            return False
+            return f"weight is not a QuantizedTensor-like object: type={type(weight).__name__}"
         if self.scale_weight is not None:
-            return False
-        if weight.ndim != 2 or weight.shape[-1] != input.shape[-1]:
-            return False
+            return "scale_weight is present"
+        if weight.ndim != 2:
+            return f"weight ndim is {weight.ndim}, expected 2"
+        if weight.shape[-1] != input.shape[-1]:
+            return f"weight/input feature mismatch: weight={tuple(weight.shape)}, input={tuple(input.shape)}"
 
         out_features, in_features = weight.shape
-        for lora_diff_names in self.lora_diffs:
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
             if isinstance(lora_diff_names, tuple):
                 lora_diff_0 = getattr(self, lora_diff_names[0])
                 lora_diff_1 = getattr(self, lora_diff_names[1])
                 lora_a, lora_b = self._lora_tuple_matrices(lora_diff_0, lora_diff_1)
                 if lora_a.ndim != 2 or lora_b.ndim != 2:
-                    return False
+                    return f"LoRA {idx} matrices are not 2D: A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}"
                 if lora_a.shape[0] != out_features or lora_b.shape[1] != in_features:
-                    return False
+                    return (
+                        f"LoRA {idx} shape does not match weight/input: "
+                        f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}, weight={tuple(weight.shape)}"
+                    )
                 if lora_a.shape[1] != lora_b.shape[0]:
-                    return False
+                    return f"LoRA {idx} rank mismatch: A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}"
             else:
                 lora_diff = getattr(self, lora_diff_names)
                 if tuple(lora_diff.shape) != tuple(weight.shape):
-                    return False
-        return True
+                    return f"LoRA {idx} full diff shape mismatch: diff={tuple(lora_diff.shape)}, weight={tuple(weight.shape)}"
+        return None
+
+    def _lora_debug_shapes(self):
+        shapes = []
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            if isinstance(lora_diff_names, tuple):
+                lora_diff_0 = getattr(self, lora_diff_names[0])
+                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_a, lora_b = self._lora_tuple_matrices(lora_diff_0, lora_diff_1)
+                shapes.append(f"{idx}:tuple A={tuple(lora_a.shape)} B={tuple(lora_b.shape)}")
+            else:
+                lora_diff = getattr(self, lora_diff_names)
+                shapes.append(f"{idx}:diff {tuple(lora_diff.shape)}")
+        return "[" + ", ".join(shapes) + "]"
+
+    def _raise_native_quant_lora_fallback(self, weight, input, reason):
+        layer = getattr(self, "_wan_layer_prefix", "<unknown>")
+        raise RuntimeError(
+            "Native quant LoRA would require full-weight dequantization; refusing to avoid VRAM spike. "
+            f"layer={layer}, "
+            f"format={getattr(self, '_comfy_quant_format', None)}, "
+            f"reason={reason}, "
+            f"weight_type={type(weight).__name__}, "
+            f"weight_shape={tuple(weight.shape) if hasattr(weight, 'shape') else None}, "
+            f"weight_device={getattr(weight, 'device', None)}, "
+            f"input_shape={tuple(input.shape)}, input_dtype={input.dtype}, input_device={input.device}, "
+            f"scale_weight_present={self.scale_weight is not None}, "
+            f"lora_shapes={self._lora_debug_shapes()}"
+        )
 
     def _apply_lora_to_output(self, input, out):
         # Equivalent to F.linear(input, weight + A @ B), without materializing A @ B
@@ -583,12 +620,15 @@ class CustomLinear(nn.Linear):
         else:
             bias = None
 
-        if self._can_apply_lora_to_output(weight, input):
+        lora_output_reject_reason = self._native_quant_lora_output_reject_reason(weight, input)
+        if lora_output_reject_reason is None:
             self._check_linear_weight_shape(weight, input)
             out = self._linear_forward_impl(input, weight, bias)
             out = self._apply_lora_to_output(input, out)
             del weight, input, bias
             return out
+        if getattr(self, "_comfy_quant_format", None) is not None and self._has_lora_diffs():
+            self._raise_native_quant_lora_fallback(weight, input, lora_output_reject_reason)
 
         weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
