@@ -12,11 +12,12 @@
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 # Licensed under the Apache License, Version 2.0
-import os, gc, math, copy
+import os, gc, math, copy, shutil
 import torch
 import numpy as np
 from tqdm import tqdm
 import inspect
+import folder_paths
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
 from .wanvideo.schedulers import get_scheduler, scheduler_list
@@ -2919,12 +2920,18 @@ class WanVideoSampler:
                     align_corners=False,
                 )[0]
 
+            def _maybe_offload_loop_vae():
+                if force_offload:
+                    vae.to(offload_device)
+
             def _encode_video_window(video_bhwc, width, height, scale=1.0):
                 video_bhwc = video_bhwc[:, :, :, :3]
                 pixels = common_upscale(video_bhwc.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
                 pixels = pixels.permute(3, 0, 1, 2).to(device=device, dtype=vae.dtype) * 2 - 1
                 vae.to(device)
                 lat = vae.encode([pixels], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+                del pixels
+                _maybe_offload_loop_vae()
                 mask = torch.ones_like(lat[:4])
                 if scale != 1.0:
                     lat = lat * scale
@@ -3072,6 +3079,86 @@ class WanVideoSampler:
                     return last_matched_ref_frame
                 return scail2_transition_match_ref
 
+            def _create_loop_temp_output_path():
+                from datetime import datetime
+                path = os.path.join(
+                    folder_paths.get_output_directory(),
+                    f"scail2_loop_cache_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}",
+                )
+                os.makedirs(path, exist_ok=True)
+                return path
+
+            def _cache_loop_output_chunk(video_cthw, output_dir, chunk_idx, max_frames):
+                if video_cthw is None or max_frames <= 0:
+                    return None
+                frames_to_cache = min(int(video_cthw.shape[1]), int(max_frames))
+                if frames_to_cache <= 0:
+                    return None
+                cached_chunk = video_cthw[:, :frames_to_cache].detach().cpu().contiguous()
+                if output_dir is None:
+                    return {"tensor": cached_chunk, "frames": frames_to_cache}
+
+                cache_path = os.path.join(output_dir, f"chunk_{chunk_idx:06d}.pt")
+                try:
+                    torch.save(cached_chunk, cache_path)
+                except Exception as e:
+                    log.warning(f"SCAIL-2 loop tensor cache save failed; keeping chunk in memory: {e}")
+                    return {"tensor": cached_chunk, "frames": frames_to_cache}
+                del cached_chunk
+                return {"path": cache_path, "frames": frames_to_cache}
+
+            def _load_loop_cache_entry(entry):
+                if "tensor" in entry:
+                    return entry["tensor"]
+                try:
+                    return torch.load(entry["path"], map_location="cpu", weights_only=True)
+                except TypeError:
+                    return torch.load(entry["path"], map_location="cpu")
+
+            def _assemble_loop_cached_chunks(entries, max_frames):
+                if not entries or max_frames <= 0:
+                    return None
+                total_frames = min(sum(int(entry["frames"]) for entry in entries), int(max_frames))
+                if total_frames <= 0:
+                    return None
+
+                first_entry = entries[0]
+                first_chunk = _load_loop_cache_entry(first_entry)
+                if not isinstance(first_chunk, torch.Tensor) or first_chunk.ndim != 4:
+                    raise RuntimeError("SCAIL-2 loop tensor cache entry is invalid")
+                gen_video = torch.empty(
+                    first_chunk.shape[0],
+                    total_frames,
+                    first_chunk.shape[2],
+                    first_chunk.shape[3],
+                    dtype=first_chunk.dtype,
+                    device=torch.device("cpu"),
+                )
+
+                def _copy_cached_chunk(chunk, entry, write_pos):
+                    if chunk.shape[0] != gen_video.shape[0] or chunk.shape[2:] != gen_video.shape[2:]:
+                        raise RuntimeError(
+                            f"SCAIL-2 loop tensor cache shape mismatch: expected "
+                            f"{tuple(gen_video.shape[0:1] + gen_video.shape[2:])}, got {tuple(chunk.shape)}"
+                        )
+                    take = min(int(chunk.shape[1]), total_frames - write_pos)
+                    if take > 0:
+                        gen_video[:, write_pos:write_pos + take].copy_(chunk[:, :take])
+                        write_pos += take
+                    entry.pop("tensor", None)
+                    return write_pos
+
+                write_pos = 0
+                write_pos = _copy_cached_chunk(first_chunk, first_entry, write_pos)
+                del first_chunk
+                for entry in entries[1:]:
+                    if write_pos >= total_frames:
+                        break
+                    chunk = _load_loop_cache_entry(entry)
+                    write_pos = _copy_cached_chunk(chunk, entry, write_pos)
+                    del chunk
+                return gen_video
+
             def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
                 local_latents = torch.zeros(16, chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
                 local_mask = torch.zeros(chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
@@ -3208,7 +3295,11 @@ class WanVideoSampler:
             def _encode_anchor_from_video(video_cthw):
                 anchor = video_cthw[:, -prev_frame_count:].to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
                 vae.to(device)
-                return vae.encode([anchor.to(device, vae.dtype)], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+                anchor_pixels = anchor.to(device, vae.dtype)
+                anchor_latent = vae.encode([anchor_pixels], device, tiled=tiled_vae, pbar=False)[0].to(device, dtype)
+                del anchor, anchor_pixels
+                _maybe_offload_loop_vae()
+                return anchor_latent
 
             if "comfy" in rope_function:
                 transformer.rope_embedder.num_frames = chunk_latent_frames
@@ -3228,11 +3319,22 @@ class WanVideoSampler:
             )
 
             callback = prepare_callback(patcher, num_chunks * len(timesteps))
-            generated_chunks = []
+            cached_output_chunks = []
+            cached_loop_frame_count = 0
+            loop_cache_frame_limit = requested_output_frames
+            if canvas_expansion_px and not scail2_has_transition_video:
+                loop_cache_frame_limit += max(int(canvas_expansion_px), 0)
             prev_anchor_latents = None
             last_matched_ref_frame = None
             chunk_seeds = []
             step_iteration_count = 0
+            loop_cache_output_path = None
+            try:
+                loop_cache_output_path = _create_loop_temp_output_path()
+                log.info(f"SCAIL-2 loop: caching completed output chunks to temporary folder {loop_cache_output_path}")
+            except Exception as e:
+                loop_cache_output_path = None
+                log.warning(f"SCAIL-2 loop tensor cache will use in-memory fallback; could not create temporary folder: {e}")
 
             try:
                 for chunk_idx in range(num_chunks):
@@ -3330,10 +3432,14 @@ class WanVideoSampler:
                     finally:
                         scail_freeze_mask = old_scail_freeze_mask
                         chunk_pbar.close()
+                        self.cache_state = [None, None]
 
                     if local_freeze_latents is not None:
                         mask = local_freeze_mask.unsqueeze(0).to(latent)
                         latent = local_freeze_latents.to(latent) * mask + latent * (1 - mask)
+                    del local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
+                    _maybe_offload_loop_vae()
+                    mm.soft_empty_cache()
 
                     vae.to(device)
                     chunk_video = vae.decode(
@@ -3342,6 +3448,8 @@ class WanVideoSampler:
                         tiled=tiled_vae,
                         pbar=False,
                     )[0].detach().cpu()
+                    del latent
+                    _maybe_offload_loop_vae()
                     if chunk_video.shape[1] > chunk_frames:
                         chunk_video = chunk_video[:, :chunk_frames]
 
@@ -3368,18 +3476,28 @@ class WanVideoSampler:
                             .cpu()
                         )
                         prev_anchor_latents = _encode_anchor_from_video(output_chunk)
-                        generated_chunks.append(output_chunk)
+                        remaining_cache_frames = loop_cache_frame_limit - cached_loop_frame_count
+                        cache_entry = _cache_loop_output_chunk(
+                            output_chunk,
+                            loop_cache_output_path,
+                            chunk_idx,
+                            remaining_cache_frames,
+                        )
+                        if cache_entry is not None:
+                            cached_output_chunks.append(cache_entry)
+                            cached_loop_frame_count += int(cache_entry["frames"])
                         del output_chunk
                     else:
                         del output_chunk
                     if chunk_idx == 0:
                         scail2_transition_raw_last_frame = None
 
-                    del latent, local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
                     mm.soft_empty_cache()
                     gc.collect()
 
-                gen_video_samples = torch.cat(generated_chunks, dim=1)
+                gen_video_samples = _assemble_loop_cached_chunks(cached_output_chunks, loop_cache_frame_limit)
+                if gen_video_samples is None:
+                    raise RuntimeError("SCAIL-2 loop produced no output frames")
                 if canvas_expansion_px and not scail2_has_transition_video:
                     if gen_video_samples.shape[1] > canvas_expansion_px:
                         gen_video_samples = gen_video_samples[:, canvas_expansion_px:]
@@ -3391,6 +3509,14 @@ class WanVideoSampler:
                 if gen_video_samples.shape[1] > requested_output_frames:
                     gen_video_samples = gen_video_samples[:, :requested_output_frames]
                 log.info(f"SCAIL-2 chunk seeds: {chunk_seeds}")
+                if loop_cache_output_path is not None:
+                    log.info(f"SCAIL-2 loop: cached {cached_loop_frame_count} output frames to {loop_cache_output_path}")
+                    try:
+                        shutil.rmtree(loop_cache_output_path)
+                        log.info(f"SCAIL-2 loop: removed temporary cache folder {loop_cache_output_path}")
+                        loop_cache_output_path = None
+                    except Exception as e:
+                        log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {loop_cache_output_path}: {e}")
 
                 if force_offload:
                     vae.to(offload_device)
