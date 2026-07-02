@@ -493,6 +493,8 @@ class CustomLinear(nn.Linear):
         """Prepare weight tensor - handles regular, GGUF, and Comfy native quant weights"""
         if getattr(self, "_comfy_quant_format", None) is not None:
             weight = self.weight
+            if self._is_materialized_regular_weight(weight, input):
+                return weight.to(input)
             if weight.device.type == "meta" or contains_meta_tensor(getattr(weight, "_qdata", None)):
                 raise RuntimeError(
                     "ComfyUI-native quantized Linear weight is still a meta tensor. "
@@ -591,6 +593,17 @@ class CustomLinear(nn.Linear):
             return weight.dtype == torch.float8_e5m2
         return False
 
+    def _is_materialized_regular_weight(self, weight, input):
+        if not isinstance(weight, torch.Tensor):
+            return False
+        if self._is_comfy_quant_tensor(weight) or self._is_raw_comfy_quant_weight(weight):
+            return False
+        if weight.device.type == "meta" or weight.ndim != 2:
+            return False
+        if weight.shape[-1] != input.shape[-1]:
+            return False
+        return torch.is_floating_point(weight)
+
     def _dequantize_comfy_quant_for_lora(self, weight, input):
         if getattr(self, "_comfy_quant_format", None) is None or not self._has_lora_diffs():
             return weight
@@ -649,25 +662,32 @@ class CustomLinear(nn.Linear):
 
     def forward(self, input):
         weight = self._prepare_weight(input)
-        weight = self._ensure_comfy_quant_forward_weight(weight, input)
+        stale_comfy_quant_metadata = (
+            getattr(self, "_comfy_quant_format", None) is not None
+            and self._is_materialized_regular_weight(weight, input)
+        )
+        if not stale_comfy_quant_metadata:
+            weight = self._ensure_comfy_quant_forward_weight(weight, input)
 
         if self.bias is not None:
             bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
         else:
             bias = None
-        self._check_comfy_quant_forward_devices(weight, input)
+        if not stale_comfy_quant_metadata:
+            self._check_comfy_quant_forward_devices(weight, input)
 
-        lora_output_reject_reason = self._native_quant_lora_output_reject_reason(weight, input)
-        if lora_output_reject_reason is None:
-            self._check_linear_weight_shape(weight, input)
-            out = self._linear_forward_impl(input, weight, bias)
-            out = self._apply_lora_to_output(input, out)
-            del weight, input, bias
-            return out
-        if getattr(self, "_comfy_quant_format", None) is not None and self._has_lora_diffs():
-            self._raise_native_quant_lora_fallback(weight, input, lora_output_reject_reason)
+        if not stale_comfy_quant_metadata:
+            lora_output_reject_reason = self._native_quant_lora_output_reject_reason(weight, input)
+            if lora_output_reject_reason is None:
+                self._check_linear_weight_shape(weight, input)
+                out = self._linear_forward_impl(input, weight, bias)
+                out = self._apply_lora_to_output(input, out)
+                del weight, input, bias
+                return out
+            if getattr(self, "_comfy_quant_format", None) is not None and self._has_lora_diffs():
+                self._raise_native_quant_lora_fallback(weight, input, lora_output_reject_reason)
 
-        weight = self._dequantize_comfy_quant_for_lora(weight, input)
+            weight = self._dequantize_comfy_quant_for_lora(weight, input)
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
