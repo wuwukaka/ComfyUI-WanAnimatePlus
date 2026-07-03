@@ -3088,7 +3088,27 @@ class WanVideoSampler:
                 os.makedirs(path, exist_ok=True)
                 return path
 
-            def _cache_loop_output_chunk(video_cthw, output_dir, chunk_idx, max_frames):
+            def _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache):
+                try:
+                    torch.save(cached_chunk, cache_path)
+                except Exception as e:
+                    log.warning(f"SCAIL-2 loop tensor cache save failed; keeping chunk in memory: {e}")
+                    return {"tensor": cached_chunk, "frames": frames_to_cache}
+                del cached_chunk
+                return {"path": cache_path, "frames": frames_to_cache}
+
+            def _resolve_loop_cache_entry(entry):
+                if entry is None:
+                    return None
+                future = entry.pop("future", None)
+                if future is None:
+                    return entry
+                resolved = future.result()
+                entry.clear()
+                entry.update(resolved)
+                return entry
+
+            def _cache_loop_output_chunk(video_cthw, output_dir, chunk_idx, max_frames, executor=None):
                 if video_cthw is None or max_frames <= 0:
                     return None
                 frames_to_cache = min(int(video_cthw.shape[1]), int(max_frames))
@@ -3099,15 +3119,13 @@ class WanVideoSampler:
                     return {"tensor": cached_chunk, "frames": frames_to_cache}
 
                 cache_path = os.path.join(output_dir, f"chunk_{chunk_idx:06d}.pt")
-                try:
-                    torch.save(cached_chunk, cache_path)
-                except Exception as e:
-                    log.warning(f"SCAIL-2 loop tensor cache save failed; keeping chunk in memory: {e}")
-                    return {"tensor": cached_chunk, "frames": frames_to_cache}
-                del cached_chunk
-                return {"path": cache_path, "frames": frames_to_cache}
+                if executor is None:
+                    return _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache)
+                future = executor.submit(_save_loop_cache_tensor, cached_chunk, cache_path, frames_to_cache)
+                return {"future": future, "frames": frames_to_cache}
 
             def _load_loop_cache_entry(entry):
+                entry = _resolve_loop_cache_entry(entry)
                 if "tensor" in entry:
                     return entry["tensor"]
                 try:
@@ -3329,12 +3347,21 @@ class WanVideoSampler:
             chunk_seeds = []
             step_iteration_count = 0
             loop_cache_output_path = None
+            loop_cache_executor = None
+            pending_loop_cache_entry = None
             try:
                 loop_cache_output_path = _create_loop_temp_output_path()
                 log.info(f"SCAIL-2 loop: caching completed output chunks to temporary folder {loop_cache_output_path}")
             except Exception as e:
                 loop_cache_output_path = None
                 log.warning(f"SCAIL-2 loop tensor cache will use in-memory fallback; could not create temporary folder: {e}")
+            if loop_cache_output_path is not None:
+                try:
+                    from concurrent.futures import ThreadPoolExecutor
+                    loop_cache_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scail2_loop_cache")
+                except Exception as e:
+                    loop_cache_executor = None
+                    log.warning(f"SCAIL-2 loop tensor cache will save synchronously; could not start background worker: {e}")
 
             try:
                 for chunk_idx in range(num_chunks):
@@ -3475,17 +3502,31 @@ class WanVideoSampler:
                             .detach()
                             .cpu()
                         )
-                        prev_anchor_latents = _encode_anchor_from_video(output_chunk)
                         remaining_cache_frames = loop_cache_frame_limit - cached_loop_frame_count
+                        if pending_loop_cache_entry is not None:
+                            _resolve_loop_cache_entry(pending_loop_cache_entry)
+                            pending_loop_cache_entry = None
                         cache_entry = _cache_loop_output_chunk(
                             output_chunk,
                             loop_cache_output_path,
                             chunk_idx,
                             remaining_cache_frames,
+                            loop_cache_executor,
                         )
                         if cache_entry is not None:
                             cached_output_chunks.append(cache_entry)
                             cached_loop_frame_count += int(cache_entry["frames"])
+                            if "future" in cache_entry:
+                                pending_loop_cache_entry = cache_entry
+
+                        anchor_frames = None
+                        if chunk_idx + 1 < num_chunks:
+                            anchor_frame_count = min(prev_frame_count, int(output_chunk.shape[1]))
+                            if anchor_frame_count > 0:
+                                anchor_frames = output_chunk[:, -anchor_frame_count:].contiguous()
+                                prev_anchor_latents = _encode_anchor_from_video(anchor_frames)
+                        if anchor_frames is not None:
+                            del anchor_frames
                         del output_chunk
                     else:
                         del output_chunk
@@ -3495,6 +3536,9 @@ class WanVideoSampler:
                     mm.soft_empty_cache()
                     gc.collect()
 
+                if pending_loop_cache_entry is not None:
+                    _resolve_loop_cache_entry(pending_loop_cache_entry)
+                    pending_loop_cache_entry = None
                 gen_video_samples = _assemble_loop_cached_chunks(cached_output_chunks, loop_cache_frame_limit)
                 if gen_video_samples is None:
                     raise RuntimeError("SCAIL-2 loop produced no output frames")
@@ -3532,6 +3576,21 @@ class WanVideoSampler:
                     "scail2_chunk_seeds": chunk_seeds,
                 },)
             finally:
+                if pending_loop_cache_entry is not None:
+                    try:
+                        _resolve_loop_cache_entry(pending_loop_cache_entry)
+                    except Exception as e:
+                        log.warning(f"SCAIL-2 loop: failed to resolve pending tensor cache save during cleanup: {e}")
+                    pending_loop_cache_entry = None
+                if loop_cache_executor is not None:
+                    loop_cache_executor.shutdown(wait=True)
+                    loop_cache_executor = None
+                if loop_cache_output_path is not None:
+                    try:
+                        shutil.rmtree(loop_cache_output_path)
+                        log.info(f"SCAIL-2 loop: removed temporary cache folder {loop_cache_output_path}")
+                    except Exception as e:
+                        log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {loop_cache_output_path}: {e}")
                 _scail2_restore_rope_state()
 
         # Main sampling loop with FreeInit iterations
