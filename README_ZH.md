@@ -255,4 +255,4 @@ ComfyUI-WanAnimatePlus/
 
 本项目中的修改部分和新增代码 Copyright (c) 2026 wuwukasi/wuwukaka。详细归属和修改说明要求见 [NOTICE](NOTICE)。任何使用或修改 WanAnimatePlus 新增部分的下游项目，应保留相关 copyright / modification notices，并在 README、NOTICE 文件或等效归属说明文档中加入详细修改说明。该说明应标明哪些模块、文件或功能区域来自 wuwukasi/wuwukaka，并描述下游对这些部分做了哪些修改。
 
-wuwukasi/wuwukaka 新增部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini in-context conditioning、SCAIL-2 embeds 支持（包括 prefix_mask 处理、freeze/prepend 集成）、EverAnimate embeds、sampler/context-window 修改、cache/inference 安全保护，以及相关 custom-op 处理等。
+wuwukasi/wuwukaka 新增部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini in-context conditioning、SCAIL-2 embeds 支持（包括 prefix_mask 处理、freeze/prepend 集成、loop 输出张量缓存/后台保存）、EverAnimate embeds、sampler/context-window 修改、cache/inference 安全保护、fast-path attention dispatch 传递，以及相关 custom-op 处理等。

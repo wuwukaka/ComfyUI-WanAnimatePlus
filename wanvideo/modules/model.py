@@ -8,6 +8,7 @@
 #   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
 #   - Added simple T2V text/time embedding caches, cache-key helpers, and guarded no-op device moves.
 #   - Added a streamlined SCAIL-2 CFG fast path for the local WanAnimatePlus sampler.
+#   - Added main-path cross-attention attention-mode propagation and target-fusion dispatch fixes.
 # Licensed under the Apache License, Version 2.0
 import math
 import torch

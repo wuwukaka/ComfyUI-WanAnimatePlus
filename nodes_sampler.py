@@ -11,6 +11,7 @@
 #   - Added EverAnimate VAE re-encode clamp/uint8 preprocessing to match the reference path.
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
+#   - Added SCAIL-2 loop output tensor caching, background cache saves, and tail-frame anchor encoding.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy, shutil
 import torch
@@ -3079,6 +3080,53 @@ class WanVideoSampler:
                     return last_matched_ref_frame
                 return scail2_transition_match_ref
 
+            loop_cache_dir_prefix = "scail2_loop_cache_"
+            loop_cache_marker = ".wananimateplus_scail2_loop_cache"
+
+            def _is_scail2_loop_cache_dir_name(name):
+                if not name.startswith(loop_cache_dir_prefix):
+                    return False
+                suffix = name[len(loop_cache_dir_prefix):]
+                parts = suffix.split("_")
+                return (
+                    len(parts) == 4
+                    and len(parts[0]) == 8 and parts[0].isdigit()
+                    and len(parts[1]) == 6 and parts[1].isdigit()
+                    and len(parts[2]) == 6 and parts[2].isdigit()
+                    and parts[3].isdigit()
+                )
+
+            def _cleanup_stale_loop_temp_output_paths():
+                output_dir = folder_paths.get_output_directory()
+                try:
+                    entries = list(os.scandir(output_dir))
+                except Exception as e:
+                    log.warning(f"SCAIL-2 loop: failed to scan temporary cache folders in {output_dir}: {e}")
+                    return
+
+                for entry in entries:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                        marker_path = os.path.join(entry.path, loop_cache_marker)
+                        if not (_is_scail2_loop_cache_dir_name(entry.name) or os.path.exists(marker_path)):
+                            continue
+                        shutil.rmtree(entry.path)
+                        log.info(f"SCAIL-2 loop: removed stale temporary cache folder {entry.path}")
+                    except Exception as e:
+                        log.warning(f"SCAIL-2 loop: failed to remove stale temporary cache folder {entry.path}: {e}")
+
+            def _remove_loop_temp_output_path(path):
+                if path is None:
+                    return None
+                try:
+                    shutil.rmtree(path)
+                    log.info(f"SCAIL-2 loop: removed temporary cache folder {path}")
+                    return None
+                except Exception as e:
+                    log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {path}: {e}")
+                    return path
+
             def _create_loop_temp_output_path():
                 from datetime import datetime
                 path = os.path.join(
@@ -3086,6 +3134,8 @@ class WanVideoSampler:
                     f"scail2_loop_cache_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}",
                 )
                 os.makedirs(path, exist_ok=True)
+                with open(os.path.join(path, loop_cache_marker), "w", encoding="utf-8") as marker_file:
+                    marker_file.write("WanAnimatePlus SCAIL-2 loop temporary tensor cache\n")
                 return path
 
             def _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache):
@@ -3350,18 +3400,26 @@ class WanVideoSampler:
             loop_cache_executor = None
             pending_loop_cache_entry = None
             try:
-                loop_cache_output_path = _create_loop_temp_output_path()
-                log.info(f"SCAIL-2 loop: caching completed output chunks to temporary folder {loop_cache_output_path}")
-            except Exception as e:
-                loop_cache_output_path = None
-                log.warning(f"SCAIL-2 loop tensor cache will use in-memory fallback; could not create temporary folder: {e}")
-            if loop_cache_output_path is not None:
                 try:
-                    from concurrent.futures import ThreadPoolExecutor
-                    loop_cache_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scail2_loop_cache")
+                    _cleanup_stale_loop_temp_output_paths()
+                    loop_cache_output_path = _create_loop_temp_output_path()
+                    log.info(f"SCAIL-2 loop: caching completed output chunks to temporary folder {loop_cache_output_path}")
                 except Exception as e:
+                    loop_cache_output_path = None
+                    log.warning(f"SCAIL-2 loop tensor cache will use in-memory fallback; could not create temporary folder: {e}")
+                if loop_cache_output_path is not None:
+                    try:
+                        from concurrent.futures import ThreadPoolExecutor
+                        loop_cache_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scail2_loop_cache")
+                    except Exception as e:
+                        loop_cache_executor = None
+                        log.warning(f"SCAIL-2 loop tensor cache will save synchronously; could not start background worker: {e}")
+            except BaseException:
+                if loop_cache_executor is not None:
+                    loop_cache_executor.shutdown(wait=True)
                     loop_cache_executor = None
-                    log.warning(f"SCAIL-2 loop tensor cache will save synchronously; could not start background worker: {e}")
+                loop_cache_output_path = _remove_loop_temp_output_path(loop_cache_output_path)
+                raise
 
             try:
                 for chunk_idx in range(num_chunks):
@@ -3555,12 +3613,7 @@ class WanVideoSampler:
                 log.info(f"SCAIL-2 chunk seeds: {chunk_seeds}")
                 if loop_cache_output_path is not None:
                     log.info(f"SCAIL-2 loop: cached {cached_loop_frame_count} output frames to {loop_cache_output_path}")
-                    try:
-                        shutil.rmtree(loop_cache_output_path)
-                        log.info(f"SCAIL-2 loop: removed temporary cache folder {loop_cache_output_path}")
-                        loop_cache_output_path = None
-                    except Exception as e:
-                        log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {loop_cache_output_path}: {e}")
+                    loop_cache_output_path = _remove_loop_temp_output_path(loop_cache_output_path)
 
                 if force_offload:
                     vae.to(offload_device)
@@ -3585,12 +3638,7 @@ class WanVideoSampler:
                 if loop_cache_executor is not None:
                     loop_cache_executor.shutdown(wait=True)
                     loop_cache_executor = None
-                if loop_cache_output_path is not None:
-                    try:
-                        shutil.rmtree(loop_cache_output_path)
-                        log.info(f"SCAIL-2 loop: removed temporary cache folder {loop_cache_output_path}")
-                    except Exception as e:
-                        log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {loop_cache_output_path}: {e}")
+                loop_cache_output_path = _remove_loop_temp_output_path(loop_cache_output_path)
                 _scail2_restore_rope_state()
 
         # Main sampling loop with FreeInit iterations

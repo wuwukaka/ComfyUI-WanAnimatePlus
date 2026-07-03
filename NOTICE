@@ -57,9 +57,10 @@ The wuwukasi/wuwukaka additions include, without limitation:
 - EverAnimate embeds support, anchor selection and padding, pose/face/bg/mask
   conditioning, ping-pong sequence handling, and related sampling safeguards.
 - Sampler/model changes for WanAnimatePlus context windows, prefix handling,
-  looping continuation, cache handling, graph-detach/inference tensor
-  safeguards, T2V/Bernini fast path optimizations, and fast-path cache-key
-  helpers.
+  looping continuation, SCAIL-2 loop output tensor caching/background saves,
+  cache handling, graph-detach/inference tensor safeguards, T2V/Bernini fast
+  path optimizations, fast-path cache-key helpers, and main-path cross-attention
+  attention-mode propagation.
 - Custom linear operation registration safeguards and WanAnimatePlus-specific
   custom op handling.
 - ComfyUI native quantized linear loading support for NVFP4/FP8 checkpoints,
