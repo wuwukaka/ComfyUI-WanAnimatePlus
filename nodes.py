@@ -8,6 +8,7 @@
 #   - Added WanAnimatePlusEverAnimateEmbeds with anchors, pose/face, bg/mask, pingpong, random/user-first anchors, repeat-anchor padding, and offload controls.
 #   - Added WanAnimatePlusBernini with context_latents/context_roles for source video, reference video, and reference images.
 #   - Added WanAnimatePlusSCAIL2Embeds for wrapper-native SCAIL-2 ref/pose/mask conditioning and prefix/transition freeze latents.
+#   - Adjusted SCAIL-2 bg_image ordering so it is the final reference/prefix input.
 #   - Added Bernini task guidance recommendations and native-aspect reference resizing.
 #   - Added WanAnimatePlus signature widget to the embeds node.
 # Licensed under the Apache License, Version 2.0
@@ -1734,7 +1735,7 @@ class WanAnimatePlusSCAIL2Embeds:
             "optional": {
                 "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
                 "ref_image": ("IMAGE", {"tooltip": "Reference image for SCAIL conditioning. If a sequence is connected, only the first frame is used."}),
-                "bg_image": ("IMAGE", {"tooltip": "Optional single background image for animation mode. Prepended before prefix_frames with an internal white mask and ignored in replacement mode."}),
+                "bg_image": ("IMAGE", {"tooltip": "Optional single background image for animation mode. In single-frame prefix mode it is encoded as the final reference; in legacy prefix mode it is placed after prefix_frames. Ignored in replacement mode."}),
                 "pose_images": ("IMAGE", {"tooltip": "Driving pose video. Encoded at half resolution for SCAIL."}),
                 "prefix_frames": ("IMAGE", {"tooltip": "Optional prefix images. In single-frame prefix mode these are encoded as reference latents; in legacy mode they hard-freeze the beginning of the canvas."}),
                 "prefix_mask": ("IMAGE", {"tooltip": "Optional colored mask images matching prefix_frames. In single-frame prefix mode this follows the reference-mask path; in legacy canvas-prefix mode it is expanded as 1+4+4... and written into the prefix mask frames."}),
@@ -2039,12 +2040,29 @@ class WanAnimatePlusSCAIL2Embeds:
         prefix_mask_for_prefix = user_prefix_mask
         if bg_prefix_active:
             if single_frame_prefix_encoding:
+                if user_prefix_mask is not None:
+                    if user_prefix_mask.shape[0] < user_prefix_count:
+                        empty_user_masks = torch.zeros(
+                            user_prefix_count - user_prefix_mask.shape[0],
+                            user_prefix_mask.shape[1], user_prefix_mask.shape[2], 3,
+                            device=user_prefix_mask.device, dtype=user_prefix_mask.dtype,
+                        )
+                        user_prefix_mask = torch.cat([user_prefix_mask, empty_user_masks], dim=0)
+                    elif user_prefix_mask.shape[0] > user_prefix_count:
+                        user_prefix_mask = user_prefix_mask[:user_prefix_count]
+                    prefix_mask_for_prefix = user_prefix_mask
+                elif user_prefix_count > 0:
+                    prefix_mask_for_prefix = torch.zeros(
+                        user_prefix_count, bg_mask.shape[1], bg_mask.shape[2], 3,
+                        device=bg_mask.device, dtype=bg_mask.dtype,
+                    )
+                else:
+                    prefix_mask_for_prefix = None
+            else:
                 if user_prefix_frames is not None:
                     prefix_frames = torch.cat([user_prefix_frames, bg_prefix_image], dim=0)
-                    bg_prefix_mask_index = prefix_frames.shape[0] - 1
                 else:
                     prefix_frames = bg_prefix_image
-                    bg_prefix_mask_index = 0
                 if user_prefix_mask is not None:
                     if user_prefix_mask.shape[0] < user_prefix_count:
                         empty_user_masks = torch.zeros(
@@ -2064,17 +2082,8 @@ class WanAnimatePlusSCAIL2Embeds:
                     prefix_mask_for_prefix = torch.cat([empty_user_masks, bg_mask], dim=0)
                 else:
                     prefix_mask_for_prefix = bg_mask
-            else:
-                if user_prefix_frames is not None:
-                    prefix_frames = torch.cat([bg_prefix_image, user_prefix_frames], dim=0)
-                else:
-                    prefix_frames = bg_prefix_image
-                if user_prefix_mask is not None:
-                    prefix_mask_for_prefix = torch.cat([bg_mask, user_prefix_mask], dim=0)
-                else:
-                    prefix_mask_for_prefix = bg_mask
-                bg_prefix_mask_pixel_frames = 1
-                bg_prefix_mask_index = 0
+                bg_prefix_mask_pixel_frames = 1 if user_prefix_count == 0 else 4
+                bg_prefix_mask_index = prefix_frames.shape[0] - 1
 
         canvas_expansion_px = 0
         freeze_canvas = None
@@ -2205,6 +2214,14 @@ class WanAnimatePlusSCAIL2Embeds:
                 ref_masks.append(self._empty_ref_mask_like(ref_latent))
             log.info(f"SCAIL-2 reference latent shape: {ref_latent.shape}")
 
+        if bg_prefix_active and single_frame_prefix_encoding:
+            bg_ref_latent = self._encode_scail_20ch(vae, bg_prefix_image, W, H, tiled_vae, scale=ref_strength).to(offload_device)
+            ref_latents.append(bg_ref_latent)
+            bg_ref_mask = self._resize_bhwc(bg_mask, W, H, mode="bicubic")
+            ref_masks.append(self._extract_mask_to_28ch(bg_ref_mask).to(offload_device, vae.dtype))
+            ref_mask_condition_used = True
+            log.info(f"SCAIL-2 bg reference latent shape: {bg_ref_latent.shape}")
+
         if ref_latents:
             ref_latent = torch.cat(ref_latents, dim=1)
             scail_embeds["ref_latent_pos"] = ref_latent
@@ -2299,13 +2316,14 @@ class WanAnimatePlusSCAIL2Embeds:
             if prefix_mask_in.shape[1] != pose_image_mask.shape[1] or prefix_mask_in.shape[2] != pose_image_mask.shape[2]:
                 prefix_mask_in = self._resize_bhwc(prefix_mask_in, pose_image_mask.shape[2], pose_image_mask.shape[1], mode="nearest-exact")
             bg_keep = min(bg_prefix_mask_pixel_frames, prefix_mask_in.shape[0])
-            if prefix_mask_in.shape[0] > bg_keep:
+            user_prefix_end = prefix_mask_in.shape[0] - bg_keep
+            if user_prefix_end > 0:
                 user_prefix_mask_in = self._normalize_mask_background(
-                    prefix_mask_in[bg_keep:],
+                    prefix_mask_in[:user_prefix_end],
                     white_background=not replacement_mode and not prefix_alpha_crop,
                 )
                 if bg_keep > 0:
-                    prefix_mask_in = torch.cat([prefix_mask_in[:bg_keep], user_prefix_mask_in], dim=0)
+                    prefix_mask_in = torch.cat([user_prefix_mask_in, prefix_mask_in[user_prefix_end:]], dim=0)
                 else:
                     prefix_mask_in = user_prefix_mask_in
             pose_image_mask = pose_image_mask.clone()
