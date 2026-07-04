@@ -2,7 +2,7 @@
 # Modified from nodes.py in ComfyUI-WanVideoWrapper.
 # Original project: https://github.com/kijai/ComfyUI-WanVideoWrapper
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
-#   - Added prefix_frames support and reversed-prefix sampling for WanVideoAnimateEmbeds.
+#   - Added prefix_frames support, reversed-prefix sampling, and single-frame prefix reference encoding for WanVideoAnimateEmbeds.
 #   - Added transition_video, transition/outfit layouts, and canvas_expansion_px output trimming.
 #   - Added prefix/transition metadata for sampler-side context-window and looping continuation.
 #   - Added WanAnimatePlusEverAnimateEmbeds with anchors, pose/face, bg/mask, pingpong, random/user-first anchors, repeat-anchor padding, and offload controls.
@@ -1318,6 +1318,7 @@ class WanVideoAnimateEmbeds:
                 "prefix_frames": ("IMAGE", {"default": None, "tooltip": "Up to 5 prefix images. Image 0 is used once; images 1-4 are repeated 4 times each, for a max 17-frame prefix."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
                 "transition mode": ("BOOLEAN", {"default": True, "label_on": "Transition mode", "label_off": "Outfit mode", "tooltip": "Transition mode: 37-frame layout (17 prefix + 20 transition). Outfit mode: 45-frame layout (17 prefix + 8 reserve + 20 transition)."}),
+                "single_frame_prefix_encoding": ("BOOLEAN", {"default": False, "tooltip": "Encode prefix images as individual reference latents instead of expanding the beginning of the canvas."}),
                 "Prefix & Transition Video by wuwukasi(bilibili)": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON"}),
             }
         }
@@ -1329,7 +1330,7 @@ class WanVideoAnimateEmbeds:
 
     def process(self, vae, width, height, num_frames, force_offload, frame_window_size, colormatch, pose_strength, face_strength,
                 ref_images=None, pose_images=None, face_images=None, clip_embeds=None, tiled_vae=False, bg_images=None, mask=None, start_ref_image=None,
-                transition_video=None, prefix_frames=None, **kwargs):
+                transition_video=None, prefix_frames=None, single_frame_prefix_encoding=False, **kwargs):
         
         W = (width // 16) * 16
         H = (height // 16) * 16
@@ -1337,14 +1338,21 @@ class WanVideoAnimateEmbeds:
         lat_h = H // vae.upsampling_factor
         lat_w = W // vae.upsampling_factor
 
-        num_refs = ref_images.shape[0] if ref_images is not None else 0
+        wananim_single_frame_prefix = prefix_frames is not None and bool(single_frame_prefix_encoding)
+        legacy_prefix_active = prefix_frames is not None and not wananim_single_frame_prefix
+        if wananim_single_frame_prefix and ref_images is None:
+            raise ValueError("single_frame_prefix_encoding requires ref_images; the main reference is taken from the last ref image.")
+        prefix_ref_count = min(prefix_frames.shape[0], 5) if wananim_single_frame_prefix else 0
+        if wananim_single_frame_prefix and prefix_frames.shape[0] > 5:
+            log.warning(f"Prefix has {prefix_frames.shape[0]} images, max 5. Truncating.")
+        num_refs = prefix_ref_count + 1 if wananim_single_frame_prefix else (ref_images.shape[0] if ref_images is not None else 0)
         num_frames = ((num_frames - 1) // 4) * 4 + 1
         transition_mode = kwargs.get("transition mode", True)
         prefix_canvas_extra = 37 if transition_mode else 45
         prefix_transition_start = 17 if transition_mode else 25
         prefix_transition_end = prefix_canvas_extra
 
-        if transition_video is not None and prefix_frames is None:
+        if transition_video is not None and not legacy_prefix_active:
 
             # --- [Core Mod] Reserve space for insertion logic and shift subsequent actions ---
             # 1. Expand canvas: Add space for 21 pixel frames (corresponding to 6 Latent frames).
@@ -1370,7 +1378,7 @@ class WanVideoAnimateEmbeds:
             if start_ref_image is not None:
                 log.warning("Both transition_video and start_ref_image provided. Using transition_video only (loop disabled).")
         # ============ Prefix frames: expand canvas and shift control signals ============
-        if prefix_frames is not None:
+        if legacy_prefix_active:
             # Expand canvas: transition mode 37 = 17 prefix + 20 transition; outfit mode 45 = 17 prefix + 8 reserve + 20 transition
             extra = prefix_canvas_extra
             num_frames += extra
@@ -1394,7 +1402,7 @@ class WanVideoAnimateEmbeds:
                 mask = torch.cat([sampled, mask], dim=0)
         # -----------------------------------------------------------------
 
-        if prefix_frames is not None:
+        if legacy_prefix_active:
             effective_frames = num_frames - prefix_canvas_extra
         elif transition_video is not None:
             effective_frames = num_frames - 21
@@ -1409,7 +1417,8 @@ class WanVideoAnimateEmbeds:
         latent_window_size = ((frame_window_size - 1) // 4)
 
         if not looping:
-            num_frames = num_frames + num_refs * 4
+            if not wananim_single_frame_prefix:
+                num_frames = num_frames + num_refs * 4
             # latent_window_size must cover the full bg latent range (including prefix/transition expansion),
             # otherwise context windows that reach past the original frame count will clamp pose indices
             latent_window_size = target_shape[1] - num_refs
@@ -1451,7 +1460,7 @@ class WanVideoAnimateEmbeds:
 
         actual_prefix_px = 0
         prefix_pixel_data = None  # holds [C, actual_prefix_px, H, W] normalized pixel data for reuse
-        if prefix_frames is not None:
+        if legacy_prefix_active:
             pf = prefix_frames
             b_pf, h_pf, w_pf, c_pf = pf.shape
             log.info(f"Prefix frames input: {b_pf} frames, {h_pf}x{w_pf}")
@@ -1471,7 +1480,8 @@ class WanVideoAnimateEmbeds:
 
         if not looping:
             if bg_images is None:
-                resized_bg_images = torch.zeros(3, num_frames - num_refs, H, W, device=device, dtype=vae.dtype)
+                bg_frame_count = num_frames if wananim_single_frame_prefix else num_frames - num_refs
+                resized_bg_images = torch.zeros(3, bg_frame_count, H, W, device=device, dtype=vae.dtype)
 
             # ============ Prefix: replace first N pixel frames of canvas ============
             if prefix_pixel_data is not None:
@@ -1493,7 +1503,7 @@ class WanVideoAnimateEmbeds:
             # ==========================================================================
 
             # ============ Transition (no prefix): embed into canvas first 21 frames ============
-            if transition_video is not None and prefix_frames is None:
+            if transition_video is not None and not legacy_prefix_active:
                 tv = transition_video  # [B, H, W, C]
                 b_tv = tv.shape[0]
                 if b_tv >= 21:
@@ -1513,11 +1523,12 @@ class WanVideoAnimateEmbeds:
             resized_bg_images = resized_bg_images.to(offload_device, dtype=vae.dtype)
         elif transition_video is not None or prefix_frames is not None:
             # Looping mode: create canvas (transition and/or prefix handled separately via prefix_ctx)
-            resized_bg_images = torch.zeros(3, num_frames - num_refs, H, W, device=offload_device, dtype=vae.dtype)
+            bg_frame_count = num_frames if wananim_single_frame_prefix else num_frames - num_refs
+            resized_bg_images = torch.zeros(3, bg_frame_count, H, W, device=offload_device, dtype=vae.dtype)
             if transition_video is not None:
                 tv = transition_video  # [B, H, W, C]
                 b_tv = tv.shape[0]
-                if prefix_frames is not None:
+                if legacy_prefix_active:
                     if b_tv >= 20:
                         tv = tv[-20:]
                     else:
@@ -1542,21 +1553,54 @@ class WanVideoAnimateEmbeds:
         prefix_ctx = None
         prefix_T = 0
         bg_mask = None
+        resized_ref_images = None
+        wananim_static_ref_latents = 0
+        wananim_main_ref_index = 0
 
         if ref_images is not None:
-            if ref_images.shape[1] != H or ref_images.shape[2] != W:
-                resized_ref_images = common_upscale(ref_images.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
-            else:
-                resized_ref_images = ref_images.permute(3, 0, 1, 2) # C, T, H, W
-            resized_ref_images = resized_ref_images[:3] * 2 - 1
+            def _prepare_ref_frame(frame_bhwc):
+                frame_bhwc = frame_bhwc[:, :, :, :3]
+                if frame_bhwc.shape[1] != H or frame_bhwc.shape[2] != W:
+                    resized = common_upscale(frame_bhwc.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
+                else:
+                    resized = frame_bhwc.permute(3, 0, 1, 2)
+                return resized[:3] * 2 - 1
 
-            ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
-            msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
-            msk[:, :num_refs] = 1
-            ref_latent_masked = torch.cat([msk, ref_latent], dim=0).to(offload_device) # 4+C 1 H W
+            if wananim_single_frame_prefix:
+                if ref_images.shape[0] > 1:
+                    log.warning("single_frame_prefix_encoding uses the last ref_images frame as the main reference.")
+                ref_latent_parts = []
+                prefix_ref_images = prefix_frames[:prefix_ref_count, :, :, :3]
+                for i in range(prefix_ref_count):
+                    prefix_pixels = _prepare_ref_frame(prefix_ref_images[i:i + 1])
+                    prefix_latent = vae.encode([prefix_pixels.to(device, vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device)
+                    ref_latent_parts.append(prefix_latent)
+                main_ref_pixels = _prepare_ref_frame(ref_images[-1:])
+                main_ref_latent = vae.encode([main_ref_pixels.to(device, vae.dtype)], device, tiled=tiled_vae)[0].to(offload_device)
+                ref_latent_parts.append(main_ref_latent)
+                ref_latent = torch.cat(ref_latent_parts, dim=1)
+                ref_latent_for_output = ref_latent
+                resized_ref_images = main_ref_pixels
+                msk = torch.ones(4, ref_latent.shape[1], lat_h, lat_w, device=offload_device, dtype=vae.dtype)
+                ref_latent_masked = torch.cat([msk, ref_latent_for_output], dim=0).to(offload_device)
+                wananim_static_ref_latents = ref_latent.shape[1]
+                wananim_main_ref_index = wananim_static_ref_latents - 1
+                log.info(f"WanAnimate single-frame prefix references: {prefix_ref_count} prefix + 1 main = {wananim_static_ref_latents} latents")
+                del ref_latent_parts
+            else:
+                if ref_images.shape[1] != H or ref_images.shape[2] != W:
+                    resized_ref_images = common_upscale(ref_images.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(0, 1)
+                else:
+                    resized_ref_images = ref_images.permute(3, 0, 1, 2) # C, T, H, W
+                resized_ref_images = resized_ref_images[:3] * 2 - 1
+
+                ref_latent = vae.encode([resized_ref_images.to(device, vae.dtype)], device,tiled=tiled_vae)[0]
+                msk = torch.zeros(4, 1, lat_h, lat_w, device=device, dtype=vae.dtype)
+                msk[:, :num_refs] = 1
+                ref_latent_masked = torch.cat([msk, ref_latent], dim=0).to(offload_device) # 4+C 1 H W
 
             # ============ Prefix: VAE encode for looping (prepended to each chunk like ref) ============
-            if prefix_frames is not None and looping:
+            if legacy_prefix_active and looping:
                 vae.to(device)
                 prefix_latent = vae.encode([prefix_pixel_data.to(device, vae.dtype)], device, tiled=tiled_vae)[0]
                 prefix_T = prefix_latent.shape[1]
@@ -1578,7 +1622,7 @@ class WanVideoAnimateEmbeds:
                 bg_mask = bg_mask.unsqueeze(-1).permute(3, 0, 1, 2).to(offload_device, vae.dtype) # C, T, H, W
 
             # ============ Prefix: set mask=1 for actual prefix frames and optionally transition ============
-            if prefix_frames is not None:
+            if legacy_prefix_active:
                 bg_mask[:, :actual_prefix_px] = 1.0  # only actual prefix pixel frames
                 if transition_video is not None:
                     bg_mask[:, prefix_transition_start:prefix_transition_end] = 1.0
@@ -1587,7 +1631,7 @@ class WanVideoAnimateEmbeds:
                 bg_mask[:, :21] = 1.0
             # ======================================================================================
 
-            if bg_images is None and looping:
+            if bg_images is None and looping and not wananim_single_frame_prefix:
                 bg_mask[:, :num_refs] = 1
             bg_mask_mask_repeated = torch.repeat_interleave(bg_mask[:, 0:1], repeats=4, dim=1) # T, C, H, W
             bg_mask = torch.cat([bg_mask_mask_repeated, bg_mask[:, 1:]], dim=1)
@@ -1690,18 +1734,18 @@ class WanVideoAnimateEmbeds:
             "pose_latents": pose_latents,
             "pose_images": resized_pose_images if pose_images is not None and looping else None,
             "bg_images": resized_bg_images if (bg_images is not None or transition_video is not None or prefix_frames is not None) and looping else None,
-            "ref_masks": bg_mask if (mask is not None or prefix_frames is not None) and looping else None,
+            "ref_masks": bg_mask if (mask is not None or legacy_prefix_active or transition_video is not None) and looping else None,
             "is_masked": mask is not None,
             "ref_latent": ref_latent,
             "ref_image": resized_ref_images if ref_images is not None else None,
             "start_ref_image": resized_start_ref_image if start_ref_image is not None else None,
             "transition_latent": transition_latent,
             "transition_mask_values": transition_mask_values,
-            "has_prefix": prefix_frames is not None,
-            "canvas_expansion_px": prefix_canvas_extra if prefix_frames is not None else (21 if transition_video is not None else 0),
+            "has_prefix": legacy_prefix_active,
+            "canvas_expansion_px": prefix_canvas_extra if legacy_prefix_active else (21 if transition_video is not None else 0),
             "prefix_ctx": prefix_ctx,
             "prefix_T": prefix_T,
-            "prefix_prepend_latents": 6 if prefix_frames is not None else 0,
+            "prefix_prepend_latents": 6 if legacy_prefix_active else 0,
             "face_pixels": resized_face_images if face_images is not None else None,
             "num_frames": num_frames,
             "target_shape": target_shape,
@@ -1714,6 +1758,14 @@ class WanVideoAnimateEmbeds:
             "pose_strength": pose_strength,
             "face_strength": face_strength,
         }
+        if wananim_single_frame_prefix:
+            image_embeds.update({
+                "wananim_single_frame_prefix_encoding": True,
+                "wananim_static_ref_latents": wananim_static_ref_latents,
+                "wananim_main_ref_index": wananim_main_ref_index,
+                "wananim_decode_ref_latents": wananim_static_ref_latents,
+                "wananim_num_anchor_latents": wananim_static_ref_latents,
+            })
 
         return (image_embeds,)
 
@@ -3395,6 +3447,8 @@ class WanVideoDecode:
         end_image = samples.get("end_image", None)
         has_ref = samples.get("has_ref", False)
         has_prefix = samples.get("has_prefix", False)
+        ref_skip_value = samples.get("wananim_decode_ref_latents", None)
+        ref_skip = int(ref_skip_value if ref_skip_value is not None else (1 if has_ref else 0))
         canvas_expansion_px = samples.get("canvas_expansion_px", 0)
         output_frame_count = samples.get("output_frame_count", None)
         drop_last = samples.get("drop_last", False)
@@ -3408,8 +3462,8 @@ class WanVideoDecode:
 
         mm.soft_empty_cache()
 
-        if has_ref:
-            latents = latents[:, :, 1:]
+        if ref_skip > 0:
+            latents = latents[:, :, ref_skip:]
         if drop_last:
             latents = latents[:, :, :-1]
 
