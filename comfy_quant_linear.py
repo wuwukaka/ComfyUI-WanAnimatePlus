@@ -60,6 +60,11 @@ except Exception as e:
                 "storage_t": torch.float8_e4m3fn,
                 "comfy_tensor_layout": "TensorCoreMXFP8Layout",
             },
+            "int8_tensorwise": {
+                "storage_t": torch.int8,
+                "comfy_tensor_layout": "TensorWiseINT8Layout",
+                "quantize_input": False,
+            },
         }
         _COMFY_QUANT_BACKEND = "comfy_kitchen.tensor"
     except Exception as kitchen_e:
@@ -251,6 +256,22 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
             scale = scale.view(dtype=torch.float8_e8m0fnu)
         params = layout.Params(
             scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=(out_features, in_features),
+        )
+        tensor_scale = scale
+        block_scale = None
+    elif fmt == "int8_tensorwise":
+        scale = sd[prefix + "weight_scale"].to(device=device)
+        scales = {"scale": scale}
+        # convrot 参数从 comfy_quant JSON 中透传给 TensorWiseINT8Layout.Params
+        if prefix + "comfy_quant" in sd:
+            layer_conf = _decode_comfy_quant(sd[prefix + "comfy_quant"])
+            if layer_conf.get("convrot", False):
+                scales["convrot"] = True
+                scales["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", 256))
+        params = layout.Params(
+            **scales,
             orig_dtype=compute_dtype,
             orig_shape=(out_features, in_features),
         )
@@ -564,6 +585,16 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
             if scale is None:
                 raise RuntimeError(f"{fmt} fallback dequantization requires weight_scale")
             weight = ck_local.dequantize_per_tensor_fp8(weight.to(device=scale.device), scale, compute_dtype)
+        elif fmt == "int8_tensorwise":
+            if scale is None:
+                raise RuntimeError("int8_tensorwise fallback dequantization requires weight_scale")
+            if hasattr(ck_local, "dequantize_per_tensor_int8"):
+                weight = ck_local.dequantize_per_tensor_int8(
+                    weight.to(device=scale.device, dtype=torch.int8), scale, compute_dtype
+                )
+            else:
+                # 手动反量化：int8 * scale → compute_dtype
+                weight = weight.to(device=scale.device, dtype=compute_dtype) * scale.to(dtype=compute_dtype)
         else:
             raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
 
@@ -597,6 +628,14 @@ def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, bloc
             raise RuntimeError("MXFP8 QuantizedTensor rebuild requires weight_scale")
         if hasattr(torch, "float8_e8m0fnu"):
             scale = scale.view(dtype=torch.float8_e8m0fnu)
+        params = layout.Params(
+            scale=scale,
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(logical_shape),
+        )
+    elif fmt == "int8_tensorwise":
+        if scale is None:
+            raise RuntimeError("int8_tensorwise QuantizedTensor rebuild requires weight_scale")
         params = layout.Params(
             scale=scale,
             orig_dtype=compute_dtype,
