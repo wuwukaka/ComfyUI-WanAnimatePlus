@@ -264,7 +264,7 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
     elif fmt == "int8_tensorwise":
         scale = sd[prefix + "weight_scale"].to(device=device)
         scales = {"scale": scale}
-        # convrot 参数从 comfy_quant JSON 中透传给 TensorWiseINT8Layout.Params
+        # Pass convrot params from comfy_quant JSON to TensorWiseINT8Layout.Params
         if prefix + "comfy_quant" in sd:
             layer_conf = _decode_comfy_quant(sd[prefix + "comfy_quant"])
             if layer_conf.get("convrot", False):
@@ -593,7 +593,7 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
                     weight.to(device=scale.device, dtype=torch.int8), scale, compute_dtype
                 )
             else:
-                # 手动反量化：int8 * scale → compute_dtype
+                # Manual dequant: int8 * float32 scale → compute_dtype
                 weight = weight.to(device=scale.device, dtype=compute_dtype) * scale.to(dtype=compute_dtype)
         else:
             raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
