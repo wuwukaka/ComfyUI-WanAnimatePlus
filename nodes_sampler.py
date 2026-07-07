@@ -12,6 +12,7 @@
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 #   - Added SCAIL-2 loop output tensor caching, background cache saves, and tail-frame anchor encoding.
+#   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy, shutil
 import torch
@@ -21,6 +22,7 @@ import inspect
 import folder_paths
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
+from .scail2_colormatch import safe_color_match_video_bhwc
 from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
 from .comfy_quant_linear import is_comfy_quant_state_dict, rebind_comfy_quant_metadata
@@ -3036,43 +3038,31 @@ class WanVideoSampler:
                     ref = ref.clamp(0.0, 1.0)
                 return ref.contiguous().numpy()
 
-            def _color_match_video_frames(video_cthw, ref_frame):
-                if video_cthw is None or video_cthw.shape[1] == 0:
+            def _color_match_video_frames(video_cthw, ref_frame, chunk_index=None):
+                if video_cthw is None:
+                    safe_color_match_video_bhwc(None, None, scail2_transition_colormatch, "loop_chunk", logger=log, chunk_index=chunk_index)
                     return video_cthw
                 ref_np = _color_match_ref_to_numpy(ref_frame)
-                if ref_np is None:
+                if video_cthw.shape[1] == 0:
+                    safe_color_match_video_bhwc(
+                        np.empty((0, 0, 0, 3), dtype=np.float32),
+                        ref_np,
+                        scail2_transition_colormatch,
+                        "loop_chunk",
+                        logger=log,
+                        chunk_index=chunk_index,
+                    )
                     return video_cthw
-                from color_matcher import ColorMatcher
-                cm = ColorMatcher()
                 video_bhwc = video_cthw.float().clamp(-1.0, 1.0).permute(1, 2, 3, 0).add(1.0).div(2.0)
-                matched = []
-                warned_error = False
-                warned_shape = False
-                warned_nonfinite = False
-                for frame in video_bhwc:
-                    frame_np = frame.detach().cpu().contiguous().numpy()
-                    try:
-                        out = np.asarray(cm.transfer(src=frame_np, ref=ref_np, method=scail2_transition_colormatch), dtype=np.float32)
-                    except Exception as e:
-                        if not warned_error:
-                            log.warning(f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} failed; keeping original frame: {e}")
-                            warned_error = True
-                        out = frame_np
-                    if out.shape != frame_np.shape:
-                        if not warned_shape:
-                            log.warning(
-                                f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} returned shape {out.shape}, "
-                                f"expected {frame_np.shape}; keeping original frame"
-                            )
-                            warned_shape = True
-                        out = frame_np
-                    elif not np.isfinite(out).all():
-                        if not warned_nonfinite:
-                            log.warning(f"SCAIL-2 colormatch method {scail2_transition_colormatch!r} returned non-finite values; keeping finite pixels only")
-                            warned_nonfinite = True
-                        out = np.where(np.isfinite(out), out, frame_np)
-                    matched.append(torch.from_numpy(out).to(device=video_cthw.device, dtype=torch.float32))
-                return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
+                matched = safe_color_match_video_bhwc(
+                    video_bhwc.detach().cpu().contiguous().numpy(),
+                    ref_np,
+                    scail2_transition_colormatch,
+                    "loop_chunk",
+                    logger=log,
+                    chunk_index=chunk_index,
+                )
+                return torch.from_numpy(matched).to(device=video_cthw.device, dtype=torch.float32).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
 
             def _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame):
                 if scail2_transition_colormatch == "disabled":
@@ -3557,7 +3547,7 @@ class WanVideoSampler:
                     if output_chunk.shape[1] > 0:
                         match_ref = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
                         if match_ref is not None:
-                            output_chunk = _color_match_video_frames(output_chunk, match_ref)
+                            output_chunk = _color_match_video_frames(output_chunk, match_ref, chunk_index=chunk_idx)
 
                         last_matched_ref_frame = (
                             output_chunk[:, -1:]
