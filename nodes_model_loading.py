@@ -26,6 +26,7 @@ from .comfy_quant_linear import (
     is_comfy_quant_state_dict,
     is_nvfp4_comfy_quant_prefix,
     is_nvfp4_comfy_quant_state_dict,
+    is_native_quant_prefix,
     is_native_quant_weight_key,
 )
 
@@ -932,9 +933,9 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
         log.info("Loading and assigning model weights to device...")
         if comfy_quant:
             comfy_quant_device_resolver = None
-            if nvfp4_comfy_quant and block_swap_args is not None:
+            if comfy_quant and block_swap_args is not None:
                 def comfy_quant_device_resolver(prefix):
-                    if is_nvfp4_comfy_quant_prefix(sd, prefix):
+                    if is_native_quant_prefix(sd, prefix):
                         return _resolve_block_swap_load_device(
                             prefix, transformer, block_swap_args, transformer_load_device
                         )
@@ -955,7 +956,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             desc=f"Loading transformer parameters to {transformer_load_device}",
             total=param_count,
             leave=True):
-        if not nvfp4_comfy_quant:
+        if not comfy_quant:
             block_idx = vace_block_idx = None
             if name.startswith("vace_blocks."):
                 try:
@@ -997,7 +998,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             if "modulation" in name or "norm" in name:
                 dtype_to_use = value.dtype if value.dtype == torch.float32 else base_dtype
 
-        if nvfp4_comfy_quant:
+        if comfy_quant:
             load_device = _resolve_block_swap_load_device(name, transformer, block_swap_args, transformer_load_device)
         else:
             load_device = transformer_load_device
