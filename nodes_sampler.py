@@ -3830,6 +3830,43 @@ class WanVideoSampler:
                                 f"expected full length {context_full_length} or target length at least {max(c) + 1 if c else 0}"
                             )
 
+                        def _wananim_face_pixel_frames_to_latents(frame_count):
+                            return (int(frame_count) + 3) // 4
+
+                        def _slice_wananim_face_pixels_for_context(face_pixels, c):
+                            if context_latent_offset <= 0:
+                                start = c[0] * 4
+                                end = c[-1] * 4
+                                frame_indices = torch.arange(start, end, device=face_pixels.device, dtype=torch.long)
+                            else:
+                                if face_pixels.shape[2] <= 0:
+                                    raise ValueError("WanAnimate face pixels must contain at least one frame")
+                                frame_indices = []
+                                for latent_idx in c:
+                                    base = int(latent_idx) * 4
+                                    frame_indices.extend([base, base + 1, base + 2, base + 3])
+                                frame_indices = torch.tensor(frame_indices, device=face_pixels.device, dtype=torch.long)
+
+                            if frame_indices.numel() > 0:
+                                frame_indices = torch.clamp(frame_indices, min=0, max=face_pixels.shape[2] - 1)
+                            return face_pixels.index_select(2, frame_indices)
+
+                        def _slice_wananim_pose_latents_for_context(pose_latents, c):
+                            if context_latent_offset <= 0:
+                                start = c[0]
+                                end = c[-1]
+                                latent_indices = torch.arange(start, end, device=pose_latents.device, dtype=torch.long)
+                                if latent_indices.numel() > 0:
+                                    latent_indices = torch.clamp(latent_indices, min=0, max=pose_latents.shape[2] - 1)
+                                pose_limit = context_frames - 1
+                                return pose_latents.index_select(2, latent_indices)[:, :, :pose_limit]
+
+                            if pose_latents.shape[2] <= 0:
+                                raise ValueError("WanAnimate pose latents must contain at least one latent frame")
+                            latent_indices = torch.as_tensor(c, device=pose_latents.device, dtype=torch.long)
+                            latent_indices = torch.clamp(latent_indices, min=0, max=pose_latents.shape[2] - 1)
+                            return pose_latents.index_select(2, latent_indices)
+
                         for i, c in enumerate(context_queue):
                             window_id = self.window_tracker.get_window_id(c)
                             target_c = [context_latent_offset + ci for ci in c] if context_latent_offset > 0 else c
@@ -4047,18 +4084,13 @@ class WanVideoSampler:
 
                             partial_wananim_face_pixels = partial_wananim_pose_latents = None
                             if wananim_face_pixels is not None and partial_wananim_face_pixels is None:
-                                start = c[0] * 4
-                                end = c[-1] * 4
-                                center_indices = torch.arange(start, end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=wananim_face_pixels.shape[2] - 1)
-                                partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
+                                partial_wananim_face_pixels = _slice_wananim_face_pixels_for_context(
+                                    wananim_face_pixels, c
+                                ).to(device, dtype)
                             if wananim_pose_latents is not None:
-                                start = c[0]
-                                end = c[-1]
-                                center_indices = torch.arange(start, end, 1)
-                                center_indices = torch.clamp(center_indices, min=0, max=wananim_pose_latents.shape[2] - 1)
-                                pose_limit = context_frames - 1
-                                partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :pose_limit].to(device, dtype)
+                                partial_wananim_pose_latents = _slice_wananim_pose_latents_for_context(
+                                    wananim_pose_latents, c
+                                ).to(device, dtype)
 
                             # ============ Prefix: prepend face/pose for cached prefix context ============
                             if has_prefix and c[0] != 0 and prefix_prepend_latents > 0:
@@ -4069,6 +4101,44 @@ class WanVideoSampler:
                                     prefix_pose = wananim_pose_latents[:, :, :prefix_prepend_latents].to(device, dtype)
                                     partial_wananim_pose_latents = torch.cat([prefix_pose, partial_wananim_pose_latents], dim=2)
                             # ================================================================
+
+                            if context_latent_offset > 0 and (
+                                partial_wananim_face_pixels is not None or partial_wananim_pose_latents is not None
+                            ):
+                                anchor_latents = int(wananim_num_anchor_latents)
+                                model_latents = int(partial_latent_model_input.shape[1])
+                                target_latents = model_latents - anchor_latents
+                                if anchor_latents != context_latent_offset or target_latents < 0:
+                                    raise RuntimeError(
+                                        "WanAnimate context anchor mismatch: "
+                                        f"context_latent_offset={context_latent_offset}, "
+                                        f"wananim_num_anchor_latents={anchor_latents}, "
+                                        f"model_latents={model_latents}"
+                                    )
+                                if partial_wananim_face_pixels is not None:
+                                    face_frames = int(partial_wananim_face_pixels.shape[2])
+                                    face_target_latents = _wananim_face_pixel_frames_to_latents(face_frames)
+                                    face_total_latents = anchor_latents + face_target_latents
+                                    if face_total_latents != model_latents:
+                                        raise RuntimeError(
+                                            "WanAnimate face/context latent mismatch: "
+                                            f"context_latent_offset={context_latent_offset}, "
+                                            f"window_latents={len(c)}, model_latents={model_latents}, "
+                                            f"face_pixel_frames={face_frames}, "
+                                            f"face_target_latents={face_target_latents}, "
+                                            f"wananim_num_anchor_latents={anchor_latents}"
+                                        )
+                                if partial_wananim_pose_latents is not None:
+                                    pose_target_latents = int(partial_wananim_pose_latents.shape[2])
+                                    if pose_target_latents != target_latents:
+                                        raise RuntimeError(
+                                            "WanAnimate pose/context latent mismatch: "
+                                            f"context_latent_offset={context_latent_offset}, "
+                                            f"window_latents={len(c)}, model_latents={model_latents}, "
+                                            f"pose_target_latents={pose_target_latents}, "
+                                            f"expected_target_latents={target_latents}, "
+                                            f"wananim_num_anchor_latents={anchor_latents}"
+                                        )
 
                             partial_flashvsr_LQ_latent = None
                             if LQ_images is not None:
