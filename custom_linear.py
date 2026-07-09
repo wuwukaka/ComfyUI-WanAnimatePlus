@@ -18,6 +18,8 @@ from .comfy_quant_linear import (
     dequantize_comfy_quant_weight,
     get_state_dict_weight_shape,
     quantize_raw_comfy_quant_weight,
+    supports_fp8_compute,
+    supports_nvfp4_compute,
 )
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
@@ -642,6 +644,42 @@ class CustomLinear(nn.Linear):
                 sw = sw.repeat_interleave(weight.shape[-1] // sw.shape[0])
         return sw
 
+    def _maybe_quantize_input_for_qqgemm(self, input_2d: torch.Tensor, weight) -> torch.Tensor:
+        """Quantize a 2-D input for Q×Q GEMM when hardware and format support it.
+
+        Caller must ensure input_2d is already reshaped to (M, K).
+        Returns QuantizedTensor on success, original tensor on any failure.
+        """
+        fmt = getattr(self, "_comfy_quant_format", None)
+        if fmt is None:
+            return input_2d
+        try:
+            from .comfy_quant_linear import QuantizedTensor, get_layout_class, QUANT_ALGOS
+        except Exception:
+            return input_2d
+        if QuantizedTensor is None or get_layout_class is None:
+            return input_2d
+        device = input_2d.device
+        if fmt in ("float8_e4m3fn", "float8_e5m2"):
+            if not supports_fp8_compute(device):
+                return input_2d
+        elif fmt == "nvfp4":
+            if not supports_nvfp4_compute(device):
+                return input_2d
+        else:
+            # int8_tensorwise: quantize_input=False by design
+            return input_2d
+        qcfg = QUANT_ALGOS.get(fmt)
+        if qcfg is None:
+            return input_2d
+        layout_name = qcfg.get("comfy_tensor_layout")
+        if layout_name is None:
+            return input_2d
+        try:
+            return QuantizedTensor.from_float(input_2d, layout_name)
+        except Exception:
+            return input_2d
+
     def _check_linear_weight_shape(self, weight, input):
         if weight.shape[-1] == input.shape[-1]:
             return
@@ -680,7 +718,18 @@ class CustomLinear(nn.Linear):
             lora_output_reject_reason = self._native_quant_lora_output_reject_reason(weight, input)
             if lora_output_reject_reason is None:
                 self._check_linear_weight_shape(weight, input)
-                out = self._linear_forward_impl(input, weight, bias)
+                input_shape = input.shape
+                if input.ndim == 3:
+                    # Reshape to 2D for Q×Q GEMM (mirroring ComfyUI-master)
+                    inp_2d = input.reshape(-1, input_shape[2])
+                    q_inp = self._maybe_quantize_input_for_qqgemm(inp_2d, weight)
+                    out = self._linear_forward_impl(q_inp, weight, bias)
+                    del q_inp
+                    out = out.reshape((-1, input_shape[1], weight.shape[0]))
+                else:
+                    q_inp = self._maybe_quantize_input_for_qqgemm(input, weight)
+                    out = self._linear_forward_impl(q_inp, weight, bias)
+                    del q_inp
                 out = self._apply_lora_to_output(input, out)
                 del weight, input, bias
                 return out

@@ -26,11 +26,45 @@ tensor subclass.
 
 import json
 import logging
+import sys
 
 import torch
 import torch.nn as nn
 
 log = logging.getLogger(__name__)
+
+_torch_version = tuple(int(x) for x in torch.__version__.split(".")[:2] if x.isdigit())
+_WINDOWS = sys.platform == "win32"
+
+
+def supports_fp8_compute(device=None) -> bool:
+    """Return True if the device supports hardware-accelerated fp8 matmul (CC>=8.9)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:
+        return False
+    if props.major >= 9:
+        return True
+    if props.major < 8 or props.minor < 9:
+        return False
+    if _torch_version < (2, 3):
+        return False
+    if _WINDOWS and _torch_version < (2, 4):
+        return False
+    return True
+
+
+def supports_nvfp4_compute(device=None) -> bool:
+    """Return True if the device supports hardware-accelerated nvfp4 matmul (Blackwell CC>=10)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:
+        return False
+    return props.major >= 10
 
 _COMFY_QUANT_IMPORT_ERRORS = []
 
