@@ -2,13 +2,14 @@
 # Modified from wanvideo/modules/model.py in ComfyUI-WanVideoWrapper.
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 #   - Added Bernini in-context latent tokens with patch-size padding.
-#   - Added Bernini source_id RoPE rotation matrix helper and context RoPE segments.
-#   - Added context window start/context shape entries to Comfy RoPE generation and cache keys.
+#   - Integrated upstream/Comfy RoPE handling with added Bernini/SCAIL context paths.
+#   - Added context-window metadata threading, local-start handling, and cache-key fixes.
 #   - Added variable WanAnimate anchor count support for pose and face embedding offsets.
 #   - Added a streamlined simple T2V/Bernini fast path with block-swap prefetch support.
 #   - Added simple T2V text/time embedding caches, cache-key helpers, and guarded no-op device moves.
 #   - Added a streamlined SCAIL-2 CFG fast path for the local WanAnimatePlus sampler.
 #   - Added main-path cross-attention attention-mode propagation and target-fusion dispatch fixes.
+#   RoPE math/mechanisms and Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
 import math
 import torch

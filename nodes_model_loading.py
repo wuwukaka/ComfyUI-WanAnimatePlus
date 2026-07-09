@@ -1,11 +1,15 @@
 # Modified from nodes_model_loading.py in ComfyUI-WanVideoWrapper.
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 # This file also includes ComfyUI native quantized loading integration adapted
-# from PR #2029 in this fork's upstream/original project,
+# in part from PR #2029 in this fork's upstream/original project,
 # kijai/ComfyUI-WanVideoWrapper:
 # https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029
 # The upstream PR author's copyright remains with that author and the
 # ComfyUI-WanVideoWrapper contributors.
+# WanAnimatePlus modifications here include package integration, loader
+# safeguards, materialization hooks needed by this fork, block-swap/device
+# routing, and MXFP8/block-wise scale_weight handling that predates the PR
+# integration.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn

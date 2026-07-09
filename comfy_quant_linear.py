@@ -1,27 +1,38 @@
-# Derived from PR #2029 in this fork's upstream/original project,
-# kijai/ComfyUI-WanVideoWrapper:
+# Includes native quant loading code adapted in part from PR #2029 in this
+# fork's upstream/original project, kijai/ComfyUI-WanVideoWrapper:
 # https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029
+# The repository's MXFP8/block-wise scale_weight support predates the PR #2029
+# integration and is a WanAnimatePlus modification.
 #
 # The upstream PR author's copyright remains with that author and the
 # ComfyUI-WanVideoWrapper contributors. Modified portions for WanAnimatePlus
 # integration are Copyright (c) 2026 wuwukasi/wuwukaka.
+# This file does not claim ownership of ComfyUI QuantizedTensor APIs or the
+# upstream PR implementation itself. WanAnimatePlus substantially modified and
+# completed the imported PR code for this fork; MXFP8/block-wise scale_weight,
+# fallback, materialization, and LoRA integration paths are WanAnimatePlus
+# modifications.
 #
 # Modifications in this fork:
 #   - Integrated the loader with the WanAnimatePlus package/module layout.
 #   - Routed WanAnimatePlus CustomLinear quantized layers through direct
 #     forward/LoRA helpers so ComfyUI QuantizedTensor dispatch remains intact.
 #   - Added loader-side guards for LoRA merging and legacy fp8-scaled paths.
+#   - Added MXFP8/block-wise scale_weight handling for the WanAnimatePlus
+#     CustomLinear path.
+#   - Completed/hardened the imported native-quant loading path for this fork's
+#     materialization, fallback, and block-swap behavior.
 #
 # Licensed under the Apache License, Version 2.0.
 
 """Load ComfyUI-native quantized checkpoints in WanAnimatePlus.
 
-ComfyUI native NVFP4/FP8 checkpoints store packed linear weights together with
-``*.comfy_quant`` JSON metadata and scale tensors. Some NVFP4 checkpoints only
-store packed uint8 weights plus scale tensors; this module treats those as native
-quant weights too. It reconstructs weights as ComfyUI ``QuantizedTensor``
-instances so regular ``F.linear`` dispatches to comfy_kitchen kernels through the
-tensor subclass.
+ComfyUI native NVFP4, FP8, and MXFP8 checkpoints store packed linear weights
+together with ``*.comfy_quant`` JSON metadata and scale tensors. Some NVFP4
+checkpoints only store packed uint8 weights plus scale tensors; this module
+treats those as native quant weights too. It reconstructs weights as ComfyUI
+``QuantizedTensor`` instances so regular ``F.linear`` dispatches to
+comfy_kitchen kernels through the tensor subclass.
 """
 
 import json

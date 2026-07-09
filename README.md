@@ -175,10 +175,10 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `vae` | VAE model for encoding |
 | `width` / `height` / `num_frames` | Target dimensions; width and height are aligned to multiples of 32 |
 | `ref_image` | Reference image for SCAIL-2 conditioning |
-| `bg_image` | Optional single background image for animation mode; prepended as the first `prefix_frames` item with an internal white mask and ignored in replacement mode |
+| `bg_image` | Optional single background image for animation mode. In single-frame mode it is encoded as an extra background reference latent; in legacy canvas-prefix mode it is appended after user `prefix_frames`. Ignored in replacement mode |
 | `pose_images` | Driving pose video/images, encoded at half resolution |
 | `pose_image_mask` | Colored per-identity pose mask sequence |
-| `prefix_mask` | Optional colored mask images matching `prefix_frames`; expanded as `1+4+4...` and written into the prefix mask frames before mask latent encoding |
+| `prefix_mask` | Optional colored mask images matching `prefix_frames`; in single-frame mode it follows the reference-mask path, and in legacy canvas-prefix mode it is expanded as `1+4+4...` and written into prefix pixel mask frames |
 | `reference_image_mask` | Colored reference mask image |
 | `replacement_mode` | Enables SCAIL-2 replacement-mode RoPE and reference-mask compositing |
 | `preserve_main_ref_background` | Animation mode only; keeps the main reference image background when enabled, or uses `reference_image_mask` as a black-background alpha crop when disabled. Ignored in replacement mode |
@@ -192,7 +192,7 @@ For short generations, context windows are optional. For long generations or low
 
 For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or trim the output for `prefix_frames`. If `transition_video` is connected, the front canvas expands by 21 pixel frames and those 21 frames are trimmed after decoding. With `single_frame_prefix_encoding` disabled, `prefix_frames` use the legacy 37 front pixel-frame canvas layout, with transition frames placed at frames 17-36 when `transition_video` is also connected.
 
-When `bg_image` is connected in animation mode, it consumes the first prefix slot and is handled as the first prefix image. The node internally adds a white mask for that background image only; user-provided `prefix_frames` and `prefix_mask` are then limited to four images each. In replacement mode, `bg_image` is ignored.
+When `bg_image` is connected in animation mode, the node internally adds a white mask for that background image. User-provided `prefix_frames` and `prefix_mask` are limited to four images each so the background can occupy the remaining reference/prefix capacity. In replacement mode, `bg_image` is ignored.
 
 ## Project Structure
 
@@ -258,6 +258,8 @@ Every contribution, no matter how small, means a lot and helps me dedicate more 
 
 This project is an independently maintained fork / derivative project based on [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) and is released under the **Apache License, Version 2.0**. Thanks again to kijai and the original contributors for their work.
 
-Modified portions and newly added code are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
+Modified portions and newly added source expression by wuwukasi/wuwukaka are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
 
-The wuwukasi/wuwukaka additions include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini in-context conditioning, SCAIL-2 embeds support including prefix-mask handling, sampler freeze/prepend integration, loop output tensor caching/background saves, EverAnimate embeds support, sampler/context-window changes, cache/inference safeguards, fast-path attention dispatch propagation, and related custom-op handling.
+The wuwukasi/wuwukaka additions/modifications include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini/SCAIL-2/EverAnimate node and sampler integration, context metadata threading, context-window strategy changes, cache-key correctness fixes, cache/inference safeguards, fast-path/cache helper logic, custom-op namespace/registration safeguards, and CustomLinear MXFP8/block-wise `scale_weight` handling.
+
+Scope note: the base Wan model code, original ComfyUI-WanVideoWrapper code, original Alibaba Wan code, ComfyUI/Comfy RoPE implementations, RoPE mathematics/mechanisms themselves, and implementations synced or adapted from upstream projects or third-party PRs are not claimed as original wuwukasi/wuwukaka code. For native quantization, `CustomLinear` MXFP8/block-wise `scale_weight` handling is a WanAnimatePlus modification; upstream PR code remains upstream work. See [NOTICE](NOTICE) for details.

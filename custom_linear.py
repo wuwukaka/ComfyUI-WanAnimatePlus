@@ -3,10 +3,16 @@
 #   - Renamed custom torch ops from wanvideo::* to wananimateplus::* to avoid collisions.
 #   - Added guarded custom op registration for duplicate imports/stale bytecode.
 #   - Added explicit CUDA implementations for the WanAnimatePlus custom ops.
-#   - Added MXFP8/block-wise scale_weight expansion before linear forward.
-#   - Added ComfyUI native quantized weight passthrough adapted from PR #2029
-#     in this fork's upstream/original project, kijai/ComfyUI-WanVideoWrapper:
+#   - Added MXFP8/block-wise scale_weight expansion before linear forward,
+#     before this fork integrated PR #2029.
+#   - Later integrated ComfyUI native quantized weight passthrough adapted in
+#     part from PR #2029 in this fork's upstream/original project,
+#     kijai/ComfyUI-WanVideoWrapper:
 #     https://github.com/kijai/ComfyUI-WanVideoWrapper/pull/2029
+#     Upstream PR/native-quant logic remains with its original author(s).
+#     WanAnimatePlus changes include the earlier MXFP8/block-wise scale_weight
+#     path plus later completion, fallback, materialization, and LoRA integration
+#     work for this fork.
 # Licensed under the Apache License, Version 2.0
 import torch
 import torch.nn as nn

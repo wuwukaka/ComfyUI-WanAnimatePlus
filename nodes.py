@@ -8,7 +8,7 @@
 #   - Added WanAnimatePlusEverAnimateEmbeds with anchors, pose/face, bg/mask, pingpong, random/user-first anchors, repeat-anchor padding, and offload controls.
 #   - Added WanAnimatePlusBernini with context_latents/context_roles for source video, reference video, and reference images.
 #   - Added WanAnimatePlusSCAIL2Embeds for wrapper-native SCAIL-2 ref/pose/mask conditioning and prefix/transition freeze latents.
-#   - Adjusted SCAIL-2 bg_image ordering so it is the final reference/prefix input.
+#   - Added SCAIL-2 bg_image reference/prefix composition for animation mode.
 #   - Added Bernini task guidance recommendations and native-aspect reference resizing.
 #   - Added WanAnimatePlus signature widget to the embeds node.
 #   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
@@ -1789,7 +1789,7 @@ class WanAnimatePlusSCAIL2Embeds:
             "optional": {
                 "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
                 "ref_image": ("IMAGE", {"tooltip": "Reference image for SCAIL conditioning. If a sequence is connected, only the first frame is used."}),
-                "bg_image": ("IMAGE", {"tooltip": "Optional single background image for animation mode. In single-frame prefix mode it is encoded as the final reference; in legacy prefix mode it is placed after prefix_frames. Ignored in replacement mode."}),
+                "bg_image": ("IMAGE", {"tooltip": "Optional single background image for animation mode. In single-frame prefix mode it is encoded as an extra background reference latent; in legacy prefix mode it is placed after prefix_frames. Ignored in replacement mode."}),
                 "pose_images": ("IMAGE", {"tooltip": "Driving pose video. Encoded at half resolution for SCAIL."}),
                 "prefix_frames": ("IMAGE", {"tooltip": "Optional prefix images. In single-frame prefix mode these are encoded as reference latents; in legacy mode they hard-freeze the beginning of the canvas."}),
                 "prefix_mask": ("IMAGE", {"tooltip": "Optional colored mask images matching prefix_frames. In single-frame prefix mode this follows the reference-mask path; in legacy canvas-prefix mode it is expanded as 1+4+4... and written into the prefix mask frames."}),
