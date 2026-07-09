@@ -72,13 +72,13 @@
 
 通过 `WanAnimatePlus SCAIL_2 Embeds` 提供 SCAIL-2 ref / pose / mask 条件注入。
 
-- 编码 `ref_image`、`pose_images`、`pose_image_mask`、`prefix_mask` 和 `reference_image_mask`
+- 编码 `ref_image`、`pose_images`、`pose_image_mask`、`prefix_frames`、`prefix_mask`、`bg_image` 和 `reference_image_mask`
 - SCAIL-2 输入会在编码前对齐到 32 像素倍数
 - 支持 animation / replacement 两种模式
-- 支持 `prefix_frames` 和 `transition_video` 硬冻结条件
-- SCAIL-2 只有一种 prefix 布局：接入 `prefix_frames` 时前置扩展 37 个像素帧；同时接入 `transition_video` 时 transition 写入第 17-36 帧；只有 `transition_video` 时前置扩展 21 个像素帧
-- `prefix_mask` 会先写入 prefix 对应的像素 mask 帧，再统一编码为 SCAIL-2 mask latent
-- 支持 context window；非首窗口会把 prefix/transition latent prepend 给模型作为上下文，并在 overlap 融合前切掉 prepend 预测
+- 支持单帧 prefix 参考编码和可选的 `transition_video` 硬冻结条件
+- 默认情况下，`prefix_frames` 会作为全分辨率 reference latents 编码，不扩展输出画布；关闭 `single_frame_prefix_encoding` 后才使用 legacy 37 前置像素帧 prefix 布局
+- 单帧 prefix 模式下，`prefix_mask` 走与 `reference_image_mask` 相同的 reference-mask 路径
+- 支持 context window；非首窗口可以看到 prepend 的 prefix/transition 上下文，但这些 prepend 预测不会进入 overlap 融合
 
 ## 安装方式
 
@@ -175,19 +175,24 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 | `vae` | 用于编码的 VAE |
 | `width` / `height` / `num_frames` | 目标尺寸；宽高会对齐到 32 像素倍数 |
 | `ref_image` | SCAIL-2 参考图条件 |
+| `bg_image` | animation 模式下可选的单张背景图；单帧模式下会额外编码为 background reference latent，legacy canvas-prefix 模式下追加到用户 `prefix_frames` 之后；replacement 模式下忽略 |
 | `pose_images` | 驱动 pose 视频/图像，按半分辨率编码 |
 | `pose_image_mask` | colored per-identity pose mask 序列 |
-| `prefix_mask` | 可选，与 `prefix_frames` 对齐的 colored mask 图像；按 `1+4+4...` 展开，并在 mask latent 编码前写入 prefix 对应的像素 mask 帧 |
+| `prefix_mask` | 可选，与 `prefix_frames` 对齐的 colored mask 图像；在单帧 prefix 模式下走 reference-mask 路径，在 legacy canvas-prefix 模式下按 `1+4+4...` 展开并写入 prefix 像素 mask 帧 |
 | `reference_image_mask` | colored reference mask 图像 |
 | `replacement_mode` | 启用 SCAIL-2 replacement-mode RoPE 和 reference-mask 合成 |
-| `prefix_frames` | 可选，硬冻结在 latent 序列前部的 prefix 帧 |
+| `preserve_main_ref_background` | 仅 animation 模式使用；开启时保留主参考图背景，关闭时使用 `reference_image_mask` 做黑底 alpha crop。replacement 模式下忽略 |
+| `single_frame_prefix_encoding` | 将 `prefix_frames` 编码为独立的全分辨率 reference latents，而不是扩展画布；默认开启 |
+| `prefix_frames` | 可选 prefix 图像。默认单帧模式下会成为 reference-stream latents；关闭单帧模式后才硬冻结到前置画布 |
 | `transition_video` | 可选，硬冻结在 latent 序列前部的 transition 帧 |
 | `clip_embeds` | 可选，来自 `WanAnimatePlus ClipVisionEncode` 的 CLIP vision 特征 |
 | `force_offload` / `tiled_vae` | VAE 编码相关显存控制 |
 
-短视频生成时 context window 可选；长视频或低显存场景建议使用 context window。context-window 模式下，采样器会把受保护的 prefix/transition latents prepend 给模型作为上下文，并在 overlap 融合前移除这些 prepend 预测。
+短视频生成时 context window 可选；长视频或低显存场景建议使用 context window。context-window 模式下，单帧 prefix reference 会通过 SCAIL-2 reference stream 保持可见；legacy canvas prefix 和 transition latents 会 prepend 给模型作为上下文，并在 overlap 融合前移除这些 prepend 预测。
 
-SCAIL-2 的 `prefix_frames` 固定使用 37 像素帧前置画布。只有 `transition_video` 时使用 21 像素帧前置画布。普通 AnimateEmbeds 里的 45 帧 outfit 布局不适用于 `WanAnimatePlus SCAIL_2 Embeds`。
+SCAIL-2 默认的 `single_frame_prefix_encoding` 模式不会因为 `prefix_frames` 扩展或裁剪输出。如果连接 `transition_video`，前置画布会扩展 21 个像素帧，解码后裁掉这 21 帧。关闭 `single_frame_prefix_encoding` 后，`prefix_frames` 使用 legacy 37 前置像素帧画布；同时连接 `transition_video` 时，transition 帧放在第 17-36 帧。
+
+animation 模式下连接 `bg_image` 时，节点会为该背景图内部添加白色 mask。用户提供的 `prefix_frames` 和 `prefix_mask` 各自最多保留四张，让背景图占用剩余的 reference/prefix 容量。replacement 模式下 `bg_image` 会被忽略。
 
 ## 项目结构
 
@@ -253,6 +258,8 @@ ComfyUI-WanAnimatePlus/
 
 本项目是基于 [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper) 的独立维护 fork / 衍生项目，并按 **Apache License, Version 2.0** 协议发布。再次感谢 kijai 以及原项目贡献者的工作。
 
-本项目中的修改部分和新增代码 Copyright (c) 2026 wuwukasi/wuwukaka。详细归属和修改说明要求见 [NOTICE](NOTICE)。任何使用或修改 WanAnimatePlus 新增部分的下游项目，应保留相关 copyright / modification notices，并在 README、NOTICE 文件或等效归属说明文档中加入详细修改说明。该说明应标明哪些模块、文件或功能区域来自 wuwukasi/wuwukaka，并描述下游对这些部分做了哪些修改。
+本项目中的 wuwukasi/wuwukaka 修改部分和新增源码表达 Copyright (c) 2026 wuwukasi/wuwukaka。详细归属和修改说明要求见 [NOTICE](NOTICE)。任何使用或修改 WanAnimatePlus 新增/修改部分的下游项目，应保留相关 copyright / modification notices，并在 README、NOTICE 文件或等效归属说明文档中加入详细修改说明。该说明应标明哪些模块、文件或功能区域来自 wuwukasi/wuwukaka，并描述下游对这些部分做了哪些修改。
 
-wuwukasi/wuwukaka 新增部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini in-context conditioning、SCAIL-2 embeds 支持（包括 prefix_mask 处理、freeze/prepend 集成、loop 输出张量缓存/后台保存）、EverAnimate embeds、sampler/context-window 修改、cache/inference 安全保护、fast-path attention dispatch 传递，以及相关 custom-op 处理等。
+wuwukasi/wuwukaka 新增/修改部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini/SCAIL-2/EverAnimate 节点和采样集成、context metadata threading、context-window 策略修正、cache-key correctness 修复、cache/inference 安全保护、fast-path/cache 辅助逻辑、custom-op namespace/registration safeguards，以及 CustomLinear MXFP8/block-wise `scale_weight` 处理等。
+
+归属范围说明：底层 Wan 模型、ComfyUI-WanVideoWrapper 原始代码、Alibaba Wan 原始代码、ComfyUI/Comfy RoPE 实现、RoPE 数学/机制本身，以及从上游项目或第三方 PR 同步/适配的实现，不作为 wuwukasi/wuwukaka 原创代码主张。native quantization 中，`CustomLinear` MXFP8/block-wise `scale_weight` 处理是 WanAnimatePlus 修改；上游 PR 原始代码仍归属上游。详细说明见 [NOTICE](NOTICE)。
