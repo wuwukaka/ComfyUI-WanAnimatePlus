@@ -4,8 +4,10 @@
 # Modified portions Copyright (c) 2026 wuwukasi/wuwukaka.
 #   - Added APG, APG-chain, and Bernini CFG-chain guidance modes.
 #   - Added sampler graph-detach protection to prevent denoising graph accumulation.
-#   - Added Bernini context_latents/context_roles propagation, context-window slicing, and simple T2V/Bernini fast-path routing.
-#   - Threaded upstream/Comfy RoPE selection through added Bernini/SCAIL context paths, including local context-window starts.
+#   - Added Bernini/SCAIL context_latents/context_roles propagation,
+#     context-window slicing, and simple T2V/Bernini fast-path routing.
+#   - Threaded rope_function, context_window_start, and context stream metadata
+#     through added Bernini/SCAIL paths, including local context-window starts.
 #   - Added prefix frame support in context windows, looping, face/pose slices, image conditions, and noise predictions.
 #   - Added transition_video hard conditioning and canvas_expansion_px-aware Uni3C/render/output handling.
 #   - Added EverAnimate segmented sampling with anchors, generated/random/user-first anchors, repeat-anchor padding, bg/mask conditioning, motion latents, and internal context-option blocking.
@@ -14,7 +16,8 @@
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 #   - Added SCAIL-2 loop output tensor caching, background cache saves, and tail-frame anchor encoding.
 #   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
-#   RoPE math/mechanisms and Comfy RoPE implementations remain upstream/third-party work.
+#   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
+#   Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math, copy, shutil
 import torch
