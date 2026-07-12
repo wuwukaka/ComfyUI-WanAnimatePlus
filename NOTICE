@@ -33,6 +33,19 @@ minimum:
   files, and add new prominent notices for downstream changes.
 - Avoid implying endorsement by kijai, wuwukasi/wuwukaka, or other contributors.
 
+Omission, incomplete attribution, or inaccurate attribution by downstream
+projects does not waive or transfer wuwukasi/wuwukaka rights in the
+WanAnimatePlus-derived portions, including adapted, refactored, relocated,
+split, merged, or otherwise derivative source expression based on those
+portions.
+This applies to all downstream projects and derivative works, whether or not
+they are specifically identified by name.
+Downstream copyright or modification notices apply only to the downstream
+project's own changes and do not supersede, replace, or transfer the
+wuwukasi/wuwukaka notices and rights in WanAnimatePlus-derived portions or in
+adapted, refactored, relocated, split, merged, or otherwise derivative source
+expression based on those portions.
+
 When using the WanAnimatePlus-specific nodes and wuwukasi/wuwukaka additions in
 published workflows, demos, introduction videos, or tutorial videos, attribution
 is requested: please clearly state that those nodes come from
