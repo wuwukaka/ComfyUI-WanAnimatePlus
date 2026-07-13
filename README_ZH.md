@@ -101,13 +101,13 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 4. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
 5. 示例工作流见 `example_workflows/` 目录
 
-## 视频 / 教程署名要求
+## 视频 / 教程署名建议
 
-作为使用 WanAnimatePlus 专属节点制作并发布工作流介绍视频、教学视频或类似教程内容时的署名条件，你必须明确说明这些节点来自本项目，并提供项目链接：
+使用 WanAnimatePlus 专属节点制作并发布工作流介绍视频、教学视频或类似教程内容时，建议进行署名：请明确说明这些节点来自本项目，并提供项目链接：
 
 https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
 
-本署名说明适用于 WanAnimatePlus 专属新增/修改部分，不修改上游 Apache License 2.0 授权部分的 Apache 2.0 条款。
+本署名建议适用于 WanAnimatePlus 专属新增/修改部分，不修改上游 Apache License 2.0 授权部分的 Apache 2.0 条款。
 
 ## 节点说明
 
@@ -260,6 +260,6 @@ ComfyUI-WanAnimatePlus/
 
 本项目中的 wuwukasi/wuwukaka 修改部分和新增源码表达 Copyright (c) 2026 wuwukasi/wuwukaka。详细归属和修改说明要求见 [NOTICE](NOTICE)。任何使用或修改 WanAnimatePlus 新增/修改部分的下游项目，应保留相关 copyright / modification notices，并在 README、NOTICE 文件或等效归属说明文档中加入详细修改说明。该说明应标明哪些模块、文件或功能区域来自 wuwukasi/wuwukaka，并描述下游对这些部分做了哪些修改。
 
-wuwukasi/wuwukaka 新增/修改部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini/SCAIL-2/EverAnimate 节点和采样集成、context metadata threading、context-window 策略修正、cache-key correctness 修复、cache/inference 安全保护、fast-path/cache 辅助逻辑、custom-op namespace/registration safeguards，以及 CustomLinear MXFP8/block-wise `scale_weight` 处理等。
+wuwukasi/wuwukaka 新增/修改部分包括 WanAnimatePlus 专用节点注册/重命名和新增功能集成代码、prefix/transition video 条件注入、Bernini/SCAIL-2/EverAnimate 节点和采样集成、context metadata threading、为新增 context streams 编写的 ComfyUI/WanVideoWrapper 侧 context RoPE 适配表达、context-window 策略修正、cache-key correctness 修复、cache/inference 安全保护、fast-path/cache 辅助逻辑、custom-op namespace/registration safeguards，以及 CustomLinear MXFP8/block-wise `scale_weight` 处理等。
 
-归属范围说明：底层 Wan 模型、ComfyUI-WanVideoWrapper 原始代码、Alibaba Wan 原始代码、ComfyUI/Comfy RoPE 实现、RoPE 数学/机制本身，以及从上游项目或第三方 PR 同步/适配的实现，不作为 wuwukasi/wuwukaka 原创代码主张。native quantization 中，`CustomLinear` MXFP8/block-wise `scale_weight` 处理是 WanAnimatePlus 修改；上游 PR 原始代码仍归属上游。详细说明见 [NOTICE](NOTICE)。
+归属范围说明：底层 Wan 模型、ComfyUI-WanVideoWrapper 原始代码、Alibaba Wan 原始代码、ComfyUI/Comfy RoPE 实现、RoPE 数学/机制本身、上游 source-id / in-context RoPE 机制，以及从上游项目或第三方 PR 同步/适配的实现，不作为 wuwukasi/wuwukaka 原创代码主张。WanAnimatePlus 只主张自己为新增 Bernini/SCAIL/context 路径编写的 RoPE/context 接入源码表达，包括 context token shape tracking、context_frame_shapes / context_window_start 参数传递、本地 context-window 策略、为新增 context streams 应用 source-id rotation，以及 cache identity 修正。native quantization 中，`CustomLinear` MXFP8/block-wise `scale_weight` 处理是 WanAnimatePlus 修改；上游 PR 原始代码仍归属上游。详细说明见 [NOTICE](NOTICE)。

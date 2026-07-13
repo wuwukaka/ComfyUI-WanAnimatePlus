@@ -101,13 +101,13 @@ Restart ComfyUI after installation.
 4. Connect `prefix_frames` and/or `transition_video` inputs as needed
 5. Example workflows are available in the `example_workflows/` directory
 
-## Attribution for Videos
+## Attribution Request for Videos
 
-As an attribution condition for using the WanAnimatePlus-specific nodes in published workflow introduction videos, tutorial videos, or similar instructional content, you must clearly state that the nodes come from this project and provide the project link:
+When using the WanAnimatePlus-specific nodes in published workflow introduction videos, tutorial videos, or similar instructional content, attribution is requested: please clearly state that the nodes come from this project and provide the project link:
 
 https://github.com/wuwukaka/ComfyUI-WanAnimatePlus
 
-This attribution notice applies to WanAnimatePlus-specific additions and does not modify the Apache License 2.0 terms for the upstream Apache-licensed portions.
+This attribution request applies to WanAnimatePlus-specific additions and does not modify the Apache License 2.0 terms for the upstream Apache-licensed portions.
 
 ## Nodes
 
@@ -238,6 +238,8 @@ Input is automatically cropped to 21 frames (padded with the first frame if insu
 
 Modified from [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper). Deep respect to the original author for their tremendous contributions to the WanVideo ecosystem.
 
+The SCAIL-2 loop two-phase sampling feature was independently implemented in WanAnimatePlus. Thanks to [checknickname/ComfyUI-Scail2-Sampler-Helper](https://github.com/checknickname/ComfyUI-Scail2-Sampler-Helper) for the two-phase sampling idea and to [user2318/ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit/) as an MIT-licensed reference project. This is idea/reference credit and does not indicate incorporated source code from those projects.
+
 ## Contact
 
 - Bilibili: [@wuwukasi](https://space.bilibili.com/670281046)
@@ -260,6 +262,6 @@ This project is an independently maintained fork / derivative project based on [
 
 Modified portions and newly added source expression by wuwukasi/wuwukaka are Copyright (c) 2026 wuwukasi/wuwukaka. See [NOTICE](NOTICE) for attribution and detailed modification notice requirements. Downstream projects that use or modify the WanAnimatePlus additions should preserve the copyright/modification notices and include a detailed notice in their README, NOTICE file, or equivalent attribution document. That notice should identify the wuwukasi/wuwukaka-derived modules, files, or feature areas and describe any downstream modifications made to those portions.
 
-The wuwukasi/wuwukaka additions/modifications include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini/SCAIL-2/EverAnimate node and sampler integration, context metadata threading, context-window strategy changes, cache-key correctness fixes, cache/inference safeguards, fast-path/cache helper logic, custom-op namespace/registration safeguards, and CustomLinear MXFP8/block-wise `scale_weight` handling.
+The wuwukasi/wuwukaka additions/modifications include WanAnimatePlus-specific node registration/renaming and integration code, prefix/transition video conditioning, Bernini/SCAIL-2/EverAnimate node and sampler integration, context metadata threading, ComfyUI/WanVideoWrapper-side context RoPE adapters for added context streams, context-window strategy changes, cache-key correctness fixes, cache/inference safeguards, fast-path/cache helper logic, custom-op namespace/registration safeguards, and CustomLinear MXFP8/block-wise `scale_weight` handling.
 
-Scope note: the base Wan model code, original ComfyUI-WanVideoWrapper code, original Alibaba Wan code, ComfyUI/Comfy RoPE implementations, RoPE mathematics/mechanisms themselves, and implementations synced or adapted from upstream projects or third-party PRs are not claimed as original wuwukasi/wuwukaka code. For native quantization, `CustomLinear` MXFP8/block-wise `scale_weight` handling is a WanAnimatePlus modification; upstream PR code remains upstream work. See [NOTICE](NOTICE) for details.
+Scope note: the base Wan model code, original ComfyUI-WanVideoWrapper code, original Alibaba Wan code, ComfyUI/Comfy RoPE implementations, RoPE mathematics/mechanisms themselves, upstream source-id / in-context RoPE mechanisms, and implementations synced or adapted from upstream projects or third-party PRs are not claimed as original wuwukasi/wuwukaka code. WanAnimatePlus claims only its own RoPE/context integration source expression for added Bernini/SCAIL/context paths, including context token shape tracking, context_frame_shapes / context_window_start parameter threading, local context-window strategy, source-id rotation application for added context streams, and cache identity fixes. For native quantization, `CustomLinear` MXFP8/block-wise `scale_weight` handling is a WanAnimatePlus modification; upstream PR code remains upstream work. See [NOTICE](NOTICE) for details.
