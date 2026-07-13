@@ -27,44 +27,26 @@
 
 """Load ComfyUI-native quantized checkpoints in WanAnimatePlus.
 
-ComfyUI native NVFP4, FP8, and MXFP8 checkpoints store packed linear weights
+ComfyUI native NVFP4, MXFP8, and INT8 checkpoints store packed linear weights
 together with ``*.comfy_quant`` JSON metadata and scale tensors. Some NVFP4
 checkpoints only store packed uint8 weights plus scale tensors; this module
 treats those as native quant weights too. It reconstructs weights as ComfyUI
 ``QuantizedTensor`` instances so regular ``F.linear`` dispatches to
 comfy_kitchen kernels through the tensor subclass.
+
+FP8 ``*.comfy_quant`` metadata is intentionally stripped by the WanAnimatePlus
+loader so FP8 checkpoints keep using the legacy fp8/scaled-fp8 path.
 """
 
 import json
 import logging
-import sys
 
 import torch
 import torch.nn as nn
 
 log = logging.getLogger(__name__)
 
-_torch_version = tuple(int(x) for x in torch.__version__.split(".")[:2] if x.isdigit())
-_WINDOWS = sys.platform == "win32"
-
-
-def supports_fp8_compute(device=None) -> bool:
-    """Return True if the device supports hardware-accelerated fp8 matmul (CC>=8.9)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(device)
-    except Exception:
-        return False
-    if props.major >= 9:
-        return True
-    if props.major < 8 or props.minor < 9:
-        return False
-    if _torch_version < (2, 3):
-        return False
-    if _WINDOWS and _torch_version < (2, 4):
-        return False
-    return True
+LEGACY_FP8_COMFY_QUANT_FORMATS = {"float8_e4m3fn", "float8_e5m2"}
 
 
 def supports_nvfp4_compute(device=None) -> bool:
@@ -89,14 +71,6 @@ except Exception as e:
         from comfy_kitchen.tensor import get_layout_class, QuantizedTensor
 
         QUANT_ALGOS = {
-            "float8_e4m3fn": {
-                "storage_t": torch.float8_e4m3fn,
-                "comfy_tensor_layout": "TensorCoreFP8Layout",
-            },
-            "float8_e5m2": {
-                "storage_t": torch.float8_e5m2,
-                "comfy_tensor_layout": "TensorCoreFP8Layout",
-            },
             "nvfp4": {
                 "storage_t": torch.uint8,
                 "comfy_tensor_layout": "TensorCoreNVFP4Layout",
@@ -144,6 +118,58 @@ def _ensure_comfy_quant_backend():
 def _decode_comfy_quant(t: torch.Tensor) -> dict:
     raw = t.to(torch.uint8).cpu().numpy().tobytes()
     return json.loads(bytes(raw).decode("utf-8"))
+
+
+def is_legacy_fp8_comfy_quant_format(fmt) -> bool:
+    return fmt in LEGACY_FP8_COMFY_QUANT_FORMATS
+
+
+def get_comfy_quant_formats(sd) -> set[str]:
+    """Return ComfyUI-native quant formats present in a state dict."""
+    if sd is None:
+        return set()
+    formats = set()
+    for key, value in sd.items():
+        if key.endswith(".comfy_quant"):
+            formats.add(_decode_comfy_quant(value).get("format"))
+    if any(is_scale_only_nvfp4_weight_key(sd, key) for key in sd):
+        formats.add("nvfp4")
+    return formats
+
+
+def is_legacy_fp8_comfy_quant_state_dict(sd) -> bool:
+    formats = get_comfy_quant_formats(sd)
+    return bool(formats) and formats.issubset(LEGACY_FP8_COMFY_QUANT_FORMATS)
+
+
+def has_mixed_legacy_fp8_comfy_quant(sd) -> bool:
+    formats = get_comfy_quant_formats(sd)
+    return bool(formats & LEGACY_FP8_COMFY_QUANT_FORMATS) and bool(
+        formats - LEGACY_FP8_COMFY_QUANT_FORMATS
+    )
+
+
+def strip_legacy_fp8_comfy_quant_metadata(sd):
+    """Remove FP8 comfy_quant markers so FP8 checkpoints use the legacy path."""
+    stripped = dict(sd)
+    removed = 0
+    for key in list(stripped.keys()):
+        if not key.endswith(".comfy_quant"):
+            continue
+        fmt = _decode_comfy_quant(stripped[key]).get("format")
+        if is_legacy_fp8_comfy_quant_format(fmt):
+            del stripped[key]
+            removed += 1
+    return stripped, removed
+
+
+def _reject_legacy_fp8_comfy_quant(fmt):
+    if is_legacy_fp8_comfy_quant_format(fmt):
+        raise RuntimeError(
+            "ComfyUI-native FP8 metadata is routed through the legacy FP8/scaled "
+            "path in WanAnimatePlus. Strip the FP8 .comfy_quant entries before "
+            "using the native quant loader."
+        )
 
 
 def _logical_weight_shape(fmt, packed_weight):
@@ -274,6 +300,7 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
         fmt = "nvfp4"
     else:
         raise RuntimeError(f"No ComfyUI-native quant metadata found for {prefix}")
+    _reject_legacy_fp8_comfy_quant(fmt)
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     qcfg = QUANT_ALGOS[fmt]
@@ -348,6 +375,7 @@ def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
         return metadata
     else:
         raise RuntimeError(f"No ComfyUI-native quant metadata found for {prefix}")
+    _reject_legacy_fp8_comfy_quant(fmt)
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     layout_name = QUANT_ALGOS[fmt]["comfy_tensor_layout"]
@@ -602,6 +630,7 @@ def _slice_logical_shape(weight, logical_shape):
 
 def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_scale=None, logical_shape=None):
     """Dequantize one Comfy native quantized weight tensor for LoRA/fallback paths."""
+    _reject_legacy_fp8_comfy_quant(fmt)
     if hasattr(weight, "_qdata") and hasattr(weight, "_params") and hasattr(weight, "dequantize"):
         weight = weight.dequantize()
     else:
@@ -626,10 +655,6 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
             if scale is None:
                 raise RuntimeError("MXFP8 fallback dequantization requires weight_scale")
             weight = ck_local.dequantize_mxfp8(weight.to(device=scale.device), scale, compute_dtype)
-        elif fmt in ("float8_e4m3fn", "float8_e5m2"):
-            if scale is None:
-                raise RuntimeError(f"{fmt} fallback dequantization requires weight_scale")
-            weight = ck_local.dequantize_per_tensor_fp8(weight.to(device=scale.device), scale, compute_dtype)
         elif fmt == "int8_tensorwise":
             if scale is None:
                 raise RuntimeError("int8_tensorwise fallback dequantization requires weight_scale")
@@ -648,6 +673,7 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
 
 def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_scale=None, logical_shape=None, layout_name=None):
     """Wrap a raw native quantized storage tensor as a QuantizedTensor."""
+    _reject_legacy_fp8_comfy_quant(fmt)
     _ensure_comfy_quant_backend()
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")

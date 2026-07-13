@@ -24,7 +24,6 @@ from .comfy_quant_linear import (
     dequantize_comfy_quant_weight,
     get_state_dict_weight_shape,
     quantize_raw_comfy_quant_weight,
-    supports_fp8_compute,
     supports_nvfp4_compute,
 )
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
@@ -595,10 +594,8 @@ class CustomLinear(nn.Linear):
             return False
         if fmt == "nvfp4":
             return weight.dtype == torch.uint8
-        if fmt in ("float8_e4m3fn", "mxfp8"):
+        if fmt == "mxfp8":
             return weight.dtype == torch.float8_e4m3fn
-        if fmt == "float8_e5m2":
-            return weight.dtype == torch.float8_e5m2
         return False
 
     def _is_materialized_regular_weight(self, weight, input):
@@ -666,14 +663,12 @@ class CustomLinear(nn.Linear):
         if QuantizedTensor is None or get_layout_class is None:
             return input_2d
         device = input_2d.device
-        if fmt in ("float8_e4m3fn", "float8_e5m2"):
-            if not supports_fp8_compute(device):
-                return input_2d
-        elif fmt == "nvfp4":
+        if fmt == "nvfp4":
             if not supports_nvfp4_compute(device):
                 return input_2d
         else:
-            # int8_tensorwise: quantize_input=False by design
+            # FP8 comfy_quant is routed to legacy fp8/scaled paths; int8_tensorwise
+            # and MXFP8 do not quantize activations here.
             return input_2d
         qcfg = QUANT_ALGOS.get(fmt)
         if qcfg is None:

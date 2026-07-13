@@ -27,11 +27,12 @@ from .custom_linear import _replace_linear
 from .comfy_quant_linear import (
     ensure_comfy_quant_linear_materialized,
     get_state_dict_weight_shape,
+    has_mixed_legacy_fp8_comfy_quant,
     is_comfy_quant_state_dict,
-    is_nvfp4_comfy_quant_prefix,
-    is_nvfp4_comfy_quant_state_dict,
+    is_legacy_fp8_comfy_quant_state_dict,
     is_native_quant_prefix,
     is_native_quant_weight_key,
+    strip_legacy_fp8_comfy_quant_metadata,
 )
 
 from accelerate import init_empty_weights
@@ -107,6 +108,26 @@ def add_weight_scale_aliases(sd):
         elif key.endswith(".scale_weight_2"):
             aliased_sd.setdefault(key[:-len(".scale_weight_2")] + ".weight_scale_2", value)
     return aliased_sd
+
+
+def route_legacy_fp8_comfy_quant(sd):
+    if has_mixed_legacy_fp8_comfy_quant(sd):
+        raise ValueError(
+            "Mixed ComfyUI-native FP8 and non-FP8 native quant formats are not "
+            "supported in one checkpoint. Use a pure FP8 checkpoint for the "
+            "legacy fp8/scaled path, or a pure native-quant checkpoint."
+        )
+    if not is_legacy_fp8_comfy_quant_state_dict(sd):
+        return sd
+    sd, removed = strip_legacy_fp8_comfy_quant_metadata(sd)
+    if removed:
+        log.info(
+            "ComfyUI-native FP8 metadata detected; routing %d layer(s) through "
+            "the legacy fp8/scaled path.",
+            removed,
+        )
+    return sd
+
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -875,13 +896,14 @@ def rename_fuser_block(name):
 
 def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                  transformer_load_device=None, block_swap_args=None, gguf=False, reader=None, patcher=None, compile_args=None):
+    if sd is not None and not gguf:
+        sd = route_legacy_fp8_comfy_quant(sd)
     params_to_keep = {"time_in", "patch_embedding", "time_", "modulation", "text_embedding",
                       "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob", "face_encoder", "fuser_block"}
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
     block_idx = vace_block_idx = None
     comfy_quant = is_comfy_quant_state_dict(sd)
-    nvfp4_comfy_quant = is_nvfp4_comfy_quant_state_dict(sd)
 
     if gguf:
         log.info("Using GGUF to load and assign model weights to device...")
@@ -1279,6 +1301,7 @@ class WanVideoModelLoader:
                 if new_key != key:
                     sd[new_key] = sd.pop(key)
 
+        sd = route_legacy_fp8_comfy_quant(sd)
         comfy_quant = is_comfy_quant_state_dict(sd)
         if comfy_quant and merge_loras:
             raise ValueError("ComfyUI-native quantized models do not support LoRA merging. Disable merge_loras in the LoRA select node.")
@@ -1699,7 +1722,9 @@ class WanVideoModelLoader:
             sd.update(extra_sd)
             del extra_sd
 
-        if not is_comfy_quant_state_dict(sd):
+        sd = route_legacy_fp8_comfy_quant(sd)
+        comfy_quant = is_comfy_quant_state_dict(sd)
+        if not comfy_quant:
             sd = add_weight_scale_aliases(sd)
 
         # FlashVSR
