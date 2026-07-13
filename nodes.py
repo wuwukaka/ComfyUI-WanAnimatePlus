@@ -12,6 +12,9 @@
 #   - Added Bernini task guidance recommendations and native-aspect reference resizing.
 #   - Added WanAnimatePlus signature widget to the embeds node.
 #   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
+#   - Added SCAIL-2 loop two-phase sampling settings; thanks to
+#     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
+#     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math
 import torch
@@ -2472,6 +2475,34 @@ class WanAnimatePlusSCAIL2Embeds:
         return (image_embeds,)
 
 
+class WanAnimatePlusSCAIL2TwoPhaseSettings:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image_embeds": ("WANVIDIMAGE_EMBEDS",),
+            "phase1_mask": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001,
+                "tooltip": "SCAIL-2 loop handoff protection for phase 1. 1=freeze/protect, 0=free."}),
+            "phase2_mask": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                "tooltip": "SCAIL-2 loop handoff protection for phase 2. 1=freeze/protect, 0=free."}),
+            "phase2_start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1,
+                "tooltip": "Chunk-local step where phase 2 starts. 0 disables two-phase sampling."}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+
+    def process(self, image_embeds, phase1_mask, phase2_mask, phase2_start_step):
+        updated = dict(image_embeds)
+        updated["scail2_two_phase"] = True
+        updated["scail2_two_phase_phase1_mask"] = float(phase1_mask)
+        updated["scail2_two_phase_phase2_mask"] = float(phase2_mask)
+        updated["scail2_two_phase_start_step"] = int(phase2_start_step)
+        return (updated,)
+
+
 class WanAnimatePlusEverAnimateEmbeds:
     @classmethod
     def INPUT_TYPES(s):
@@ -3799,6 +3830,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddPusaNoise": WanVideoAddPusaNoise,
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
     "WanAnimatePlusSCAIL2Embeds": WanAnimatePlusSCAIL2Embeds,
+    "WanAnimatePlusSCAIL2TwoPhaseSettings": WanAnimatePlusSCAIL2TwoPhaseSettings,
     "WanAnimatePlusEverAnimateEmbeds": WanAnimatePlusEverAnimateEmbeds,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
     "WanVideoAddBindweaveEmbeds": WanVideoAddBindweaveEmbeds,
@@ -3845,6 +3877,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddPusaNoise": "WanVideo Add Pusa Noise",
     "WanVideoAnimateEmbeds": "WanVideo Animate Embeds",
     "WanAnimatePlusSCAIL2Embeds": "WanAnimatePlus SCAIL_2 Embeds",
+    "WanAnimatePlusSCAIL2TwoPhaseSettings": "WanAnimatePlus SCAIL_2 TwoPhase Settings",
     "WanAnimatePlusEverAnimateEmbeds": "WanAnimatePlus EverAnimate Embeds",
     "WanVideoAddLucyEditLatents": "WanVideo Add LucyEdit Latents",
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",

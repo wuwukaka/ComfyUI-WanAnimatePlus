@@ -16,6 +16,9 @@
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 #   - Added SCAIL-2 loop output tensor caching, background cache saves, and tail-frame anchor encoding.
 #   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
+#   - Added SCAIL-2 loop two-phase handoff sampling controls; thanks to
+#     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
+#     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
@@ -589,6 +592,16 @@ class WanVideoSampler:
         frame_window_size = image_embeds.get("frame_window_size", 77)
         wananimate_loop = image_embeds.get("looping", False)
         scail2_looping = bool(image_embeds.get("scail2_looping", False))
+        scail2_two_phase = bool(image_embeds.get("scail2_two_phase", False))
+        if scail2_two_phase and not scail2_looping:
+            raise ValueError("SCAIL-2 two-phase settings are only supported in SCAIL-2 loop mode.")
+        scail2_two_phase_start_step = int(image_embeds.get("scail2_two_phase_start_step", 0) or 0)
+        scail2_two_phase_phase1_mask = max(
+            0.0, min(1.0, float(image_embeds.get("scail2_two_phase_phase1_mask", 0.5)))
+        )
+        scail2_two_phase_phase2_mask = max(
+            0.0, min(1.0, float(image_embeds.get("scail2_two_phase_phase2_mask", 1.0)))
+        )
         scail2_requested_frames = int(image_embeds.get("scail2_requested_frames", image_embeds.get("num_frames", 0)))
         scail2_previous_frame_count = int(image_embeds.get("scail2_previous_frame_count", 5))
         # ============ Global transition_video read ============
@@ -3271,6 +3284,24 @@ class WanVideoSampler:
                     return local_latents, local_mask
                 return None, None
 
+            def _expand_local_freeze_mask(local_mask, channels, strength=1.0):
+                if local_mask is None:
+                    return None
+                strength = max(0.0, min(1.0, float(strength)))
+                if strength <= 0.0:
+                    return None
+                mask = (local_mask * strength).clamp(0.0, 1.0)
+                return mask.unsqueeze(0).repeat(1, channels, 1, 1, 1).to(device)
+
+            def _apply_local_freeze(latent_in, local_latents, local_mask, strength=1.0):
+                if local_latents is None or local_mask is None:
+                    return latent_in
+                strength = max(0.0, min(1.0, float(strength)))
+                if strength <= 0.0:
+                    return latent_in
+                mask = (local_mask.unsqueeze(0).to(latent_in) * strength).clamp(0.0, 1.0)
+                return local_latents.to(latent_in) * mask + latent_in * (1 - mask)
+
             def _build_chunk_scail_data(base_scail_data, chunk_start, local_freeze_mask, first_chunk):
                 chunk_data = base_scail_data.copy() if base_scail_data is not None else {}
                 chunk_latent_start = chunk_start // 4
@@ -3451,6 +3482,21 @@ class WanVideoSampler:
                         if arg not in step_sig.parameters:
                             chunk_step_args.pop(arg)
 
+                    chunk_two_phase = scail2_two_phase and scail2_two_phase_start_step > 0
+                    if chunk_two_phase:
+                        if scail2_two_phase_start_step >= len(chunk_timesteps):
+                            raise ValueError(
+                                "SCAIL-2 two-phase phase2_start_step must be smaller than the chunk step count."
+                            )
+                        log.info(
+                            "SCAIL-2 two-phase chunk %d/%d: phase2 starts at step %d, phase1_mask=%.3f, phase2_mask=%.3f",
+                            chunk_idx + 1,
+                            num_chunks,
+                            scail2_two_phase_start_step,
+                            scail2_two_phase_phase1_mask,
+                            scail2_two_phase_phase2_mask,
+                        )
+
                     latent = torch.randn(
                         16,
                         chunk_latent_frames,
@@ -3468,23 +3514,32 @@ class WanVideoSampler:
                         chunk_idx == 0,
                     )
                     if local_freeze_latents is not None:
-                        freeze = local_freeze_mask.unsqueeze(0).to(latent)
-                        latent = (local_freeze_latents.to(latent) * freeze + latent * (1 - freeze)).detach()
+                        latent = _apply_local_freeze(latent, local_freeze_latents, local_freeze_mask, 1.0).detach()
 
                     local_scail_data = _build_chunk_scail_data(scail_data, chunk_start, local_freeze_mask, chunk_idx == 0)
                     local_scail_data = dict_to_device(local_scail_data, device, dtype)
                     local_uni3c_data = _build_chunk_uni3c_data(chunk_start, chunk_idx == 0)
-                    local_scail_freeze_mask = None
-                    if local_freeze_mask is not None:
-                        local_scail_freeze_mask = local_freeze_mask.unsqueeze(0).repeat(1, latent.shape[0], 1, 1, 1).to(device)
+                    local_scail_freeze_mask = _expand_local_freeze_mask(local_freeze_mask, latent.shape[0], 1.0)
 
                     self.cache_state = [None, None]
                     seq_len = math.ceil((latent.shape[2] * latent.shape[3]) / 4 * latent.shape[1])
                     chunk_pbar = tqdm(total=len(chunk_timesteps), desc=f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}", position=0, leave=True)
                     old_scail_freeze_mask = scail_freeze_mask
                     try:
-                        scail_freeze_mask = local_scail_freeze_mask
                         for i, t in enumerate(chunk_timesteps):
+                            if chunk_two_phase:
+                                phase_mask_value = (
+                                    scail2_two_phase_phase1_mask
+                                    if i < scail2_two_phase_start_step
+                                    else scail2_two_phase_phase2_mask
+                                )
+                                scail_freeze_mask = _expand_local_freeze_mask(
+                                    local_freeze_mask, latent.shape[0], phase_mask_value
+                                )
+                            else:
+                                phase_mask_value = 1.0
+                                scail_freeze_mask = local_scail_freeze_mask
+
                             timestep = torch.tensor([t]).to(device)
                             latent_model_input = latent.to(device)
                             noise_pred, _, self.cache_state = predict_with_cfg(
@@ -3507,9 +3562,15 @@ class WanVideoSampler:
                                 latent.unsqueeze(0).to(noise_pred.device),
                                 **chunk_step_args,
                             )[0].squeeze(0).detach()
-                            if local_freeze_latents is not None and local_scail_freeze_mask is not None:
-                                mask = local_scail_freeze_mask[0].to(latent)
-                                latent = local_freeze_latents.to(latent) * mask + latent * (1 - mask)
+                            if local_freeze_latents is not None and local_freeze_mask is not None:
+                                latent = _apply_local_freeze(
+                                    latent, local_freeze_latents, local_freeze_mask, phase_mask_value
+                                ).detach()
+                                if chunk_two_phase and i == scail2_two_phase_start_step - 1:
+                                    latent = _apply_local_freeze(
+                                        latent, local_freeze_latents, local_freeze_mask, 1.0
+                                    ).detach()
+                                    self.cache_state = [None, None]
 
                             if callback is not None:
                                 callback_latent = (latent_model_input - noise_pred.to(device) * timestep.to(device) / 1000).detach()
@@ -3523,9 +3584,8 @@ class WanVideoSampler:
                         chunk_pbar.close()
                         self.cache_state = [None, None]
 
-                    if local_freeze_latents is not None:
-                        mask = local_freeze_mask.unsqueeze(0).to(latent)
-                        latent = local_freeze_latents.to(latent) * mask + latent * (1 - mask)
+                    if local_freeze_latents is not None and not chunk_two_phase:
+                        latent = _apply_local_freeze(latent, local_freeze_latents, local_freeze_mask, 1.0).detach()
                     del local_scail_data, local_uni3c_data, local_freeze_latents, local_freeze_mask, local_scail_freeze_mask
                     _maybe_offload_loop_vae()
                     mm.soft_empty_cache()

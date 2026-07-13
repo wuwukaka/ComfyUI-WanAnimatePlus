@@ -5,6 +5,7 @@
 #   - Registers a WanAnimatePlus-specific workflow node chain with renamed node keys.
 #   - Adds WanAnimatePlus Bernini and EverAnimate embeds nodes to the public mappings.
 #   - Adds WanAnimatePlus SCAIL-2 embeds node to the public mappings.
+#   - Adds WanAnimatePlus SCAIL-2 two-phase settings node to the public mappings.
 #   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility.
 #   - Forces registered node categories to WanAnimatePlus.
 #   - Keeps WanAnimatePlus nodes isolated from original WanVideoWrapper node names.
@@ -24,6 +25,7 @@ from .nodes import (
     WanAnimatePlusBernini,
     WanAnimatePlusEverAnimateEmbeds,
     WanAnimatePlusSCAIL2Embeds,
+    WanAnimatePlusSCAIL2TwoPhaseSettings,
     WanVideoAnimateEmbeds,
     WanVideoClipVisionEncode,
     WanVideoClipVisionEncodeV2,
@@ -81,6 +83,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Bernini": WanAnimatePlusBernini,
     "WanAnimatePlus EverAnimate Embeds": WanAnimatePlusEverAnimateEmbeds,
     "WanAnimatePlus SCAIL_2 Embeds": WanAnimatePlusSCAIL2Embeds,
+    "WanAnimatePlus SCAIL_2 TwoPhase Settings": WanAnimatePlusSCAIL2TwoPhaseSettings,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: k for k in NODE_CLASS_MAPPINGS}

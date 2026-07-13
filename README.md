@@ -238,6 +238,8 @@ Input is automatically cropped to 21 frames (padded with the first frame if insu
 
 Modified from [kijai/ComfyUI-WanVideoWrapper](https://github.com/kijai/ComfyUI-WanVideoWrapper). Deep respect to the original author for their tremendous contributions to the WanVideo ecosystem.
 
+The SCAIL-2 loop two-phase sampling feature was independently implemented in WanAnimatePlus. Thanks to [checknickname/ComfyUI-Scail2-Sampler-Helper](https://github.com/checknickname/ComfyUI-Scail2-Sampler-Helper) for the two-phase sampling idea and to [user2318/ComfyUI-CustomNodeKit](https://github.com/user2318/ComfyUI-CustomNodeKit/) as an MIT-licensed reference project. This is idea/reference credit and does not indicate incorporated source code from those projects.
+
 ## Contact
 
 - Bilibili: [@wuwukasi](https://space.bilibili.com/670281046)

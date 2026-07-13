@@ -11,6 +11,13 @@ portions, including Alibaba Wan, ComfyUI, ComfyUI native quantization support,
 and bundled model/feature implementations, remain copyrighted by their
 respective authors. Deep thanks to those projects and contributors.
 
+Additional SCAIL-2 two-phase sampling acknowledgement: the WanAnimatePlus
+implementation was independently written, with thanks to
+checknickname/ComfyUI-Scail2-Sampler-Helper for the two-phase sampling idea and
+to user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project. This is
+idea/reference credit and does not indicate incorporated source code from those
+projects.
+
 This project is distributed under the Apache License, Version 2.0. See LICENSE.
 
 Modified portions and newly added source expression by wuwukasi/wuwukaka in
