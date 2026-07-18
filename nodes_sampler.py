@@ -629,9 +629,9 @@ class WanVideoSampler:
         if wananimate_loop and context_options is not None:
             raise Exception("context_options are not compatible or necessary with WanAnim looping, since it creates the video in a loop.")
         if scail2_looping and context_options is not None:
-            raise Exception("context_options are not compatible with SCAIL-2 loop mode. Set frame_window_size >= num_frames to use context mode.")
+            raise Exception("context_options are not compatible with SCAIL-2 loop mode. Set frame_window_size equal to the normalized SCAIL-2 frame count to use context mode.")
         if scail2_looping and samples is not None:
-            raise ValueError("Input latent samples are not supported with SCAIL-2 loop mode. Disconnect samples or set frame_window_size >= num_frames.")
+            raise ValueError("Input latent samples are not supported with SCAIL-2 loop mode. Disconnect samples or set frame_window_size equal to the normalized SCAIL-2 frame count.")
         wananim_pose_latents = image_embeds.get("pose_latents", None)
         wananim_pose_strength = image_embeds.get("pose_strength", 1.0)
         wananim_face_strength = image_embeds.get("face_strength", 1.0)
