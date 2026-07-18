@@ -1376,13 +1376,64 @@ class WanVideoSampler:
         # SCAIL
         scail_embeds = image_embeds.get("scail_embeds", None)
         scail_data = None
+        scail_context_windowed = scail_embeds is not None and context_options is not None and not scail2_looping
         if scail_embeds is not None:
             log.info("Using SCAIL embeddings:")
             for k, v in scail_embeds.items():
                 log.info(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else v}")
             scail_data = scail_embeds.copy()
-            scail_data = dict_to_device(scail_data, device, dtype)
+            if not scail_context_windowed:
+                scail_data = dict_to_device(scail_data, device, dtype)
         scail2_fast_path_fallback_logged = False
+
+        def _scail_index_dim1(tensor, indices):
+            index = torch.as_tensor(indices, dtype=torch.long, device=tensor.device)
+            return tensor.index_select(1, index)
+
+        def _scail_to_like(value, like):
+            if isinstance(value, torch.Tensor):
+                return value.to(device=like.device, dtype=like.dtype)
+            return value
+
+        def _scail_window_dim1_to_like(tensor, indices, prepend_count, like):
+            parts = []
+            if prepend_count > 0:
+                parts.append(tensor[:, :prepend_count].to(device=like.device, dtype=like.dtype))
+            parts.append(_scail_index_dim1(tensor, indices).to(device=like.device, dtype=like.dtype))
+            return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
+        def _scail_context_data_to_like(active_data, indices, prepend_count, like):
+            out = {}
+            windowed_keys = {"pose_latent", "sam_latents", "ref_mask_latents"}
+            for key, value in active_data.items():
+                if key in windowed_keys:
+                    continue
+                out[key] = _scail_to_like(value, like)
+
+            pose_latent = active_data.get("pose_latent", None)
+            if pose_latent is not None:
+                out["pose_latent"] = _scail_window_dim1_to_like(pose_latent, indices, prepend_count, like)
+
+            sam_latents = active_data.get("sam_latents", None)
+            if sam_latents is not None:
+                out["sam_latents"] = _scail_window_dim1_to_like(sam_latents, indices, prepend_count, like)
+
+            ref_mask_latents = active_data.get("ref_mask_latents", None)
+            if ref_mask_latents is not None:
+                ref_latent = active_data.get("ref_latent_pos", active_data.get("ref_latent_neg", None))
+                ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
+                ref_parts = []
+                if ref_count > 0:
+                    ref_parts.append(ref_mask_latents[:, :ref_count].to(device=like.device, dtype=like.dtype))
+                ref_mask_target = ref_mask_latents[:, ref_count:]
+                if ref_mask_target.shape[1] > 0:
+                    ref_parts.append(_scail_window_dim1_to_like(ref_mask_target, indices, prepend_count, like))
+                if ref_parts:
+                    out["ref_mask_latents"] = torch.cat(ref_parts, dim=1) if len(ref_parts) > 1 else ref_parts[0]
+                else:
+                    out["ref_mask_latents"] = ref_mask_latents[:, :0].to(device=like.device, dtype=like.dtype)
+
+            return out
 
 
         # WanMove
@@ -1661,14 +1712,23 @@ class WanVideoSampler:
                 if active_scail_data is not None:
                     ref_concat_mask = torch.zeros_like(z[:4])
                     if scail_freeze_mask is not None:
-                        history_mask = scail_freeze_mask[0, :4].to(z)
                         if context_window is not None:
-                            history_parts = []
-                            if scail_context_prepend_latents > 0:
-                                history_parts.append(history_mask[:, :scail_context_prepend_latents])
-                            history_parts.append(history_mask[:, context_window])
-                            history_mask = torch.cat(history_parts, dim=1)
+                            if scail_context_windowed:
+                                history_mask = _scail_window_dim1_to_like(
+                                    scail_freeze_mask[0, :4],
+                                    context_window,
+                                    scail_context_prepend_latents,
+                                    z,
+                                )
+                            else:
+                                history_mask = scail_freeze_mask[0, :4].to(z)
+                                history_parts = []
+                                if scail_context_prepend_latents > 0:
+                                    history_parts.append(history_mask[:, :scail_context_prepend_latents])
+                                history_parts.append(history_mask[:, context_window])
+                                history_mask = torch.cat(history_parts, dim=1)
                         else:
+                            history_mask = scail_freeze_mask[0, :4].to(z)
                             history_mask = history_mask[:, :z.shape[1]]
                         if history_mask.shape[1] < z.shape[1]:
                             pad = torch.zeros(
@@ -1689,32 +1749,40 @@ class WanVideoSampler:
                         ref_concat_mask = history_mask
                     z = torch.cat([z, ref_concat_mask])
                     if context_window is not None:
-                        scail_data_in = active_scail_data.copy()
-                        if active_scail_data.get("pose_latent", None) is not None:
-                            pose_parts = []
-                            if scail_context_prepend_latents > 0:
-                                pose_parts.append(active_scail_data["pose_latent"][:, :scail_context_prepend_latents])
-                            pose_parts.append(active_scail_data["pose_latent"][:, context_window])
-                            scail_data_in["pose_latent"] = torch.cat(pose_parts, dim=1)
-                        if active_scail_data.get("sam_latents", None) is not None:
-                            sam_parts = []
-                            if scail_context_prepend_latents > 0:
-                                sam_parts.append(active_scail_data["sam_latents"][:, :scail_context_prepend_latents])
-                            sam_parts.append(active_scail_data["sam_latents"][:, context_window])
-                            scail_data_in["sam_latents"] = torch.cat(sam_parts, dim=1)
-                        ref_mask_latents = active_scail_data.get("ref_mask_latents", None)
-                        if ref_mask_latents is not None:
-                            ref_latent = active_scail_data.get("ref_latent_pos", active_scail_data.get("ref_latent_neg", None))
-                            ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
-                            ref_mask_prefix = ref_mask_latents[:, :ref_count]
-                            ref_mask_target = ref_mask_latents[:, ref_count:]
-                            if ref_mask_target.shape[1] > 0:
-                                target_parts = []
+                        if scail_context_windowed:
+                            scail_data_in = _scail_context_data_to_like(
+                                active_scail_data,
+                                context_window,
+                                scail_context_prepend_latents,
+                                z,
+                            )
+                        else:
+                            scail_data_in = active_scail_data.copy()
+                            if active_scail_data.get("pose_latent", None) is not None:
+                                pose_parts = []
                                 if scail_context_prepend_latents > 0:
-                                    target_parts.append(ref_mask_target[:, :scail_context_prepend_latents])
-                                target_parts.append(ref_mask_target[:, context_window])
-                                ref_mask_target = torch.cat(target_parts, dim=1)
-                            scail_data_in["ref_mask_latents"] = torch.cat([ref_mask_prefix, ref_mask_target], dim=1)
+                                    pose_parts.append(active_scail_data["pose_latent"][:, :scail_context_prepend_latents])
+                                pose_parts.append(active_scail_data["pose_latent"][:, context_window])
+                                scail_data_in["pose_latent"] = torch.cat(pose_parts, dim=1)
+                            if active_scail_data.get("sam_latents", None) is not None:
+                                sam_parts = []
+                                if scail_context_prepend_latents > 0:
+                                    sam_parts.append(active_scail_data["sam_latents"][:, :scail_context_prepend_latents])
+                                sam_parts.append(active_scail_data["sam_latents"][:, context_window])
+                                scail_data_in["sam_latents"] = torch.cat(sam_parts, dim=1)
+                            ref_mask_latents = active_scail_data.get("ref_mask_latents", None)
+                            if ref_mask_latents is not None:
+                                ref_latent = active_scail_data.get("ref_latent_pos", active_scail_data.get("ref_latent_neg", None))
+                                ref_count = min(ref_latent.shape[1], ref_mask_latents.shape[1]) if ref_latent is not None else 0
+                                ref_mask_prefix = ref_mask_latents[:, :ref_count]
+                                ref_mask_target = ref_mask_latents[:, ref_count:]
+                                if ref_mask_target.shape[1] > 0:
+                                    target_parts = []
+                                    if scail_context_prepend_latents > 0:
+                                        target_parts.append(ref_mask_target[:, :scail_context_prepend_latents])
+                                    target_parts.append(ref_mask_target[:, context_window])
+                                    ref_mask_target = torch.cat(target_parts, dim=1)
+                                scail_data_in["ref_mask_latents"] = torch.cat([ref_mask_prefix, ref_mask_target], dim=1)
                     else:
                         scail_data_in = active_scail_data.copy()
 
@@ -2431,7 +2499,13 @@ class WanVideoSampler:
 
         # Differential diffusion prep
         masks = None
-        if not multitalk_sampling and scail_freeze_mask is not None:
+        scail_context_freeze_direct_mask = (
+            not multitalk_sampling
+            and scail_freeze_mask is not None
+            and context_options is not None
+            and not scail2_looping
+        )
+        if not multitalk_sampling and scail_freeze_mask is not None and not scail_context_freeze_direct_mask:
             masks = scail_freeze_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device) > 0.5
         elif not multitalk_sampling and samples is not None and noise_mask is not None:
             thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
@@ -4956,7 +5030,11 @@ class WanVideoSampler:
                             latent[:, add_index:add_index+num_extra_frames] = entry["samples"].to(latent)
 
                     # differential diffusion inpaint
-                    if masks is not None:
+                    if scail_context_freeze_direct_mask:
+                        image_latent = original_image.to(device)
+                        mask = scail_freeze_mask[0].to(latent) > 0.5
+                        latent = image_latent * mask + latent * (1-mask)
+                    elif masks is not None:
                         image_latent = None
                         if scail_freeze_mask is not None:
                             image_latent = original_image.to(device)
