@@ -594,7 +594,8 @@ class WanVideoSampler:
         scail2_looping = bool(image_embeds.get("scail2_looping", False))
         scail2_two_phase = bool(image_embeds.get("scail2_two_phase", False))
         if scail2_two_phase and not scail2_looping:
-            raise ValueError("SCAIL-2 two-phase settings are only supported in SCAIL-2 loop mode.")
+            log.warning("SCAIL-2 two-phase settings are only used in SCAIL-2 loop mode; ignoring them for this run.")
+            scail2_two_phase = False
         scail2_two_phase_start_step = int(image_embeds.get("scail2_two_phase_start_step", 0) or 0)
         scail2_two_phase_phase1_mask = max(
             0.0, min(1.0, float(image_embeds.get("scail2_two_phase_phase1_mask", 0.5)))

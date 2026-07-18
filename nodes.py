@@ -1783,7 +1783,7 @@ class WanAnimatePlusSCAIL2Embeds:
             "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 32, "tooltip": "Width of the video to generate. SCAIL-2 inputs are aligned to multiples of 32."}),
             "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 32, "tooltip": "Height of the video to generate. SCAIL-2 inputs are aligned to multiples of 32."}),
             "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "Number of frames to generate"}),
-            "frame_window_size": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "SCAIL-2 chunk window length. Values different from the normalized num_frames enable built-in loop generation with 5-frame handoff; larger values are clamped after enabling loop."}),
+            "frame_window_size": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4, "tooltip": "SCAIL-2 chunk window length. Automatically rounds down to 4n+1. Values different from the normalized num_frames enable built-in loop generation with 5-frame handoff; oversized values are clamped to the largest valid window that fits."}),
             "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Offload VAE after encoding to save VRAM"}),
             "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL pose stream"}),
             "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the SCAIL reference stream"}),
@@ -2035,25 +2035,28 @@ class WanAnimatePlusSCAIL2Embeds:
         def _align_4n(frames):
             return max(4, (frames // 4) * 4)
 
+        def _clamp_window_to_requested(window_size, requested_size):
+            return min(window_size, _align_4n_plus_1(requested_size))
+
         legacy_canvas_encoding = (
             not bool(single_frame_prefix_encoding)
             and (prefix_frames is not None or transition_video is not None)
         )
+        frame_window_size = _align_4n_plus_1(raw_frame_window_size)
         if legacy_canvas_encoding:
             requested_frames = _align_4n(raw_num_frames)
-            frame_window_size = _align_4n(raw_frame_window_size)
         else:
             requested_frames = _align_4n_plus_1(raw_num_frames)
-            frame_window_size = _align_4n_plus_1(raw_frame_window_size)
 
+        frame_window_size = _clamp_window_to_requested(frame_window_size, requested_frames)
         scail2_looping = frame_window_size != requested_frames
         if scail2_looping and not single_frame_prefix_encoding:
             log.info("SCAIL-2 loop mode forces single_frame_prefix_encoding on; legacy canvas prefix is not used for loop handoff.")
             single_frame_prefix_encoding = True
             requested_frames = _align_4n_plus_1(raw_num_frames)
             frame_window_size = _align_4n_plus_1(raw_frame_window_size)
-        if frame_window_size > requested_frames:
-            frame_window_size = requested_frames
+            frame_window_size = _clamp_window_to_requested(frame_window_size, requested_frames)
+            scail2_looping = frame_window_size != requested_frames
         num_frames = requested_frames
         bg_prefix_mask_pixel_frames = 0
         bg_prefix_mask_index = None
