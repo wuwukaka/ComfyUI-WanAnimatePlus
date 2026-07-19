@@ -22,7 +22,7 @@
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
-import os, gc, math, copy, shutil
+import os, gc, math, copy, shutil, time
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -3174,6 +3174,29 @@ class WanVideoSampler:
 
             loop_cache_dir_prefix = "scail2_loop_cache_"
             loop_cache_marker = ".wananimateplus_scail2_loop_cache"
+            loop_cache_mib = 1024 * 1024
+
+            def _loop_chunk_label(chunk_idx):
+                if isinstance(chunk_idx, int) and chunk_idx >= 0:
+                    return f"chunk {chunk_idx + 1}/{num_chunks}"
+                return "final"
+
+            def _loop_tensor_mib(tensor):
+                if not isinstance(tensor, torch.Tensor):
+                    return 0.0
+                return tensor.numel() * tensor.element_size() / loop_cache_mib
+
+            def _loop_file_mib(path):
+                try:
+                    return os.path.getsize(path) / loop_cache_mib
+                except Exception:
+                    return None
+
+            def _loop_cache_log(stage, elapsed, chunk_idx=None, extra=None):
+                message = f"SCAIL-2 loop cache: {_loop_chunk_label(chunk_idx)} {stage} took {elapsed:.2f}s"
+                if extra:
+                    message += f"; {extra}"
+                log.info(message)
 
             def _is_scail2_loop_cache_dir_name(name):
                 if not name.startswith(loop_cache_dir_prefix):
@@ -3211,12 +3234,16 @@ class WanVideoSampler:
             def _remove_loop_temp_output_path(path):
                 if path is None:
                     return None
+                remove_start = time.perf_counter()
                 try:
                     shutil.rmtree(path)
-                    log.info(f"SCAIL-2 loop: removed temporary cache folder {path}")
+                    _loop_cache_log("temporary folder cleanup", time.perf_counter() - remove_start, extra=f"path={path}")
                     return None
                 except Exception as e:
-                    log.warning(f"SCAIL-2 loop: failed to remove temporary cache folder {path}: {e}")
+                    log.warning(
+                        f"SCAIL-2 loop cache: temporary folder cleanup failed after "
+                        f"{time.perf_counter() - remove_start:.2f}s; path={path}; error={e}"
+                    )
                     return path
 
             def _create_loop_temp_output_path():
@@ -3230,14 +3257,38 @@ class WanVideoSampler:
                     marker_file.write("WanAnimatePlus SCAIL-2 loop temporary tensor cache\n")
                 return path
 
-            def _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache):
+            def _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache, chunk_idx, estimated_mib):
+                save_start = time.perf_counter()
                 try:
                     torch.save(cached_chunk, cache_path)
                 except Exception as e:
-                    log.warning(f"SCAIL-2 loop tensor cache save failed; keeping chunk in memory: {e}")
-                    return {"tensor": cached_chunk, "frames": frames_to_cache}
+                    elapsed = time.perf_counter() - save_start
+                    log.warning(
+                        f"SCAIL-2 loop cache: {_loop_chunk_label(chunk_idx)} save failed after {elapsed:.2f}s; "
+                        f"frames={frames_to_cache}; tensor={estimated_mib:.2f} MiB; keeping chunk in memory: {e}"
+                    )
+                    return {
+                        "tensor": cached_chunk,
+                        "frames": frames_to_cache,
+                        "chunk_idx": chunk_idx,
+                        "estimated_mib": estimated_mib,
+                    }
                 del cached_chunk
-                return {"path": cache_path, "frames": frames_to_cache}
+                file_mib = _loop_file_mib(cache_path)
+                file_extra = f"{file_mib:.2f} MiB" if file_mib is not None else "unknown"
+                _loop_cache_log(
+                    "cache save",
+                    time.perf_counter() - save_start,
+                    chunk_idx,
+                    extra=f"frames={frames_to_cache}; tensor={estimated_mib:.2f} MiB; file={file_extra}; path={cache_path}",
+                )
+                return {
+                    "path": cache_path,
+                    "frames": frames_to_cache,
+                    "chunk_idx": chunk_idx,
+                    "estimated_mib": estimated_mib,
+                    "file_mib": file_mib,
+                }
 
             def _resolve_loop_cache_entry(entry):
                 if entry is None:
@@ -3245,7 +3296,23 @@ class WanVideoSampler:
                 future = entry.pop("future", None)
                 if future is None:
                     return entry
+                chunk_idx = entry.get("chunk_idx")
+                wait_start = time.perf_counter()
+                if not future.done():
+                    submitted_at = entry.get("submitted_at")
+                    age = time.perf_counter() - submitted_at if submitted_at is not None else None
+                    age_text = f"; submitted {age:.2f}s ago" if age is not None else ""
+                    log.info(
+                        f"SCAIL-2 loop cache: waiting for pending save for {_loop_chunk_label(chunk_idx)}"
+                        f"{age_text}; frames={entry.get('frames', '?')}; tensor={entry.get('estimated_mib', 0.0):.2f} MiB"
+                    )
                 resolved = future.result()
+                _loop_cache_log(
+                    "pending cache wait",
+                    time.perf_counter() - wait_start,
+                    chunk_idx,
+                    extra=f"frames={entry.get('frames', '?')}; tensor={entry.get('estimated_mib', 0.0):.2f} MiB",
+                )
                 entry.clear()
                 entry.update(resolved)
                 return entry
@@ -3256,28 +3323,86 @@ class WanVideoSampler:
                 frames_to_cache = min(int(video_cthw.shape[1]), int(max_frames))
                 if frames_to_cache <= 0:
                     return None
+                prepare_start = time.perf_counter()
                 cached_chunk = video_cthw[:, :frames_to_cache].detach().cpu().contiguous()
+                estimated_mib = _loop_tensor_mib(cached_chunk)
+                _loop_cache_log(
+                    "cache prepare",
+                    time.perf_counter() - prepare_start,
+                    chunk_idx,
+                    extra=f"frames={frames_to_cache}; tensor={estimated_mib:.2f} MiB",
+                )
                 if output_dir is None:
-                    return {"tensor": cached_chunk, "frames": frames_to_cache}
+                    _loop_cache_log(
+                        "cache keep in memory",
+                        0.0,
+                        chunk_idx,
+                        extra=f"frames={frames_to_cache}; tensor={estimated_mib:.2f} MiB",
+                    )
+                    return {
+                        "tensor": cached_chunk,
+                        "frames": frames_to_cache,
+                        "chunk_idx": chunk_idx,
+                        "estimated_mib": estimated_mib,
+                    }
 
                 cache_path = os.path.join(output_dir, f"chunk_{chunk_idx:06d}.pt")
                 if executor is None:
-                    return _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache)
-                future = executor.submit(_save_loop_cache_tensor, cached_chunk, cache_path, frames_to_cache)
-                return {"future": future, "frames": frames_to_cache}
+                    return _save_loop_cache_tensor(cached_chunk, cache_path, frames_to_cache, chunk_idx, estimated_mib)
+                submit_start = time.perf_counter()
+                submitted_at = time.perf_counter()
+                future = executor.submit(
+                    _save_loop_cache_tensor,
+                    cached_chunk,
+                    cache_path,
+                    frames_to_cache,
+                    chunk_idx,
+                    estimated_mib,
+                )
+                _loop_cache_log(
+                    "cache save submit",
+                    time.perf_counter() - submit_start,
+                    chunk_idx,
+                    extra=f"frames={frames_to_cache}; tensor={estimated_mib:.2f} MiB; path={cache_path}",
+                )
+                return {
+                    "future": future,
+                    "frames": frames_to_cache,
+                    "chunk_idx": chunk_idx,
+                    "estimated_mib": estimated_mib,
+                    "path": cache_path,
+                    "submitted_at": submitted_at,
+                }
 
             def _load_loop_cache_entry(entry):
                 entry = _resolve_loop_cache_entry(entry)
                 if "tensor" in entry:
+                    _loop_cache_log(
+                        "cache load from memory",
+                        0.0,
+                        entry.get("chunk_idx"),
+                        extra=f"frames={entry.get('frames', '?')}; tensor={entry.get('estimated_mib', 0.0):.2f} MiB",
+                    )
                     return entry["tensor"]
+                load_start = time.perf_counter()
                 try:
-                    return torch.load(entry["path"], map_location="cpu", weights_only=True)
+                    chunk = torch.load(entry["path"], map_location="cpu", weights_only=True)
                 except TypeError:
-                    return torch.load(entry["path"], map_location="cpu")
+                    chunk = torch.load(entry["path"], map_location="cpu")
+                file_mib = _loop_file_mib(entry["path"])
+                file_extra = f"{file_mib:.2f} MiB" if file_mib is not None else "unknown"
+                _loop_cache_log(
+                    "cache load",
+                    time.perf_counter() - load_start,
+                    entry.get("chunk_idx"),
+                    extra=f"frames={entry.get('frames', '?')}; file={file_extra}; path={entry['path']}",
+                )
+                return chunk
 
             def _assemble_loop_cached_chunks(entries, max_frames):
                 if not entries or max_frames <= 0:
                     return None
+                assemble_start = time.perf_counter()
                 total_frames = min(sum(int(entry["frames"]) for entry in entries), int(max_frames))
                 if total_frames <= 0:
                     return None
@@ -3300,10 +3425,17 @@ class WanVideoSampler:
                         raise RuntimeError(
                             f"SCAIL-2 loop tensor cache shape mismatch: expected "
                             f"{tuple(gen_video.shape[0:1] + gen_video.shape[2:])}, got {tuple(chunk.shape)}"
-                        )
+                    )
                     take = min(int(chunk.shape[1]), total_frames - write_pos)
                     if take > 0:
+                        copy_start = time.perf_counter()
                         gen_video[:, write_pos:write_pos + take].copy_(chunk[:, :take])
+                        _loop_cache_log(
+                            "assemble copy",
+                            time.perf_counter() - copy_start,
+                            entry.get("chunk_idx"),
+                            extra=f"frames={take}; write_pos={write_pos}",
+                        )
                         write_pos += take
                     entry.pop("tensor", None)
                     return write_pos
@@ -3317,6 +3449,11 @@ class WanVideoSampler:
                     chunk = _load_loop_cache_entry(entry)
                     write_pos = _copy_cached_chunk(chunk, entry, write_pos)
                     del chunk
+                _loop_cache_log(
+                    "assemble complete",
+                    time.perf_counter() - assemble_start,
+                    extra=f"frames={write_pos}; entries={len(entries)}",
+                )
                 return gen_video
 
             def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
@@ -3646,6 +3783,7 @@ class WanVideoSampler:
                     seq_len = math.ceil((latent.shape[2] * latent.shape[3]) / 4 * latent.shape[1])
                     chunk_pbar = tqdm(total=len(chunk_timesteps), desc=f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}", position=0, leave=True)
                     old_scail_freeze_mask = scail_freeze_mask
+                    sample_start = time.perf_counter()
                     try:
                         for i, t in enumerate(chunk_timesteps):
                             if chunk_two_phase:
@@ -3700,6 +3838,12 @@ class WanVideoSampler:
                         scail_freeze_mask = old_scail_freeze_mask
                         chunk_pbar.close()
                         self.cache_state = [None, None]
+                        _loop_cache_log(
+                            "sampling loop",
+                            time.perf_counter() - sample_start,
+                            chunk_idx,
+                            extra=f"steps={len(chunk_timesteps)}",
+                        )
 
                     if full_freeze_state is not None and not chunk_two_phase:
                         latent = _apply_local_freeze_state(latent, full_freeze_state).detach()
@@ -3714,18 +3858,44 @@ class WanVideoSampler:
                         phase1_freeze_state,
                         phase2_freeze_state,
                     )
+                    chunk_boundary_start = time.perf_counter()
+                    pre_decode_cleanup_start = time.perf_counter()
                     _maybe_offload_loop_vae()
                     mm.soft_empty_cache()
+                    _loop_cache_log("pre-decode cleanup", time.perf_counter() - pre_decode_cleanup_start, chunk_idx)
 
+                    vae_to_start = time.perf_counter()
                     vae.to(device)
-                    chunk_video = vae.decode(
+                    _loop_cache_log("vae to device", time.perf_counter() - vae_to_start, chunk_idx)
+
+                    decode_start = time.perf_counter()
+                    decoded_video = vae.decode(
                         latent.unsqueeze(0).to(device, vae.dtype),
                         device=device,
                         tiled=tiled_vae,
                         pbar=False,
-                    )[0].detach().cpu()
+                    )[0].detach()
+                    _loop_cache_log(
+                        "vae decode",
+                        time.perf_counter() - decode_start,
+                        chunk_idx,
+                        extra=f"shape={tuple(decoded_video.shape)}; dtype={decoded_video.dtype}",
+                    )
+
+                    cpu_transfer_start = time.perf_counter()
+                    chunk_video = decoded_video.cpu()
+                    del decoded_video
+                    _loop_cache_log(
+                        "decode cpu transfer",
+                        time.perf_counter() - cpu_transfer_start,
+                        chunk_idx,
+                        extra=f"tensor={_loop_tensor_mib(chunk_video):.2f} MiB",
+                    )
                     del latent
+                    vae_offload_start = time.perf_counter()
                     _maybe_offload_loop_vae()
+                    _loop_cache_log("vae offload after decode", time.perf_counter() - vae_offload_start, chunk_idx)
+                    output_slice_start = time.perf_counter()
                     if chunk_video.shape[1] > chunk_frames:
                         chunk_video = chunk_video[:, :chunk_frames]
 
@@ -3735,12 +3905,33 @@ class WanVideoSampler:
                     else:
                         output_chunk = chunk_video[:, prev_frame_count:].contiguous()
                     del chunk_video
+                    _loop_cache_log(
+                        "output slice",
+                        time.perf_counter() - output_slice_start,
+                        chunk_idx,
+                        extra=f"frames={int(output_chunk.shape[1])}; tensor={_loop_tensor_mib(output_chunk):.2f} MiB",
+                    )
 
                     if output_chunk.shape[1] > 0:
                         match_ref = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
                         if match_ref is not None:
+                            colormatch_start = time.perf_counter()
                             output_chunk = _color_match_video_frames(output_chunk, match_ref, chunk_index=chunk_idx)
+                            _loop_cache_log(
+                                "colormatch",
+                                time.perf_counter() - colormatch_start,
+                                chunk_idx,
+                                extra=f"method={scail2_transition_colormatch}; tensor={_loop_tensor_mib(output_chunk):.2f} MiB",
+                            )
+                        else:
+                            _loop_cache_log(
+                                "colormatch skipped",
+                                0.0,
+                                chunk_idx,
+                                extra=f"method={scail2_transition_colormatch}",
+                            )
 
+                        ref_update_start = time.perf_counter()
                         last_matched_ref_frame = (
                             output_chunk[:, -1:]
                             .float()
@@ -3751,6 +3942,7 @@ class WanVideoSampler:
                             .detach()
                             .cpu()
                         )
+                        _loop_cache_log("last matched ref update", time.perf_counter() - ref_update_start, chunk_idx)
                         remaining_cache_frames = loop_cache_frame_limit - cached_loop_frame_count
                         if pending_loop_cache_entry is not None:
                             _resolve_loop_cache_entry(pending_loop_cache_entry)
@@ -3772,8 +3964,22 @@ class WanVideoSampler:
                         if chunk_idx + 1 < num_chunks:
                             anchor_frame_count = min(prev_frame_count, int(output_chunk.shape[1]))
                             if anchor_frame_count > 0:
+                                anchor_slice_start = time.perf_counter()
                                 anchor_frames = output_chunk[:, -anchor_frame_count:].contiguous()
+                                _loop_cache_log(
+                                    "anchor slice",
+                                    time.perf_counter() - anchor_slice_start,
+                                    chunk_idx,
+                                    extra=f"frames={anchor_frame_count}; tensor={_loop_tensor_mib(anchor_frames):.2f} MiB",
+                                )
+                                anchor_encode_start = time.perf_counter()
                                 prev_anchor_latents = _encode_anchor_from_video(anchor_frames)
+                                _loop_cache_log(
+                                    "anchor encode",
+                                    time.perf_counter() - anchor_encode_start,
+                                    chunk_idx,
+                                    extra=f"latents={tuple(prev_anchor_latents.shape)}",
+                                )
                         if anchor_frames is not None:
                             del anchor_frames
                         del output_chunk
@@ -3782,8 +3988,15 @@ class WanVideoSampler:
                     if chunk_idx == 0:
                         scail2_transition_raw_last_frame = None
 
+                    chunk_cleanup_start = time.perf_counter()
                     mm.soft_empty_cache()
                     gc.collect()
+                    _loop_cache_log("chunk cleanup", time.perf_counter() - chunk_cleanup_start, chunk_idx)
+                    _loop_cache_log(
+                        "post-sampling boundary total",
+                        time.perf_counter() - chunk_boundary_start,
+                        chunk_idx,
+                    )
 
                 if pending_loop_cache_entry is not None:
                     _resolve_loop_cache_entry(pending_loop_cache_entry)
