@@ -5246,7 +5246,7 @@ class WanVideoSampler:
                     # differential diffusion inpaint
                     if scail_context_freeze_direct_mask:
                         image_latent = original_image.to(device)
-                        mask = scail_freeze_mask[0].to(latent) > 0.5
+                        mask = (scail_freeze_mask[0] > 0.5).to(latent)
                         latent = image_latent * mask + latent * (1-mask)
                     elif masks is not None:
                         image_latent = None
