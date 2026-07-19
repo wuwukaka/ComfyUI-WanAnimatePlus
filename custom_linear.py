@@ -274,6 +274,37 @@ class CustomLinear(nn.Linear):
             self._apply_single_lora_impl = self._apply_single_lora_direct
             self._linear_forward_impl = self._linear_forward_direct
 
+    def _apply(self, fn, recurse=True):
+        if getattr(self, "_comfy_quant_format", None) is None:
+            return super()._apply(fn, recurse=recurse)
+
+        if recurse:
+            for module in self.children():
+                module._apply(fn)
+
+        for key, param in self._parameters.items():
+            if param is None:
+                continue
+            param_grad = param.grad
+            with torch.no_grad():
+                param_applied = fn(param)
+            if (not torch.is_inference_mode_enabled()) and param_applied.is_inference():
+                param_applied = param_applied.clone()
+            out_param = nn.Parameter(param_applied, requires_grad=param.requires_grad)
+            if param_grad is not None:
+                with torch.no_grad():
+                    grad_applied = fn(param_grad)
+                if (not torch.is_inference_mode_enabled()) and grad_applied.is_inference():
+                    grad_applied = grad_applied.clone()
+                out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
+            self._parameters[key] = out_param
+
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                self._buffers[key] = fn(buf)
+
+        return self
+
 
     # Direct implementations (no custom ops)
     def _apply_lora_direct(self, weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength):
