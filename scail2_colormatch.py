@@ -1,9 +1,11 @@
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -11,6 +13,11 @@ import numpy as np
 def _warn(logger, message):
     if logger is not None:
         logger.warning(message)
+
+
+def _info(logger, message):
+    if logger is not None:
+        logger.info(message)
 
 
 def _context(stage, method, chunk_index=None, frame_index=None):
@@ -76,6 +83,138 @@ def _run_worker(src_path, ref_path, out_path, method, timeout):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
 
 
+def _shape_arg(shape):
+    return ",".join(str(int(v)) for v in shape)
+
+
+def _parse_shape_arg(value):
+    return tuple(int(part) for part in value.split(",") if part)
+
+
+def _decode_worker_metrics(stdout):
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _run_shared_memory_worker(video_np, ref_np, method, timeout):
+    """Run color_matcher in an isolated worker using shared memory instead of .npy files."""
+    try:
+        from multiprocessing import shared_memory
+    except Exception as e:
+        return {"ok": False, "fallback": True, "reason": f"shared_memory unavailable: {e}"}
+
+    src_shm = ref_shm = out_shm = None
+    try:
+        video_np = np.ascontiguousarray(video_np.astype(np.float32, copy=False))
+        ref_np = np.ascontiguousarray(ref_np.astype(np.float32, copy=False))
+        src_shm = shared_memory.SharedMemory(create=True, size=video_np.nbytes)
+        ref_shm = shared_memory.SharedMemory(create=True, size=ref_np.nbytes)
+        out_shm = shared_memory.SharedMemory(create=True, size=video_np.nbytes)
+
+        copy_start = time.perf_counter()
+        src_arr = np.ndarray(video_np.shape, dtype=video_np.dtype, buffer=src_shm.buf)
+        ref_arr = np.ndarray(ref_np.shape, dtype=ref_np.dtype, buffer=ref_shm.buf)
+        src_arr[...] = video_np
+        ref_arr[...] = ref_np
+        copy_in_seconds = time.perf_counter() - copy_start
+
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--worker-shm",
+            "--src-shm",
+            src_shm.name,
+            "--src-shape",
+            _shape_arg(video_np.shape),
+            "--src-dtype",
+            str(video_np.dtype),
+            "--ref-shm",
+            ref_shm.name,
+            "--ref-shape",
+            _shape_arg(ref_np.shape),
+            "--ref-dtype",
+            str(ref_np.dtype),
+            "--out-shm",
+            out_shm.name,
+            "--out-shape",
+            _shape_arg(video_np.shape),
+            "--out-dtype",
+            str(video_np.dtype),
+            "--method",
+            method,
+        ]
+
+        worker_start = time.perf_counter()
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            return {
+                "ok": False,
+                "fallback": False,
+                "reason": f"TimeoutExpired: timeout={timeout}s",
+                "copy_in_seconds": copy_in_seconds,
+                "worker_seconds": time.perf_counter() - worker_start,
+            }
+
+        worker_seconds = time.perf_counter() - worker_start
+        metrics = _decode_worker_metrics(result.stdout)
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "fallback": False,
+                "reason": _failure_reason(result=result),
+                "copy_in_seconds": copy_in_seconds,
+                "worker_seconds": worker_seconds,
+                "metrics": metrics,
+            }
+
+        copy_out_start = time.perf_counter()
+        out_arr = np.ndarray(video_np.shape, dtype=video_np.dtype, buffer=out_shm.buf).copy()
+        copy_out_seconds = time.perf_counter() - copy_out_start
+        if out_arr.shape != video_np.shape or not np.isfinite(out_arr).all():
+            return {
+                "ok": False,
+                "fallback": False,
+                "reason": f"invalid shared-memory worker output shape={out_arr.shape}, expected={video_np.shape}, or non-finite output",
+                "copy_in_seconds": copy_in_seconds,
+                "worker_seconds": worker_seconds,
+                "copy_out_seconds": copy_out_seconds,
+                "metrics": metrics,
+            }
+
+        return {
+            "ok": True,
+            "output": np.ascontiguousarray(np.clip(out_arr.astype(np.float32, copy=False), 0.0, 1.0)),
+            "copy_in_seconds": copy_in_seconds,
+            "worker_seconds": worker_seconds,
+            "copy_out_seconds": copy_out_seconds,
+            "metrics": metrics,
+        }
+    except Exception as e:
+        return {"ok": False, "fallback": True, "reason": f"{type(e).__name__}: {e}"}
+    finally:
+        for shm in (src_shm, ref_shm, out_shm):
+            if shm is None:
+                continue
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+
 def _failure_reason(result=None, exc=None):
     if exc is not None:
         return f"{type(exc).__name__}: {exc}"
@@ -97,6 +236,29 @@ def safe_color_match_video_bhwc(video, ref, method, stage, logger=None, chunk_in
     if validated is None:
         return video
     video_np, ref_np = validated
+    timeout = max(60, int(video_np.shape[0]) * 10)
+
+    shm_result = _run_shared_memory_worker(video_np, ref_np, method, timeout)
+    if shm_result.get("ok"):
+        metrics = shm_result.get("metrics", {})
+        _info(
+            logger,
+            f"SCAIL-2 colormatch shared-memory worker completed ({_context(stage, method, chunk_index)}): "
+            f"copy_in={shm_result.get('copy_in_seconds', 0.0):.2f}s, "
+            f"worker={shm_result.get('worker_seconds', 0.0):.2f}s, "
+            f"transfer={float(metrics.get('transfer_seconds', 0.0)):.2f}s, "
+            f"copy_out={shm_result.get('copy_out_seconds', 0.0):.2f}s, "
+            f"frames={int(metrics.get('frames', video_np.shape[0]))}"
+        )
+        return shm_result["output"]
+
+    reason = shm_result.get("reason", "unknown shared-memory worker failure")
+    _warn(
+        logger,
+        f"SCAIL-2 colormatch shared-memory worker failed or unavailable ({_context(stage, method, chunk_index)}): "
+        f"{reason}; falling back to .npy worker"
+    )
+
     tmp_dir = tempfile.mkdtemp(prefix="wananimateplus_scail2_colormatch_")
     try:
         src_path = os.path.join(tmp_dir, "src.npy")
@@ -105,7 +267,6 @@ def safe_color_match_video_bhwc(video, ref, method, stage, logger=None, chunk_in
         np.save(src_path, video_np)
         np.save(ref_path, ref_np)
 
-        timeout = max(60, int(video_np.shape[0]) * 10)
         try:
             result = _run_worker(src_path, ref_path, out_path, method, timeout)
             if result.returncode == 0 and os.path.exists(out_path):
@@ -192,15 +353,14 @@ def safe_color_match_video_bhwc(video, ref, method, stage, logger=None, chunk_in
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _worker_main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--src", required=True)
-    parser.add_argument("--ref", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--method", required=True)
-    args = parser.parse_args()
+def _require_worker_args(args, names):
+    missing = [name for name in names if getattr(args, name) is None]
+    if missing:
+        raise ValueError(f"missing worker argument(s): {', '.join(missing)}")
 
+
+def _run_color_match_npy_worker(args):
+    _require_worker_args(args, ["src", "ref", "out", "method"])
     from color_matcher import ColorMatcher
 
     video = np.load(args.src).astype(np.float32, copy=False)
@@ -220,6 +380,105 @@ def _worker_main():
             raise ValueError("non-finite output")
         matched.append(out)
     np.save(args.out, np.stack(matched, axis=0).astype(np.float32, copy=False))
+
+
+def _run_color_match_shm_worker(args):
+    _require_worker_args(
+        args,
+        [
+            "src_shm",
+            "src_shape",
+            "src_dtype",
+            "ref_shm",
+            "ref_shape",
+            "ref_dtype",
+            "out_shm",
+            "out_shape",
+            "out_dtype",
+            "method",
+        ],
+    )
+    from multiprocessing import shared_memory
+    from color_matcher import ColorMatcher
+
+    src_shm = ref_shm = out_shm = None
+    total_start = time.perf_counter()
+    transfer_seconds = 0.0
+    try:
+        src_shape = _parse_shape_arg(args.src_shape)
+        ref_shape = _parse_shape_arg(args.ref_shape)
+        out_shape = _parse_shape_arg(args.out_shape)
+        src_dtype = np.dtype(args.src_dtype)
+        ref_dtype = np.dtype(args.ref_dtype)
+        out_dtype = np.dtype(args.out_dtype)
+
+        src_shm = shared_memory.SharedMemory(name=args.src_shm)
+        ref_shm = shared_memory.SharedMemory(name=args.ref_shm)
+        out_shm = shared_memory.SharedMemory(name=args.out_shm)
+
+        video = np.ndarray(src_shape, dtype=src_dtype, buffer=src_shm.buf)
+        ref = np.ndarray(ref_shape, dtype=ref_dtype, buffer=ref_shm.buf)
+        out_video = np.ndarray(out_shape, dtype=out_dtype, buffer=out_shm.buf)
+
+        if video.ndim != 4 or video.shape[-1] != 3:
+            raise ValueError(f"invalid src shape {video.shape}")
+        if ref.ndim != 3 or ref.shape[-1] != 3:
+            raise ValueError(f"invalid ref shape {ref.shape}")
+        if out_video.shape != video.shape:
+            raise ValueError(f"invalid output shape {out_video.shape}, expected {video.shape}")
+
+        cm = ColorMatcher()
+        for frame_index, frame in enumerate(video):
+            transfer_start = time.perf_counter()
+            out = np.asarray(cm.transfer(src=frame, ref=ref, method=args.method), dtype=np.float32)
+            transfer_seconds += time.perf_counter() - transfer_start
+            if out.shape != frame.shape:
+                raise ValueError(f"invalid output shape {out.shape}, expected {frame.shape}, frame={frame_index}")
+            if not np.isfinite(out).all():
+                raise ValueError(f"non-finite output, frame={frame_index}")
+            out_video[frame_index] = out
+
+        print(
+            json.dumps(
+                {
+                    "frames": int(video.shape[0]),
+                    "transfer_seconds": transfer_seconds,
+                    "total_seconds": time.perf_counter() - total_start,
+                }
+            ),
+            flush=True,
+        )
+    finally:
+        for shm in (src_shm, ref_shm, out_shm):
+            if shm is not None:
+                shm.close()
+
+
+def _worker_main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--worker-shm", action="store_true")
+    parser.add_argument("--src")
+    parser.add_argument("--ref")
+    parser.add_argument("--out")
+    parser.add_argument("--src-shm")
+    parser.add_argument("--src-shape")
+    parser.add_argument("--src-dtype")
+    parser.add_argument("--ref-shm")
+    parser.add_argument("--ref-shape")
+    parser.add_argument("--ref-dtype")
+    parser.add_argument("--out-shm")
+    parser.add_argument("--out-shape")
+    parser.add_argument("--out-dtype")
+    parser.add_argument("--method")
+    args = parser.parse_args()
+
+    if args.worker_shm:
+        _run_color_match_shm_worker(args)
+    elif args.worker:
+        _run_color_match_npy_worker(args)
+    else:
+        raise ValueError("missing worker mode")
 
 
 if __name__ == "__main__":
