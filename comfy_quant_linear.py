@@ -27,7 +27,7 @@
 
 """Load ComfyUI-native quantized checkpoints in WanAnimatePlus.
 
-ComfyUI native NVFP4, FP8, and MXFP8 checkpoints store packed linear weights
+ComfyUI native NVFP4, FP8, MXFP8, and ConvRot checkpoints store packed linear weights
 together with ``*.comfy_quant`` JSON metadata and scale tensors. Some NVFP4
 checkpoints only store packed uint8 weights plus scale tensors; this module
 treats those as native quant weights too. It reconstructs weights as ComfyUI
@@ -110,6 +110,11 @@ except Exception as e:
                 "comfy_tensor_layout": "TensorWiseINT8Layout",
                 "quantize_input": False,
             },
+            "convrot_w4a4": {
+                "storage_t": torch.int8,
+                "comfy_tensor_layout": "TensorCoreConvRotW4A4Layout",
+                "quantize_input": False,
+            },
         }
         _COMFY_QUANT_BACKEND = "comfy_kitchen.tensor"
     except Exception as kitchen_e:
@@ -141,6 +146,17 @@ def _ensure_comfy_quant_backend():
     )
 
 
+def _get_layout_class_checked(layout_name, fmt):
+    layout = get_layout_class(layout_name) if get_layout_class is not None else None
+    if layout is None or not hasattr(layout, "Params"):
+        raise RuntimeError(
+            f"ComfyUI-native quantization format {fmt} requires layout {layout_name}, "
+            "but the running ComfyUI/comfy_kitchen backend does not provide it. "
+            "Update ComfyUI/comfy_kitchen or use a checkpoint with a supported quantization format."
+        )
+    return layout
+
+
 def _decode_comfy_quant(t: torch.Tensor) -> dict:
     raw = t.to(torch.uint8).cpu().numpy().tobytes()
     return json.loads(bytes(raw).decode("utf-8"))
@@ -148,8 +164,43 @@ def _decode_comfy_quant(t: torch.Tensor) -> dict:
 
 def _logical_weight_shape(fmt, packed_weight):
     out_features = packed_weight.shape[0]
-    in_features = packed_weight.shape[1] * (2 if fmt == "nvfp4" else 1)
+    in_features = packed_weight.shape[1] * (2 if fmt in ("nvfp4", "convrot_w4a4") else 1)
     return out_features, in_features
+
+
+def _layer_quant_conf(sd, prefix):
+    quant_key = prefix + "comfy_quant"
+    if sd is None or quant_key not in sd:
+        return {}
+    conf = _decode_comfy_quant(sd[quant_key])
+    return conf if isinstance(conf, dict) else {}
+
+
+def _layer_params_conf(layer_conf):
+    params_conf = layer_conf.get("params", {})
+    return params_conf if isinstance(params_conf, dict) else {}
+
+
+def _quant_params_for_format(fmt, layer_conf):
+    params_conf = _layer_params_conf(layer_conf)
+    if fmt == "int8_tensorwise":
+        if layer_conf.get("convrot", params_conf.get("convrot", False)):
+            return {
+                "convrot": True,
+                "convrot_groupsize": int(
+                    layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
+                ),
+            }
+        return {}
+    if fmt == "convrot_w4a4":
+        return {
+            "convrot_groupsize": int(
+                layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
+            ),
+            "quant_group_size": 64,
+            "linear_dtype": str(layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4"))),
+        }
+    return {}
 
 
 def _is_weight_key(weight_key):
@@ -260,7 +311,7 @@ def get_state_dict_weight_shape(sd, weight_key):
         return shape
 
     fmt = _decode_comfy_quant(sd[quant_key]).get("format")
-    if fmt == "nvfp4":
+    if fmt in ("nvfp4", "convrot_w4a4"):
         return _logical_weight_shape(fmt, sd[weight_key])
     return shape
 
@@ -278,7 +329,9 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     qcfg = QUANT_ALGOS[fmt]
     layout_name = qcfg["comfy_tensor_layout"]
-    layout = get_layout_class(layout_name)
+    layout = _get_layout_class_checked(layout_name, fmt)
+    layer_conf = _layer_quant_conf(sd, prefix)
+    quant_params = _quant_params_for_format(fmt, layer_conf)
 
     weight = sd[prefix + "weight"].to(device=device, dtype=qcfg["storage_t"])
     out_features, in_features = get_state_dict_weight_shape(sd, prefix + "weight")
@@ -308,15 +361,19 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
         block_scale = None
     elif fmt == "int8_tensorwise":
         scale = sd[prefix + "weight_scale"].to(device=device)
-        scales = {"scale": scale}
-        # Pass convrot params from comfy_quant JSON to TensorWiseINT8Layout.Params
-        if prefix + "comfy_quant" in sd:
-            layer_conf = _decode_comfy_quant(sd[prefix + "comfy_quant"])
-            if layer_conf.get("convrot", False):
-                scales["convrot"] = True
-                scales["convrot_groupsize"] = int(layer_conf.get("convrot_groupsize", 256))
         params = layout.Params(
-            **scales,
+            scale=scale,
+            **quant_params,
+            orig_dtype=compute_dtype,
+            orig_shape=(out_features, in_features),
+        )
+        tensor_scale = scale
+        block_scale = None
+    elif fmt == "convrot_w4a4":
+        scale = sd[prefix + "weight_scale"].to(device=device)
+        params = layout.Params(
+            scale=scale,
+            **quant_params,
             orig_dtype=compute_dtype,
             orig_shape=(out_features, in_features),
         )
@@ -332,7 +389,7 @@ def _build_quantized_tensor(sd, prefix, device, compute_dtype):
         tensor_scale = scale
         block_scale = None
 
-    return QuantizedTensor(weight, layout_name, params), fmt, layout_name, tensor_scale, block_scale
+    return QuantizedTensor(weight, layout_name, params), fmt, layout_name, tensor_scale, block_scale, quant_params
 
 
 def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
@@ -351,6 +408,9 @@ def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
     if fmt not in QUANT_ALGOS:
         raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
     layout_name = QUANT_ALGOS[fmt]["comfy_tensor_layout"]
+    _get_layout_class_checked(layout_name, fmt)
+    layer_conf = _layer_quant_conf(sd, prefix)
+    quant_params = _quant_params_for_format(fmt, layer_conf)
     weight_shape = tuple(get_state_dict_weight_shape(sd, prefix + "weight"))
 
     if fmt == "nvfp4":
@@ -372,6 +432,7 @@ def get_comfy_quant_metadata(sd, prefix, device, compute_dtype):
         "backend": _COMFY_QUANT_BACKEND,
         "weight_scale": tensor_scale,
         "block_scale": block_scale,
+        "quant_params": quant_params,
     }
 
 
@@ -381,6 +442,7 @@ def bind_comfy_quant_metadata(module, metadata):
     module._comfy_quant_layout = metadata["layout"]
     module._comfy_quant_logical_shape = tuple(metadata["logical_shape"])
     module._comfy_quant_backend = metadata["backend"]
+    module._comfy_quant_params = dict(metadata.get("quant_params") or {})
     tensor_scale = metadata["weight_scale"]
     block_scale = metadata["block_scale"]
     if hasattr(module, "_comfy_quant_weight_scale"):
@@ -458,6 +520,7 @@ def _get_nvfp4_metadata_from_prefix(sd, prefix, device, compute_dtype, logical_s
         "backend": _COMFY_QUANT_BACKEND,
         "weight_scale": tensor_scale.to(device=device),
         "block_scale": block_scale.to(device=device).view(dtype=torch.float8_e4m3fn),
+        "quant_params": {},
     }
 
 
@@ -640,13 +703,27 @@ def dequantize_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_
             else:
                 # Manual dequant: int8 * float32 scale → compute_dtype
                 weight = weight.to(device=scale.device, dtype=compute_dtype) * scale.to(dtype=compute_dtype)
+        elif fmt == "convrot_w4a4":
+            raise RuntimeError(
+                "convrot_w4a4 fallback dequantization requires QuantizedTensor.dequantize(); "
+                "raw storage fallback is not supported by WanAnimatePlus."
+            )
         else:
             raise RuntimeError(f"Unsupported ComfyUI-native quantization format: {fmt}")
 
     return _slice_logical_shape(weight, logical_shape)
 
 
-def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, block_scale=None, logical_shape=None, layout_name=None):
+def quantize_raw_comfy_quant_weight(
+    weight,
+    fmt,
+    compute_dtype,
+    scale=None,
+    block_scale=None,
+    logical_shape=None,
+    layout_name=None,
+    quant_params=None,
+):
     """Wrap a raw native quantized storage tensor as a QuantizedTensor."""
     _ensure_comfy_quant_backend()
     if fmt not in QUANT_ALGOS:
@@ -654,7 +731,8 @@ def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, bloc
     if logical_shape is None:
         logical_shape = _logical_weight_shape(fmt, weight)
     layout_name = layout_name or QUANT_ALGOS[fmt]["comfy_tensor_layout"]
-    layout = get_layout_class(layout_name)
+    layout = _get_layout_class_checked(layout_name, fmt)
+    quant_params = dict(quant_params or {})
 
     qcfg = QUANT_ALGOS[fmt]
     weight = weight.to(dtype=qcfg["storage_t"])
@@ -683,6 +761,16 @@ def quantize_raw_comfy_quant_weight(weight, fmt, compute_dtype, scale=None, bloc
             raise RuntimeError("int8_tensorwise QuantizedTensor rebuild requires weight_scale")
         params = layout.Params(
             scale=scale,
+            **quant_params,
+            orig_dtype=compute_dtype,
+            orig_shape=tuple(logical_shape),
+        )
+    elif fmt == "convrot_w4a4":
+        if scale is None:
+            raise RuntimeError("convrot_w4a4 QuantizedTensor rebuild requires weight_scale")
+        params = layout.Params(
+            scale=scale,
+            **quant_params,
             orig_dtype=compute_dtype,
             orig_shape=tuple(logical_shape),
         )
@@ -802,7 +890,9 @@ def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device
             raise RuntimeError("ComfyUI-native quantized Linear materialization requires dtype and device")
 
         weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
-        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, materialize_device, compute_dtype)
+        qt, fmt, layout_name, tensor_scale, block_scale, quant_params = _build_quantized_tensor(
+            sd, child_prefix, materialize_device, compute_dtype
+        )
         module.weight = nn.Parameter(qt, requires_grad=False)
         module.out_features, module.in_features = weight_shape
 
@@ -817,6 +907,7 @@ def ensure_comfy_quant_linear_materialized(model, sd, compute_dtype, load_device
             "backend": _COMFY_QUANT_BACKEND,
             "weight_scale": tensor_scale,
             "block_scale": block_scale,
+            "quant_params": quant_params,
         })
         rebuilt += 1
 
@@ -840,7 +931,9 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
             continue
 
         weight_shape = get_state_dict_weight_shape(sd, child_prefix + "weight")
-        qt, fmt, layout_name, tensor_scale, block_scale = _build_quantized_tensor(sd, child_prefix, load_device, compute_dtype)
+        qt, fmt, layout_name, tensor_scale, block_scale, quant_params = _build_quantized_tensor(
+            sd, child_prefix, load_device, compute_dtype
+        )
         module.weight = nn.Parameter(qt, requires_grad=False)
         module.out_features, module.in_features = weight_shape
 
@@ -855,6 +948,7 @@ def replace_with_comfy_quant_linear(model, sd, compute_dtype, load_device, prefi
             "backend": _COMFY_QUANT_BACKEND,
             "weight_scale": tensor_scale,
             "block_scale": block_scale,
+            "quant_params": quant_params,
         })
 
     return model

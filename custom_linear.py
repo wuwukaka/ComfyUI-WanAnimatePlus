@@ -584,6 +584,7 @@ class CustomLinear(nn.Linear):
             block_scale=block_scale,
             logical_shape=getattr(self, "_comfy_quant_logical_shape", None),
             layout_name=getattr(self, "_comfy_quant_layout", None),
+            quant_params=getattr(self, "_comfy_quant_params", None),
         )
 
     def _is_comfy_quant_tensor(self, weight):

@@ -40,6 +40,10 @@ from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar
+try:
+    from comfy.utils import convert_old_quants
+except Exception:
+    convert_old_quants = None
 import comfy.model_base
 from comfy.sd import load_lora_for_models
 try:
@@ -49,6 +53,26 @@ except Exception:
     pass
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_torch_file_with_quant_metadata(path, device=None, safe_load=True):
+    try:
+        sd, metadata = load_torch_file(path, device=device, safe_load=safe_load, return_metadata=True)
+    except TypeError:
+        sd = load_torch_file(path, device=device, safe_load=safe_load)
+        metadata = None
+
+    if metadata and "_quantization_metadata" in metadata:
+        if convert_old_quants is None:
+            raise RuntimeError(
+                "This checkpoint stores ComfyUI quantization metadata in safetensors metadata, "
+                "but the running ComfyUI build does not provide convert_old_quants. "
+                "Update ComfyUI or use a checkpoint with .comfy_quant tensors."
+            )
+        sd, _ = convert_old_quants(sd, "", metadata=metadata)
+
+    return sd
+
 
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
@@ -1256,7 +1280,7 @@ class WanVideoModelLoader:
 
         gguf_reader = None
         if not gguf:
-            sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+            sd = _load_torch_file_with_quant_metadata(model_path, device=transformer_load_device, safe_load=True)
         else:
             gguf_reader=[]
             from .gguf.gguf import load_gguf
@@ -1339,7 +1363,9 @@ class WanVideoModelLoader:
                 else:
                     if _model["path"].endswith(".gguf"):
                         raise ValueError("With GGUF extra model the main model must also be GGUF quantized model")
-                    extra_sd = load_torch_file(_model["path"], device=transformer_load_device, safe_load=True)
+                    extra_sd = _load_torch_file_with_quant_metadata(
+                        _model["path"], device=transformer_load_device, safe_load=True
+                    )
                 if "audio_model.patch_embedding.0.weight" in extra_sd:
                     extra_audio_model = True
                 sd.update(extra_sd)
@@ -1691,7 +1717,9 @@ class WanVideoModelLoader:
                 gguf_reader.append(extra_reader)
                 del extra_reader
             else:
-                extra_sd_temp = load_torch_file(extra_model_path, device=transformer_load_device, safe_load=True)
+                extra_sd_temp = _load_torch_file_with_quant_metadata(
+                    extra_model_path, device=transformer_load_device, safe_load=True
+                )
 
             for k, v in extra_sd_temp.items():
                 extra_sd[k.replace("audio_proj.", "multitalk_audio_proj.")] = v
