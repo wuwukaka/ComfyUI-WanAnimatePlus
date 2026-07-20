@@ -35,12 +35,12 @@ Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. I
 
 ### RunningHub Online Workflow Examples
 
-RunningHub is an online ComfyUI compute platform. If your local hardware cannot run AI models, you can run the workflows below on RunningHub; register through the links to receive 1000 credits.
+RunningHub is an online ComfyUI compute platform. If your local hardware cannot run AI models, you can run the workflows below for free on RunningHub; register through the links to receive 1000 credits.
 
 | Scail2 Ultra-long Video Two-stage Sampling Non-degradation Workflow | Ultra-powerful all-in-one WanAnimate Plus version workflow |
 |---|---|
 | [![Scail2 Ultra-long Video Two-stage Sampling Non-degradation Workflow](docs/images/image_006.png)](https://www.runninghub.ai/post/2073345711527444480/?inviteCode=rh-v1565) | [![Ultra-powerful all-in-one WanAnimate Plus version workflow](docs/images/image_007.png)](https://www.runninghub.ai/post/2073345712362110976/?inviteCode=rh-v1565) |
-| [Scail2 Ultra-long Video Two-stage Sampling Non-degradation Workflow](https://www.runninghub.ai/post/2073345711527444480/?inviteCode=rh-v1565) | [Ultra-powerful all-in-one WanAnimate Plus version workflow! Unlimited duration, no degradation, and customizable outfits!](https://www.runninghub.ai/post/2073345712362110976/?inviteCode=rh-v1565) |
+| https://www.runninghub.ai/post/2073345711527444480/?inviteCode=rh-v1565 | https://www.runninghub.ai/post/2073345712362110976/?inviteCode=rh-v1565 |
 
 ### prefix_frames & transition_video usage
 
