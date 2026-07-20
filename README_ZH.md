@@ -33,6 +33,15 @@
 
 ## 效果展示
 
+### RunningHub 在线运行示例
+
+RunningHub 是一个在线 ComfyUI 算力平台。如果你的本地配置无法运行 AI 模型，可以在 RunningHub 上运行下方工作流；点击链接注册可领取 1000 积分。
+
+| Scail2 超长视频二阶段采样无劣化示例流 | 超强全能 WanAnimate Plus 版工作流 |
+|---|---|
+| [![Scail2 超长视频二阶段采样无劣化示例流](docs/images/image_004.png)](https://www.runninghub.ai/zh-cn/post/2073345711527444480/?inviteCode=rh-v1565) | [![超强全能 WanAnimate Plus 版工作流](docs/images/image_005.png)](https://www.runninghub.ai/zh-cn/post/2073345712362110976/?inviteCode=rh-v1565) |
+| [Scail2 超长视频二阶段采样无劣化示例流](https://www.runninghub.ai/zh-cn/post/2073345711527444480/?inviteCode=rh-v1565) | [超强全能 WanAnimate Plus 版工作流！无限时长无劣化可换装！](https://www.runninghub.ai/zh-cn/post/2073345712362110976/?inviteCode=rh-v1565) |
+
 ### prefix_frames 与 transition_video 使用示例
 
 ![使用方法](docs/images/image_001.png)
