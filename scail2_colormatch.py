@@ -103,6 +103,41 @@ def _decode_worker_metrics(stdout):
     return {}
 
 
+def _format_mib(num_bytes):
+    return f"{num_bytes / (1024 * 1024):.1f} MiB"
+
+
+def _shared_memory_skip_reason(video_np, ref_np):
+    if not sys.platform.startswith("linux"):
+        return None
+
+    shm_dir = "/dev/shm"
+    required = int((video_np.nbytes * 2 + ref_np.nbytes) * 1.10)
+    if not os.path.isdir(shm_dir):
+        return (
+            f"{shm_dir} is unavailable; required={_format_mib(required)}; "
+            "skipping shared-memory worker"
+        )
+    if not os.access(shm_dir, os.R_OK | os.W_OK):
+        return (
+            f"{shm_dir} is not readable/writable; required={_format_mib(required)}; "
+            "skipping shared-memory worker"
+        )
+    try:
+        free = shutil.disk_usage(shm_dir).free
+    except Exception as e:
+        return (
+            f"could not inspect {shm_dir}: {type(e).__name__}: {e}; "
+            f"required={_format_mib(required)}; skipping shared-memory worker"
+        )
+    if free < required:
+        return (
+            f"{shm_dir} free={_format_mib(free)} required={_format_mib(required)}; "
+            "skipping shared-memory worker"
+        )
+    return None
+
+
 def _run_shared_memory_worker(video_np, ref_np, method, timeout):
     """Run color_matcher in an isolated worker using shared memory instead of .npy files."""
     try:
@@ -114,6 +149,10 @@ def _run_shared_memory_worker(video_np, ref_np, method, timeout):
     try:
         video_np = np.ascontiguousarray(video_np.astype(np.float32, copy=False))
         ref_np = np.ascontiguousarray(ref_np.astype(np.float32, copy=False))
+        skip_reason = _shared_memory_skip_reason(video_np, ref_np)
+        if skip_reason is not None:
+            return {"ok": False, "fallback": True, "reason": skip_reason}
+
         src_shm = shared_memory.SharedMemory(create=True, size=video_np.nbytes)
         ref_shm = shared_memory.SharedMemory(create=True, size=ref_np.nbytes)
         out_shm = shared_memory.SharedMemory(create=True, size=video_np.nbytes)
