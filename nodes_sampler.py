@@ -2511,7 +2511,8 @@ class WanVideoSampler:
         elif not multitalk_sampling and samples is not None and noise_mask is not None:
             thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
             thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
-            masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
+            noise_mask = noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device=device, dtype=thresholds.dtype)
+            masks = (1.0 - noise_mask) > thresholds
 
         latent_shift_loop = False
         if loop_args is not None and not scail2_looping:
@@ -3512,7 +3513,7 @@ class WanVideoSampler:
                 if strength <= 0.0:
                     return latent_in
                 mask = (local_mask.unsqueeze(0).to(latent_in) * strength).clamp(0.0, 1.0)
-                return local_latents.to(latent_in) * mask + latent_in * (1 - mask)
+                return local_latents.to(latent_in) * mask + latent_in * (1.0 - mask)
 
             def _make_local_freeze_base(local_latents, local_mask, latent_ref):
                 if local_latents is None or local_mask is None:
@@ -3533,7 +3534,7 @@ class WanVideoSampler:
                 scail_mask = (freeze_base["scail_mask"] * strength).clamp(0.0, 1.0)
                 return {
                     "frozen_part": freeze_base["latents"] * latent_mask,
-                    "inverse_mask": 1 - latent_mask,
+                    "inverse_mask": 1.0 - latent_mask,
                     "scail_mask": scail_mask.unsqueeze(0).repeat(1, channels, 1, 1, 1).to(device),
                 }
 
@@ -5017,7 +5018,8 @@ class WanVideoSampler:
 
                                     thresholds = torch.arange(len(timesteps), dtype=original_image.dtype) / len(timesteps)
                                     thresholds = thresholds.reshape(-1, 1, 1, 1, 1).to(device)
-                                    masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
+                                    noise_mask = noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device=device, dtype=thresholds.dtype)
+                                    masks = (1.0 - noise_mask) > thresholds
 
                             if isinstance(scheduler, dict):
                                 sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
@@ -5091,8 +5093,8 @@ class WanVideoSampler:
                                 if masks is not None:
                                     if i < len(timesteps) - 1:
                                         image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
-                                        mask = masks[i].to(latent)
-                                        latent = image_latent * mask + latent * (1-mask)
+                                        mask = masks[i].to(device=latent.device, dtype=latent.dtype)
+                                        latent = image_latent * mask + latent * (1.0 - mask)
 
                             del noise
                             if offload:
@@ -5246,8 +5248,8 @@ class WanVideoSampler:
                     # differential diffusion inpaint
                     if scail_context_freeze_direct_mask:
                         image_latent = original_image.to(device)
-                        mask = (scail_freeze_mask[0] > 0.5).to(latent)
-                        latent = image_latent * mask + latent * (1-mask)
+                        mask = (scail_freeze_mask[0] > 0.5).to(device=latent.device, dtype=latent.dtype)
+                        latent = image_latent * mask + latent * (1.0 - mask)
                     elif masks is not None:
                         image_latent = None
                         if scail_freeze_mask is not None:
@@ -5258,16 +5260,17 @@ class WanVideoSampler:
                                 original_image.to(device), torch.tensor([noise_timestep]), noise.to(device)
                             )
                         if image_latent is not None:
-                            mask = masks[idx].to(latent)
-                            latent = image_latent * mask + latent * (1-mask)
+                            mask = masks[idx].to(device=latent.device, dtype=latent.dtype)
+                            latent = image_latent * mask + latent * (1.0 - mask)
 
                     # TTM
                     if ttm_reference_latents is not None and (idx + ttm_start_step) < ttm_end_step:
+                        ttm_motion_mask = motion_mask.to(device=latent.device, dtype=latent.dtype)
                         if idx + ttm_start_step + 1 < len(sample_scheduler.all_timesteps):
                             noisy_latents = add_noise(ttm_reference_latents, noise, sample_scheduler.all_timesteps[idx + ttm_start_step + 1].to(noise.device)).to(latent)
-                            latent = latent * (1 - motion_mask) + noisy_latents * motion_mask
+                            latent = latent * (1.0 - ttm_motion_mask) + noisy_latents * ttm_motion_mask
                         else:
-                            latent = latent * (1 - motion_mask) + ttm_reference_latents.to(latent) * motion_mask
+                            latent = latent * (1.0 - ttm_motion_mask) + ttm_reference_latents.to(latent) * ttm_motion_mask
 
                     if freeinit_args is not None:
                         current_latent = latent.clone()
