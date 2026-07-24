@@ -11,7 +11,6 @@
 #   - Added SCAIL-2 bg_image reference/prefix composition for animation mode.
 #   - Added Bernini task guidance recommendations and native-aspect reference resizing.
 #   - Added WanAnimatePlus signature widget to the embeds node.
-#   - Added subprocess-isolated SCAIL-2 colormatch to prevent native color_matcher crashes from killing ComfyUI.
 #   - Added SCAIL-2 loop two-phase sampling settings; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
@@ -23,7 +22,6 @@ import hashlib
 from tqdm import tqdm
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
-from .scail2_colormatch import safe_color_match_video_bhwc
 from .taehv import TAEHV
 
 from comfy import model_management as mm
@@ -1960,20 +1958,17 @@ class WanAnimatePlusSCAIL2Embeds:
         return out
 
     @staticmethod
-    def _color_match_frames(frames, ref_frame, method, stage="transition_video"):
-        if method == "disabled":
+    def _color_match_frames(frames, ref_frame, method):
+        if method == "disabled" or ref_frame is None or frames is None or frames.shape[0] == 0:
             return frames
-        if frames is None:
-            safe_color_match_video_bhwc(None, None, method, stage, logger=log)
-            return frames
-
-        video_np = frames[:, :, :, :3].detach().cpu().float().clamp(0.0, 1.0).contiguous().numpy()
-        ref_np = None
-        if isinstance(ref_frame, torch.Tensor) and ref_frame.numel() > 0:
-            ref_np = ref_frame[:1, :, :, :3].detach().cpu().float().clamp(0.0, 1.0).contiguous().numpy()[0]
-
-        matched = safe_color_match_video_bhwc(video_np, ref_np, method, stage, logger=log)
-        return torch.from_numpy(matched).to(device=frames.device, dtype=frames.dtype).clamp(0.0, 1.0)
+        from color_matcher import ColorMatcher
+        cm = ColorMatcher()
+        ref_np = ref_frame[:1, :, :, :3].detach().cpu().float().numpy()[0]
+        matched = []
+        for frame in frames[:, :, :, :3]:
+            out = cm.transfer(src=frame.detach().cpu().float().numpy(), ref=ref_np, method=method)
+            matched.append(torch.from_numpy(out).to(device=frames.device, dtype=frames.dtype))
+        return torch.stack(matched, dim=0).clamp(0.0, 1.0)
 
     @staticmethod
     def _extract_mask_to_28ch(rgb_video):
