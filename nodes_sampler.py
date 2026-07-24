@@ -18,6 +18,7 @@
 #   - Added SCAIL-2 loop two-phase handoff sampling controls; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
+#   - Added a simplified WanAnimatePlus Easy Sampler wrapper node.
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
@@ -5392,6 +5393,72 @@ class WanVideoSamplerFromSettings(WanVideoSampler):
         return super().process(**sampler_inputs)
 
 
+class WanAnimatePlusEasySampler(WanVideoSamplerFromSettings):
+    DESCRIPTION = "Simplified WanAnimatePlus sampler exposing the common controls while using the same sampler settings path."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL",),
+                "image_embeds": ("WANVIDIMAGE_EMBEDS",),
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
+                "scheduler": (scheduler_list, {"default": "unipc"}),
+            },
+            "optional": {
+                "text_embeds": ("WANVIDEOTEXTEMBEDS",),
+                "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"}),
+                "context_options": ("WANVIDCONTEXT",),
+                "uni3c_embeds": ("UNI3C_EMBEDS",),
+            },
+        }
+
+    def process(
+        self,
+        model,
+        image_embeds,
+        steps,
+        cfg,
+        shift,
+        seed,
+        force_offload,
+        scheduler,
+        text_embeds=None,
+        samples=None,
+        context_options=None,
+        uni3c_embeds=None,
+    ):
+        params = inspect.signature(WanVideoSampler.process).parameters
+        sampler_inputs = {
+            name: param.default if param.default is not inspect.Parameter.empty else None
+            for name, param in params.items()
+            if name != "self"
+        }
+        sampler_inputs.update(
+            {
+                "model": model,
+                "image_embeds": image_embeds,
+                "steps": steps,
+                "cfg": cfg,
+                "shift": shift,
+                "seed": seed,
+                "force_offload": force_offload,
+                "scheduler": scheduler,
+                "riflex_freq_index": 0,
+                "text_embeds": text_embeds,
+                "samples": samples,
+                "context_options": context_options,
+                "uni3c_embeds": uni3c_embeds,
+                "rope_function": "comfy",
+            }
+        )
+        return super().process(sampler_inputs)
+
+
 class WanVideoSamplerExtraArgs():
     @classmethod
     def INPUT_TYPES(s):
@@ -5604,6 +5671,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSampler": WanVideoSampler,
     "WanVideoSamplerSettings": WanVideoSamplerSettings,
     "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
+    "WanAnimatePlusEasySampler": WanAnimatePlusEasySampler,
     "WanVideoSamplerv2": WanVideoSamplerv2,
     "WanVideoSamplerExtraArgs": WanVideoSamplerExtraArgs,
     "WanVideoScheduler": WanVideoScheduler,
@@ -5613,6 +5681,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSampler": "WanVideo Sampler",
     "WanVideoSamplerSettings": "WanVideo Sampler Settings",
     "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
+    "WanAnimatePlusEasySampler": "WanAnimatePlus Easy Sampler",
     "WanVideoSamplerv2": "WanVideo Sampler v2",
     "WanVideoSamplerExtraArgs": "WanVideoSampler v2 Extra Args",
     "WanVideoScheduler": "WanVideo Scheduler",
