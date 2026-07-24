@@ -89,6 +89,8 @@ The wuwukasi/wuwukaka additions/modifications include, without limitation:
 - Sampler/model safeguards and optimizations added for WanAnimatePlus paths,
   including graph-detach/inference tensor safeguards, T2V/Bernini/SCAIL fast
   paths, fast-path/cache helper logic, and attention-mode propagation.
+- Simplified Easy Sampler and Easy SamplerSettings convenience wrappers for
+  WanAnimatePlus sampling workflows.
 - Custom operation namespace changes, duplicate-registration safeguards, and
   WanAnimatePlus-specific custom op handling.
 - CustomLinear MXFP8/block-wise scale_weight handling and related

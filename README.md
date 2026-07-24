@@ -107,8 +107,9 @@ Restart ComfyUI after installation.
 1. Start ComfyUI and confirm the WanAnimatePlus nodes appear under the `WanAnimatePlus` category
 2. **Replace the entire workflow chain** with WanAnimatePlus counterparts: `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, `Decode`, and supporting nodes
 3. Do **not** mix original WanVideoWrapper nodes in the same workflow
-4. Connect `prefix_frames` and/or `transition_video` inputs as needed
-5. Example workflows are available in the `example_workflows/` directory
+4. For SCAIL-2 and WanAnimate workflows, `WanAnimatePlus Easy Sampler` or `WanAnimatePlus Easy SamplerSettings` is recommended because they keep the full sampler functionality while exposing only the common controls
+5. Connect `prefix_frames` and/or `transition_video` inputs as needed
+6. Example workflows are available in the `example_workflows/` directory
 
 ## Nodes
 
@@ -123,6 +124,7 @@ Core nodes:
 - `WanAnimatePlus ContextOptions`
 - `WanAnimatePlus AnimateEmbeds`
 - `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
+- `WanAnimatePlus Easy Sampler` / `WanAnimatePlus Easy SamplerSettings`
 - `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
 - `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
 - `WanAnimatePlus LoraSelect` / `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
@@ -132,6 +134,12 @@ Core nodes:
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
 - `WanAnimatePlus SCAIL_2 Embeds`
+
+### WanAnimatePlus Easy Sampler / Easy SamplerSettings
+
+These nodes are recommended for SCAIL-2 and WanAnimate workflows. They simplify the visible node panel to common controls such as `steps`, `cfg`, `shift`, `seed`, `force_offload`, and `scheduler`, while still using the full WanAnimatePlus sampler settings and feature path underneath.
+
+`WanAnimatePlus Easy Sampler` runs sampling directly. `WanAnimatePlus Easy SamplerSettings` outputs `SAMPLER_ARGS` for use with `WanAnimatePlus SamplerFromSettings`.
 
 ### WanAnimatePlus AnimateEmbeds
 

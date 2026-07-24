@@ -107,8 +107,9 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 1. 启动 ComfyUI，确认 `WanAnimatePlus` 分类下能看到完整节点链路
 2. **将整个工作流链路替换**为 WanAnimatePlus 版本：`ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler`、`Decode` 及配套节点
 3. **不要**在同一个工作流中混用原版 WanVideoWrapper 节点
-4. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
-5. 示例工作流见 `example_workflows/` 目录
+4. SCAIL-2 和 WanAnimate 工作流推荐优先使用 `WanAnimatePlus Easy Sampler` 或 `WanAnimatePlus Easy SamplerSettings`，它们只精简常用可见参数，底层仍保留完整采样功能，搭建更方便
+5. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
+6. 示例工作流见 `example_workflows/` 目录
 
 ## 节点说明
 
@@ -123,6 +124,7 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus ContextOptions`
 - `WanAnimatePlus AnimateEmbeds`
 - `WanAnimatePlus Sampler` / `WanAnimatePlus Samplerv2`
+- `WanAnimatePlus Easy Sampler` / `WanAnimatePlus Easy SamplerSettings`
 - `WanAnimatePlus Scheduler` / `WanAnimatePlus Schedulerv2`
 - `WanAnimatePlus Decode` / `WanAnimatePlus Encode`
 - `WanAnimatePlus LoraSelect` / `WanAnimatePlus LoraSelectMulti` / `WanAnimatePlus SetLoRAs`
@@ -132,6 +134,12 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
 - `WanAnimatePlus SCAIL_2 Embeds`
+
+### WanAnimatePlus Easy Sampler / Easy SamplerSettings
+
+推荐 SCAIL-2 和 WanAnimate 工作流优先使用这两个节点。它们只把节点面板中的可见参数精简为常用项，例如 `steps`、`cfg`、`shift`、`seed`、`force_offload` 和 `scheduler`，底层仍然走完整的 WanAnimatePlus 采样参数和功能路径。
+
+`WanAnimatePlus Easy Sampler` 可直接采样；`WanAnimatePlus Easy SamplerSettings` 输出 `SAMPLER_ARGS`，适合继续接入 `WanAnimatePlus SamplerFromSettings`。
 
 ### WanAnimatePlus AnimateEmbeds
 
