@@ -6,7 +6,7 @@
 #   - Adds WanAnimatePlus Bernini and EverAnimate embeds nodes to the public mappings.
 #   - Adds WanAnimatePlus SCAIL-2 embeds node to the public mappings.
 #   - Adds WanAnimatePlus SCAIL-2 two-phase settings node to the public mappings.
-#   - Adds WanAnimatePlus Easy Sampler node to the public mappings.
+#   - Adds WanAnimatePlus Easy Sampler and Easy SamplerSettings nodes to the public mappings.
 #   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility.
 #   - Forces registered node categories to WanAnimatePlus.
 #   - Keeps WanAnimatePlus nodes isolated from original WanVideoWrapper node names.
@@ -38,6 +38,7 @@ from .nodes import (
 )
 from .nodes_sampler import (
     WanAnimatePlusEasySampler,
+    WanAnimatePlusEasySamplerSettings,
     WanVideoSampler,
     WanVideoSamplerv2,
     WanVideoScheduler,
@@ -62,6 +63,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Sampler": WanVideoSampler,
     "WanAnimatePlus Samplerv2": WanVideoSamplerv2,
     "WanAnimatePlus Easy Sampler": WanAnimatePlusEasySampler,
+    "WanAnimatePlus Easy SamplerSettings": WanAnimatePlusEasySamplerSettings,
     "WanAnimatePlus Scheduler": WanVideoScheduler,
     "WanAnimatePlus Schedulerv2": WanVideoSchedulerv2,
     "WanAnimatePlus SamplerSettings": WanVideoSamplerSettings,

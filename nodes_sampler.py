@@ -18,7 +18,7 @@
 #   - Added SCAIL-2 loop two-phase handoff sampling controls; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
-#   - Added a simplified WanAnimatePlus Easy Sampler wrapper node.
+#   - Added simplified WanAnimatePlus Easy Sampler and Easy SamplerSettings wrapper nodes.
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
 # Licensed under the Apache License, Version 2.0
@@ -5393,29 +5393,74 @@ class WanVideoSamplerFromSettings(WanVideoSampler):
         return super().process(**sampler_inputs)
 
 
+def _wananimateplus_easy_sampler_input_types():
+    return {
+        "required": {
+            "model": ("WANVIDEOMODEL",),
+            "image_embeds": ("WANVIDIMAGE_EMBEDS",),
+            "steps": ("INT", {"default": 30, "min": 1}),
+            "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+            "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
+            "scheduler": (scheduler_list, {"default": "unipc"}),
+        },
+        "optional": {
+            "text_embeds": ("WANVIDEOTEXTEMBEDS",),
+            "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"}),
+            "context_options": ("WANVIDCONTEXT",),
+            "uni3c_embeds": ("UNI3C_EMBEDS",),
+        },
+    }
+
+
+def _build_wananimateplus_easy_sampler_inputs(
+    model,
+    image_embeds,
+    steps,
+    cfg,
+    shift,
+    seed,
+    force_offload,
+    scheduler,
+    text_embeds=None,
+    samples=None,
+    context_options=None,
+    uni3c_embeds=None,
+):
+    params = inspect.signature(WanVideoSampler.process).parameters
+    sampler_inputs = {
+        name: param.default if param.default is not inspect.Parameter.empty else None
+        for name, param in params.items()
+        if name != "self"
+    }
+    sampler_inputs.update(
+        {
+            "model": model,
+            "image_embeds": image_embeds,
+            "steps": steps,
+            "cfg": cfg,
+            "shift": shift,
+            "seed": seed,
+            "force_offload": force_offload,
+            "scheduler": scheduler,
+            "riflex_freq_index": 0,
+            "text_embeds": text_embeds,
+            "samples": samples,
+            "context_options": context_options,
+            "uni3c_embeds": uni3c_embeds,
+            "rope_function": "comfy",
+        }
+    )
+    return sampler_inputs
+
+
 class WanAnimatePlusEasySampler(WanVideoSamplerFromSettings):
     DESCRIPTION = "Simplified WanAnimatePlus sampler exposing the common controls while using the same sampler settings path."
 
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("WANVIDEOMODEL",),
-                "image_embeds": ("WANVIDIMAGE_EMBEDS",),
-                "steps": ("INT", {"default": 30, "min": 1}),
-                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
-                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "force_offload": ("BOOLEAN", {"default": True, "tooltip": "Moves the model to the offload device after sampling"}),
-                "scheduler": (scheduler_list, {"default": "unipc"}),
-            },
-            "optional": {
-                "text_embeds": ("WANVIDEOTEXTEMBEDS",),
-                "samples": ("LATENT", {"tooltip": "init Latents to use for video2video process"}),
-                "context_options": ("WANVIDCONTEXT",),
-                "uni3c_embeds": ("UNI3C_EMBEDS",),
-            },
-        }
+        return _wananimateplus_easy_sampler_input_types()
 
     def process(
         self,
@@ -5432,31 +5477,65 @@ class WanAnimatePlusEasySampler(WanVideoSamplerFromSettings):
         context_options=None,
         uni3c_embeds=None,
     ):
-        params = inspect.signature(WanVideoSampler.process).parameters
-        sampler_inputs = {
-            name: param.default if param.default is not inspect.Parameter.empty else None
-            for name, param in params.items()
-            if name != "self"
-        }
-        sampler_inputs.update(
-            {
-                "model": model,
-                "image_embeds": image_embeds,
-                "steps": steps,
-                "cfg": cfg,
-                "shift": shift,
-                "seed": seed,
-                "force_offload": force_offload,
-                "scheduler": scheduler,
-                "riflex_freq_index": 0,
-                "text_embeds": text_embeds,
-                "samples": samples,
-                "context_options": context_options,
-                "uni3c_embeds": uni3c_embeds,
-                "rope_function": "comfy",
-            }
+        sampler_inputs = _build_wananimateplus_easy_sampler_inputs(
+            model,
+            image_embeds,
+            steps,
+            cfg,
+            shift,
+            seed,
+            force_offload,
+            scheduler,
+            text_embeds,
+            samples,
+            context_options,
+            uni3c_embeds,
         )
         return super().process(sampler_inputs)
+
+
+class WanAnimatePlusEasySamplerSettings:
+    RETURN_TYPES = ("SAMPLER_ARGS",)
+    RETURN_NAMES = ("sampler_inputs",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Simplified WanAnimatePlus sampler settings exposing the common controls while preserving the full sampler settings path."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return _wananimateplus_easy_sampler_input_types()
+
+    def process(
+        self,
+        model,
+        image_embeds,
+        steps,
+        cfg,
+        shift,
+        seed,
+        force_offload,
+        scheduler,
+        text_embeds=None,
+        samples=None,
+        context_options=None,
+        uni3c_embeds=None,
+    ):
+        return (
+            _build_wananimateplus_easy_sampler_inputs(
+                model,
+                image_embeds,
+                steps,
+                cfg,
+                shift,
+                seed,
+                force_offload,
+                scheduler,
+                text_embeds,
+                samples,
+                context_options,
+                uni3c_embeds,
+            ),
+        )
 
 
 class WanVideoSamplerExtraArgs():
@@ -5672,6 +5751,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSamplerSettings": WanVideoSamplerSettings,
     "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
     "WanAnimatePlusEasySampler": WanAnimatePlusEasySampler,
+    "WanAnimatePlusEasySamplerSettings": WanAnimatePlusEasySamplerSettings,
     "WanVideoSamplerv2": WanVideoSamplerv2,
     "WanVideoSamplerExtraArgs": WanVideoSamplerExtraArgs,
     "WanVideoScheduler": WanVideoScheduler,
@@ -5682,6 +5762,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSamplerSettings": "WanVideo Sampler Settings",
     "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
     "WanAnimatePlusEasySampler": "WanAnimatePlus Easy Sampler",
+    "WanAnimatePlusEasySamplerSettings": "WanAnimatePlus Easy SamplerSettings",
     "WanVideoSamplerv2": "WanVideo Sampler v2",
     "WanVideoSamplerExtraArgs": "WanVideoSampler v2 Extra Args",
     "WanVideoScheduler": "WanVideo Scheduler",
