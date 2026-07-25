@@ -11,6 +11,7 @@
 #   - Added SCAIL-2 bg_image reference/prefix composition for animation mode.
 #   - Added Bernini task guidance recommendations and native-aspect reference resizing.
 #   - Added WanAnimatePlus signature widget to the embeds node.
+#   - Added SCAIL-2 auto_drift loop colormatch metadata for sampler-side seam correction.
 #   - Added SCAIL-2 loop two-phase sampling settings; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
@@ -1800,6 +1801,7 @@ class WanAnimatePlusSCAIL2Embeds:
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
                 "transition_colormatch": ([
                     'disabled',
+                    'auto_drift',
                     'mkl',
                     'hm',
                     'reinhard',
@@ -1959,7 +1961,7 @@ class WanAnimatePlusSCAIL2Embeds:
 
     @staticmethod
     def _color_match_frames(frames, ref_frame, method):
-        if method == "disabled" or ref_frame is None or frames is None or frames.shape[0] == 0:
+        if method in ("disabled", "auto_drift") or ref_frame is None or frames is None or frames.shape[0] == 0:
             return frames
         from color_matcher import ColorMatcher
         cm = ColorMatcher()
@@ -1969,6 +1971,16 @@ class WanAnimatePlusSCAIL2Embeds:
             out = cm.transfer(src=frame.detach().cpu().float().numpy(), ref=ref_np, method=method)
             matched.append(torch.from_numpy(out).to(device=frames.device, dtype=frames.dtype))
         return torch.stack(matched, dim=0).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _frame_rgb_means_bhwc(frames, max_frames=5):
+        if frames is None or frames.shape[0] == 0:
+            return None
+        count = min(max(1, int(max_frames)), int(frames.shape[0]))
+        tail = frames[-count:, :, :, :3].detach().float().clamp(0.0, 1.0)
+        if tail.numel() == 0:
+            return None
+        return tail.mean(dim=(1, 2)).cpu()
 
     @staticmethod
     def _extract_mask_to_28ch(rgb_video):
@@ -2177,9 +2189,10 @@ class WanAnimatePlusSCAIL2Embeds:
         transition_match_ref = self._resize_bhwc(ref_image[:1, :, :, :3], W, H) if ref_image is not None else None
         transition_raw_last_frame = (
             transition_video[-1:, :, :, :3].detach().to(offload_device)
-            if transition_video is not None and scail2_looping else None
+            if transition_video is not None and scail2_looping and transition_colormatch != "auto_drift" else None
         )
-        if transition_colormatch != "disabled" and transition_match_ref is None and (
+        transition_raw_tail_means = None
+        if transition_colormatch not in ("disabled", "auto_drift") and transition_match_ref is None and (
             transition_video is not None or (scail2_looping and loop_colormatch_reference == "main_ref_image")
         ):
             log.warning("SCAIL-2 transition_colormatch is enabled but ref_image is not connected. Skipping color match.")
@@ -2322,12 +2335,16 @@ class WanAnimatePlusSCAIL2Embeds:
                 if transition_video is not None:
                     tv = self._take_tail_with_front_pad(transition_video[:, :, :, :3], 20)
                     tv = self._resize_bhwc(tv, W, H)
+                    if scail2_looping and transition_colormatch == "auto_drift":
+                        transition_raw_tail_means = self._frame_rgb_means_bhwc(tv, 5)
                     tv = self._color_match_frames(tv, transition_match_ref, transition_colormatch)
                     freeze_canvas[17:37] = tv.to(device, dtype=freeze_canvas.dtype)
                     freeze_frame_mask[17:37] = 1.0
             elif transition_video is not None:
                 tv = self._take_tail_with_front_pad(transition_video[:, :, :, :3], 21)
                 tv = self._resize_bhwc(tv, W, H)
+                if scail2_looping and transition_colormatch == "auto_drift":
+                    transition_raw_tail_means = self._frame_rgb_means_bhwc(tv, 5)
                 tv = self._color_match_frames(tv, transition_match_ref, transition_colormatch)
                 freeze_canvas[:21] = tv.to(device, dtype=freeze_canvas.dtype)
                 freeze_frame_mask[:21] = 1.0
@@ -2478,6 +2495,8 @@ class WanAnimatePlusSCAIL2Embeds:
             image_embeds["scail2_transition_match_ref"] = transition_match_ref.to(offload_device)
         if transition_raw_last_frame is not None:
             image_embeds["scail2_transition_raw_last_frame"] = transition_raw_last_frame
+        if transition_raw_tail_means is not None:
+            image_embeds["scail2_transition_raw_tail_means"] = transition_raw_tail_means
         if scail_freeze_latents is not None:
             image_embeds["scail_freeze_latents"] = scail_freeze_latents
             image_embeds["scail_freeze_mask"] = scail_freeze_mask

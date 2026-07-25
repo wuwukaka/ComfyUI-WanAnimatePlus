@@ -197,6 +197,8 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 | `clip_embeds` | 可选，来自 `WanAnimatePlus ClipVisionEncode` 的 CLIP vision 特征 |
 | `force_offload` / `tiled_vae` | VAE 编码相关显存控制 |
 
+`transition_colormatch` 可选择 `auto_drift`，用于 SCAIL-2 loop 模式的轻量段间色漂校正。它不调用完整颜色分布匹配算法，而是用上一段尾部最多 5 帧和当前段开头最多 5 帧的 RGB 均值检测跳变，并对当前输出段做轻量校正；连接 `transition_video` 时，第一段会使用 transition 尾部最多 5 帧作为参考。
+
 短视频生成时 context window 可选；长视频或低显存场景建议使用 context window。context-window 模式下，单帧 prefix reference 会通过 SCAIL-2 reference stream 保持可见；legacy canvas prefix 和 transition latents 会 prepend 给模型作为上下文，并在 overlap 融合前移除这些 prepend 预测。
 
 SCAIL-2 默认的 `single_frame_prefix_encoding` 模式不会因为 `prefix_frames` 扩展或裁剪输出。如果连接 `transition_video`，前置画布会扩展 21 个像素帧，解码后裁掉这 21 帧。关闭 `single_frame_prefix_encoding` 后，`prefix_frames` 使用 legacy 37 前置像素帧画布；同时连接 `transition_video` 时，transition 帧放在第 17-36 帧。

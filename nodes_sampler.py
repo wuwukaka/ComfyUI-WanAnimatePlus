@@ -15,6 +15,7 @@
 #   - Added variable WanAnimate anchor-count forwarding for pose/face alignment.
 #   - Added SCAIL-2 sampler-side freeze_mask handling for prefix/transition latents.
 #   - Added SCAIL-2 loop output tensor caching, background cache saves, and tail-frame anchor encoding.
+#   - Added SCAIL-2 auto_drift loop colormatch for lightweight seam correction.
 #   - Added SCAIL-2 loop two-phase handoff sampling controls; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
@@ -2969,6 +2970,7 @@ class WanVideoSampler:
             scail2_transition_colormatch = image_embeds.get("scail2_transition_colormatch", "disabled")
             scail2_transition_match_ref = image_embeds.get("scail2_transition_match_ref", None)
             scail2_transition_raw_last_frame = image_embeds.pop("scail2_transition_raw_last_frame", None)
+            scail2_transition_raw_tail_means = image_embeds.pop("scail2_transition_raw_tail_means", None)
             scail2_loop_colormatch_reference = image_embeds.get("scail2_loop_colormatch_reference", "previous_matched_frame")
             if scail2_loop_colormatch_reference not in ("previous_matched_frame", "main_ref_image"):
                 log.warning(f"Unknown SCAIL-2 loop_colormatch_reference={scail2_loop_colormatch_reference!r}; using previous_matched_frame")
@@ -3169,8 +3171,75 @@ class WanVideoSampler:
                     matched.append(torch.from_numpy(out).to(device=video_cthw.device, dtype=torch.float32))
                 return torch.stack(matched, dim=0).clamp(0.0, 1.0).mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(dtype=video_cthw.dtype)
 
+            auto_drift_max_frames = 5
+            auto_drift_jump_threshold = 0.0005
+            auto_drift_max_offset = 0.02
+            auto_drift_residual_max = 0.004
+
+            def _normalize_auto_drift_means(means):
+                if means is None or not isinstance(means, torch.Tensor):
+                    return None
+                means = means.detach().cpu().float()
+                if means.ndim == 1:
+                    means = means.unsqueeze(0)
+                if means.ndim != 2 or means.shape[0] <= 0 or means.shape[1] < 3:
+                    return None
+                return means[:, :3].clamp(0.0, 1.0).contiguous()
+
+            def _auto_drift_tail_means(video_cthw):
+                if video_cthw is None or video_cthw.shape[1] == 0:
+                    return None
+                count = min(auto_drift_max_frames, int(video_cthw.shape[1]))
+                tail = video_cthw[:, -count:].float().clamp(-1.0, 1.0).add(1.0).div(2.0)
+                return tail.mean(dim=(2, 3)).permute(1, 0).detach().cpu().contiguous()
+
+            def _auto_drift_video_frames(video_cthw, ref_means, chunk_index):
+                ref_means = _normalize_auto_drift_means(ref_means)
+                if video_cthw is None or video_cthw.shape[1] == 0 or ref_means is None:
+                    return video_cthw
+
+                current = video_cthw.float().clamp(-1.0, 1.0).permute(1, 2, 3, 0).add(1.0).div(2.0)
+                frame_count = int(current.shape[0])
+                compare_count = min(auto_drift_max_frames, int(ref_means.shape[0]), frame_count)
+                if compare_count <= 0:
+                    return video_cthw
+
+                ref_means = ref_means.to(device=current.device, dtype=current.dtype)
+                ref_window_mean = ref_means[-compare_count:].mean(dim=0)
+                current_head_means = current[:compare_count].mean(dim=(1, 2))
+                current_window_mean = current_head_means.mean(dim=0)
+                jump_vec = current_window_mean - ref_window_mean
+                local_jump = float(jump_vec.abs().max().item())
+
+                global_applied = local_jump > auto_drift_jump_threshold
+                if global_applied:
+                    base = jump_vec.clamp(-auto_drift_max_offset, auto_drift_max_offset)
+                    current = current - base.view(1, 1, 1, 3)
+                    max_global = float(base.abs().max().item())
+                else:
+                    max_global = 0.0
+
+                ref_last_mean = ref_means[-1]
+                current_means = current.mean(dim=(1, 2))
+                residual_offsets = (ref_last_mean.view(1, 3) - current_means).clamp(
+                    -auto_drift_residual_max,
+                    auto_drift_residual_max,
+                )
+                max_residual = float(residual_offsets.abs().max().item()) if residual_offsets.numel() else 0.0
+                current = (current + residual_offsets.view(-1, 1, 1, 3)).clamp(0.0, 1.0)
+
+                jump_values = ", ".join(f"{float(v):+.6f}" for v in jump_vec.detach().cpu())
+                log.info(
+                    f"SCAIL-2 auto_drift chunk {chunk_index + 1}/{num_chunks}: "
+                    f"frames={compare_count}, jump=[{jump_values}], "
+                    f"global={'yes' if global_applied else 'no'}, "
+                    f"max_global={max_global:.6f}, max_residual={max_residual:.6f}"
+                )
+
+                return current.mul(2.0).sub(1.0).permute(3, 0, 1, 2).to(device=video_cthw.device, dtype=video_cthw.dtype)
+
             def _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame):
-                if scail2_transition_colormatch == "disabled":
+                if scail2_transition_colormatch in ("disabled", "auto_drift"):
                     return None
                 if chunk_idx == 0:
                     if not scail2_has_transition_video:
@@ -3686,6 +3755,7 @@ class WanVideoSampler:
                 loop_cache_frame_limit += max(int(canvas_expansion_px), 0)
             prev_anchor_latents = None
             last_matched_ref_frame = None
+            last_auto_drift_ref_means = _normalize_auto_drift_means(scail2_transition_raw_tail_means)
             chunk_seeds = []
             step_iteration_count = 0
             loop_cache_output_path = None
@@ -3925,10 +3995,9 @@ class WanVideoSampler:
                     )
 
                     if output_chunk.shape[1] > 0:
-                        match_ref = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
-                        if match_ref is not None:
+                        if scail2_transition_colormatch == "auto_drift":
                             colormatch_start = time.perf_counter()
-                            output_chunk = _color_match_video_frames(output_chunk, match_ref)
+                            output_chunk = _auto_drift_video_frames(output_chunk, last_auto_drift_ref_means, chunk_idx)
                             _loop_cache_log(
                                 "colormatch",
                                 time.perf_counter() - colormatch_start,
@@ -3936,12 +4005,23 @@ class WanVideoSampler:
                                 extra=f"method={scail2_transition_colormatch}; tensor={_loop_tensor_mib(output_chunk):.2f} MiB",
                             )
                         else:
-                            _loop_cache_log(
-                                "colormatch skipped",
-                                0.0,
-                                chunk_idx,
-                                extra=f"method={scail2_transition_colormatch}",
-                            )
+                            match_ref = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
+                            if match_ref is not None:
+                                colormatch_start = time.perf_counter()
+                                output_chunk = _color_match_video_frames(output_chunk, match_ref)
+                                _loop_cache_log(
+                                    "colormatch",
+                                    time.perf_counter() - colormatch_start,
+                                    chunk_idx,
+                                    extra=f"method={scail2_transition_colormatch}; tensor={_loop_tensor_mib(output_chunk):.2f} MiB",
+                                )
+                            else:
+                                _loop_cache_log(
+                                    "colormatch skipped",
+                                    0.0,
+                                    chunk_idx,
+                                    extra=f"method={scail2_transition_colormatch}",
+                                )
 
                         ref_update_start = time.perf_counter()
                         last_matched_ref_frame = (
@@ -3954,6 +4034,7 @@ class WanVideoSampler:
                             .detach()
                             .cpu()
                         )
+                        last_auto_drift_ref_means = _auto_drift_tail_means(output_chunk)
                         _loop_cache_log("last matched ref update", time.perf_counter() - ref_update_start, chunk_idx)
                         remaining_cache_frames = loop_cache_frame_limit - cached_loop_frame_count
                         if pending_loop_cache_entry is not None:
@@ -3999,6 +4080,7 @@ class WanVideoSampler:
                         del output_chunk
                     if chunk_idx == 0:
                         scail2_transition_raw_last_frame = None
+                        scail2_transition_raw_tail_means = None
 
                     chunk_cleanup_start = time.perf_counter()
                     mm.soft_empty_cache()

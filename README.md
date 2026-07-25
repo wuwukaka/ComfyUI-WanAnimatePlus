@@ -197,6 +197,8 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `clip_embeds` | Optional CLIP vision features from `WanAnimatePlus ClipVisionEncode` |
 | `force_offload` / `tiled_vae` | Memory controls for VAE encoding |
 
+`transition_colormatch` can be set to `auto_drift` for lightweight SCAIL-2 loop seam correction. It does not run full color-distribution matching; instead, it compares RGB means from up to the last 5 frames of the previous segment and up to the first 5 frames of the current segment, then lightly corrects the current output segment. When `transition_video` is connected, the first segment uses up to the last 5 transition frames as its reference.
+
 For short generations, context windows are optional. For long generations or low VRAM, context windows are recommended. In context-window mode, single-frame prefix references remain visible through the SCAIL-2 reference stream. Legacy canvas prefixes and transition latents are prepended for model context and removed before overlap fusion.
 
 For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or trim the output for `prefix_frames`. If `transition_video` is connected, the front canvas expands by 21 pixel frames and those 21 frames are trimmed after decoding. With `single_frame_prefix_encoding` disabled, `prefix_frames` use the legacy 37 front pixel-frame canvas layout, with transition frames placed at frames 17-36 when `transition_video` is also connected.
