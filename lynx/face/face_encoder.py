@@ -10,6 +10,21 @@ import os
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _safe_download_filename(filename):
+    filename = os.path.basename(str(filename or "").replace("\\", "/"))
+    if not filename or filename in (".", ".."):
+        raise ValueError("Download filename is empty.")
+    return filename
+
+
+def _is_path_within(base_path, candidate_path):
+    try:
+        return os.path.commonpath([base_path, candidate_path]) == base_path
+    except ValueError:
+        return False
+
+
 __all__ = [
     "FaceEncoderArcFace",
     "get_landmarks_from_image",
@@ -59,13 +74,16 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None, save_
 
     if save_dir is None:
         save_dir = os.path.join(ROOT_DIR, model_dir)
+    save_dir = os.path.realpath(os.path.abspath(save_dir))
     os.makedirs(save_dir, exist_ok=True)
 
     parts = urlparse(url)
-    filename = os.path.basename(parts.path)
+    filename = _safe_download_filename(parts.path)
     if file_name is not None:
-        filename = file_name
-    cached_file = os.path.abspath(os.path.join(save_dir, filename))
+        filename = _safe_download_filename(file_name)
+    cached_file = os.path.realpath(os.path.abspath(os.path.join(save_dir, filename)))
+    if not _is_path_within(save_dir, cached_file):
+        raise ValueError(f"Downloaded file path must stay within its cache directory: {save_dir}")
     if not os.path.exists(cached_file):
         print(f'Downloading: "{url}" to {cached_file}\n')
         download_url_to_file(url, cached_file, hash_prefix=None, progress=progress)

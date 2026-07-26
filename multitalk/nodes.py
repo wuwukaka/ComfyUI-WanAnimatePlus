@@ -13,6 +13,30 @@ import numpy as np
 script_directory = os.path.dirname(os.path.abspath(__file__))
 folder_paths.add_model_folder_path("wav2vec2", os.path.join(folder_paths.models_dir, "wav2vec2"))
 
+
+def _is_path_within(base_path, candidate_path):
+    try:
+        return os.path.commonpath([base_path, candidate_path]) == base_path
+    except ValueError:
+        return False
+
+
+def _resolve_output_path(output_path, mode):
+    output_path = str(output_path or "").strip().replace("\\", os.sep)
+    if not output_path:
+        return ""
+    if os.path.isabs(output_path) or os.path.splitdrive(output_path)[0]:
+        raise ValueError("output_path must be a relative folder under the ComfyUI output directory.")
+    output_root = os.path.realpath(folder_paths.get_output_directory())
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = os.path.basename(str(mode or "multitalk").replace("\\", "/")) or "multitalk"
+    output_path = os.path.realpath(os.path.join(output_root, output_path, f"{timestamp}_{mode}_output"))
+    if not _is_path_within(output_root, output_path):
+        raise ValueError("output_path must stay within the ComfyUI output directory.")
+    os.makedirs(output_path, exist_ok=True)
+    return output_path
+
+
 class Wav2VecModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -409,7 +433,7 @@ class WanVideoImageToVideoMultiTalk:
                     "multitalk",
                     "infinitetalk"
                 ], {"default": "auto", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"}),
-                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
+                "output_path": ("STRING", {"default": "", "tooltip": "If set, saves each window's resulting frames under this subfolder of the ComfyUI output directory, and disables returning the final video tensor to save memory"}),
 
             }
         }
@@ -439,9 +463,7 @@ class WanVideoImageToVideoMultiTalk:
                         width // VAE_STRIDE[2])
         
         if output_path:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(output_path, f"{timestamp}_{mode}_output")
-            os.makedirs(output_path, exist_ok=True)
+            output_path = _resolve_output_path(output_path, mode)
 
         image_embeds = {
             "multitalk_sampling": True,
@@ -492,7 +514,7 @@ class WanVideoImageToVideoSkyreelsv3_audio:
                 "start_image": ("IMAGE", {"tooltip": "Images to encode"}),
                 "reference_video": ("IMAGE", {"tooltip": "Optional: Pre-generated reference video to use for keyframes instead of extracting from first generation. Should be color-matched to source image."}),
                 "clip_embeds": ("WANVIDIMAGE_CLIPEMBEDS", {"tooltip": "Clip vision encoded image"}),
-                "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
+                "output_path": ("STRING", {"default": "", "tooltip": "If set, saves each window's resulting frames under this subfolder of the ComfyUI output directory, and disables returning the final video tensor to save memory"}),
             }
         }
 
@@ -517,9 +539,7 @@ class WanVideoImageToVideoSkyreelsv3_audio:
         target_shape = (16, (num_frames - 1) // 4 + 1, height // 8, width // 8)
 
         if output_path:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(output_path, f"{timestamp}_{mode}_output")
-            os.makedirs(output_path, exist_ok=True)
+            output_path = _resolve_output_path(output_path, mode)
 
         processed_reference_video = None
         if reference_video is not None:

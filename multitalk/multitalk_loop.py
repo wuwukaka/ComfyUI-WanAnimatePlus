@@ -3,6 +3,7 @@ import os
 import gc
 from PIL import Image
 import numpy as np
+import folder_paths
 from ..latent_preview import prepare_callback
 from ..wanvideo.schedulers import get_scheduler
 from .multitalk import timestep_transform, add_noise
@@ -75,6 +76,15 @@ def multitalk_loop(self, **kwargs):
         original_images = torch.zeros([noise.shape[0], 1, target_h, target_w], device=device)
 
     output_path = image_embeds.get("output_path", "")
+    if output_path:
+        output_root = os.path.realpath(folder_paths.get_output_directory())
+        output_path = os.path.realpath(output_path)
+        try:
+            path_ok = os.path.commonpath([output_root, output_path]) == output_root
+        except ValueError:
+            path_ok = False
+        if not path_ok:
+            raise ValueError("output_path must stay within the ComfyUI output directory.")
     img_counter = 0
 
     if len(multitalk_embeds['audio_features'])==2 and (multitalk_embeds['ref_target_masks'] is None):
