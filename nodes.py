@@ -2589,6 +2589,7 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
                 ], {"default": "previous_matched_frame"}),
                 "prefix_alpha_crop": ("BOOLEAN", {"default": False}),
                 "preserve_main_ref_background": ("BOOLEAN", {"default": True}),
+                "by wuwukasi(bilibili)": ("BOOLEAN", {"default": True, "label_on": "ON", "label_off": "ON", "tooltip": "Follow wuwukasi on bilibili"}),
             },
         }
 
@@ -2625,6 +2626,7 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
         loop_colormatch_reference="previous_matched_frame",
         prefix_alpha_crop=False,
         preserve_main_ref_background=True,
+        **kwargs,
     ):
         runtime = make_runtime(
             width,

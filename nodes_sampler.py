@@ -5830,7 +5830,6 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent": ("LATENT",),
-                "vae": ("VAE",),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
@@ -5841,7 +5840,10 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 "phase1_mask": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "phase2_mask": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "phase2_start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
-            }
+            },
+            "optional": {
+                "vae": ("VAE",),
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -5856,7 +5858,6 @@ class WanAnimatePlusSCAIL2FlowSampler:
         positive,
         negative,
         latent,
-        vae,
         steps,
         cfg,
         sampler_name,
@@ -5867,6 +5868,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
         phase1_mask,
         phase2_mask,
         phase2_start_step,
+        vae=None,
     ):
         runtime = latent.get(FLOW_RUNTIME_KEY, None)
         model = _wanap_flow_patch_shift(model, shift)
@@ -5874,6 +5876,11 @@ class WanAnimatePlusSCAIL2FlowSampler:
 
         try:
             if runtime is not None and runtime.get("looping", False) and not has_context_handler:
+                if vae is None:
+                    raise ValueError(
+                        "WanAnimatePlus SCAIL-2 Flow internal loop requires a VAE. "
+                        "Connect VAE or use official context mode."
+                    )
                 out = self._process_loop(
                     model,
                     positive,
