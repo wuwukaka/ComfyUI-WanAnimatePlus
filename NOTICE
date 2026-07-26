@@ -78,11 +78,14 @@ The wuwukasi/wuwukaka additions/modifications include, without limitation:
   guidance-mode routing, native-aspect reference preprocessing, source-id
   rotation application for the added streams, and cache-key correctness fixes
   for the added context paths.
-- SCAIL-2 embeds support, including wrapper-native ref/pose/mask conditioning,
-  single-frame prefix reference handling, legacy prefix-mask pixel-frame
-  handling, prefix/transition freeze handling, decode-side canvas trimming,
-  context-window prepend/fusion integration, loop tensor caching/background
-  saves, and subprocess-isolated color matching.
+- SCAIL-2 embeds and Flow support, including wrapper-native ref/pose/mask
+  conditioning, official-compatible SCAIL-2 Flow embeds/sampler/VAE decode
+  nodes for MODEL/VAE/CONDITIONING/LATENT/IMAGE workflow types, single-frame
+  prefix reference handling, legacy prefix-mask pixel-frame handling,
+  bg/prefix/reference ordering, prefix/transition freeze handling, decode-side
+  canvas trimming, context-window prepend/fusion integration, loop tensor
+  caching/background saves, loop colormatch/auto_drift correction, and
+  two-phase freeze-mask sampling controls.
 - EverAnimate embeds and sampler support, including anchor selection and
   padding, pose/face/bg/mask conditioning, ping-pong sequence handling, segment
   sampling, and related safeguards.

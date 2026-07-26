@@ -31,6 +31,10 @@
 
 新增基于 WanAnimatePlus 采样器适配的 `WanAnimatePlus SCAIL_2 Embeds` 节点，用于准备 SCAIL-2 的参考图、pose、colored pose mask、reference mask、prefix/transition 硬冻结 latent，以及与 prefix 对齐的 colored mask。
 
+### SCAIL-2 Flow 官方兼容节点
+
+新增 `WanAnimatePlus SCAIL_2 Flow Embeds`、`WanAnimatePlus SCAIL_2 Flow Sampler` 和 `WanAnimatePlus VAE Decode`。这套节点使用官方 ComfyUI 的 `MODEL`、`VAE`、`CONDITIONING`、`LATENT` 和 `IMAGE` 接口，方便接入官方流程，同时保留 WanAnimatePlus SCAIL-2 的 prefix、transition、bg、mask、loop colormatch 和二阶段采样行为。
+
 ## 效果展示
 
 ### RunningHub 在线运行示例
@@ -108,8 +112,9 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 2. **将整个工作流链路替换**为 WanAnimatePlus 版本：`ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler`、`Decode` 及配套节点
 3. **不要**在同一个工作流中混用原版 WanVideoWrapper 节点
 4. SCAIL-2 和 WanAnimate 工作流推荐优先使用 `WanAnimatePlus Easy Sampler` 或 `WanAnimatePlus Easy SamplerSettings`，它们只精简常用可见参数，底层仍保留完整采样功能，搭建更方便
-5. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
-6. 示例工作流见 `example_workflows/` 目录
+5. 如果要接入官方 ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` 流程，可使用 `WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+6. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
+7. 示例工作流见 `example_workflows/` 目录
 
 ## 节点说明
 
@@ -134,6 +139,9 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
 - `WanAnimatePlus SCAIL_2 Embeds`
+- `WanAnimatePlus SCAIL_2 Flow Embeds`
+- `WanAnimatePlus SCAIL_2 Flow Sampler`
+- `WanAnimatePlus VAE Decode`
 
 ### WanAnimatePlus Easy Sampler / Easy SamplerSettings
 
@@ -205,6 +213,16 @@ SCAIL-2 默认的 `single_frame_prefix_encoding` 模式不会因为 `prefix_fram
 
 animation 模式下连接 `bg_image` 时，节点会为该背景图内部添加白色 mask。用户提供的 `prefix_frames` 和 `prefix_mask` 各自最多保留四张，让背景图占用剩余的 reference/prefix 容量。replacement 模式下 `bg_image` 会被忽略。
 
+### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
+
+这套节点用于官方 ComfyUI 类型链路，不依赖旧的 `WANVID...` 输入输出类型。`Flow Embeds` 接收官方 `CONDITIONING`、`VAE`、图片和 mask 输入，输出更新后的 `CONDITIONING` 与 `LATENT`；`Flow Sampler` 使用官方 sampler 核心采样；`WanAnimatePlus VAE Decode` 可直接解码普通 latent，也能读取 Flow Sampler 在内循环模式下写入 `LATENT` 对象的已解码视频。
+
+Flow 节点保留 SCAIL-2 的主要行为：`bg_image` 在 animation 模式下占用一个 prefix/reference 容量，最终 reference 顺序保持为 `prefix -> main ref -> bg`；`transition_video` 使用 21 前置像素帧硬冻结并在输出时裁掉；loop 模式每个 chunk 使用随机 chunk seed；`transition_colormatch` 和 `auto_drift` 复用 WanAnimatePlus SCAIL-2 的段间校正逻辑。
+
+Flow Embeds 中 `single_frame_prefix_encoding` 固定开启且不暴露。二阶段采样参数直接在 `Flow Sampler` 中提供：`phase1_mask`、`phase2_mask` 和 `phase2_start_step`。这里的 mask 表示保护强度，`1=冻结/保护`，`0=自由 denoise`。
+
+当官方模型上游已经带有 context handler 时，Flow Sampler 会关闭内部 loop，交给官方 context 路径处理；此时二阶段设置只对内部 loop handoff chunk 生效，不会强制接管官方 context 采样。
+
 ## 项目结构
 
 ```text
@@ -212,6 +230,7 @@ ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo 核心模型代码
 ├─ nodes.py                  # WanAnimatePlus embeds / encode / decode 核心节点
 ├─ nodes_sampler.py          # WanAnimatePlus sampler / scheduler 核心节点
+├─ scail2_flow.py            # 官方兼容 SCAIL-2 Flow helper
 ├─ nodes_model_loading.py    # WanAnimatePlus model / VAE / LoRA / block swap 节点
 ├─ context_windows/          # Context window 调度
 ├─ cache_methods/            # 缓存加速方法

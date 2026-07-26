@@ -31,6 +31,10 @@ Use cases:
 
 Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. It prepares reference image, driving pose, colored pose mask, reference mask, optional prefix/transition hard-freeze latents, and prefix-aligned colored masks for the WanAnimatePlus sampler.
 
+### Official-Compatible SCAIL-2 Flow Nodes
+
+Adds `WanAnimatePlus SCAIL_2 Flow Embeds`, `WanAnimatePlus SCAIL_2 Flow Sampler`, and `WanAnimatePlus VAE Decode`. These nodes use official ComfyUI `MODEL`, `VAE`, `CONDITIONING`, `LATENT`, and `IMAGE` interfaces so they can fit into official-style workflows while preserving WanAnimatePlus SCAIL-2 prefix, transition, bg, mask, loop colormatch, and two-phase sampling behavior.
+
 ## Demo
 
 ### RunningHub Online Workflow Examples
@@ -108,8 +112,9 @@ Restart ComfyUI after installation.
 2. **Replace the entire workflow chain** with WanAnimatePlus counterparts: `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, `Decode`, and supporting nodes
 3. Do **not** mix original WanVideoWrapper nodes in the same workflow
 4. For SCAIL-2 and WanAnimate workflows, `WanAnimatePlus Easy Sampler` or `WanAnimatePlus Easy SamplerSettings` is recommended because they keep the full sampler functionality while exposing only the common controls
-5. Connect `prefix_frames` and/or `transition_video` inputs as needed
-6. Example workflows are available in the `example_workflows/` directory
+5. For official ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` chains, use `WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+6. Connect `prefix_frames` and/or `transition_video` inputs as needed
+7. Example workflows are available in the `example_workflows/` directory
 
 ## Nodes
 
@@ -134,6 +139,9 @@ Core nodes:
 - `WanAnimatePlus Uni3C ControlnetLoader` / `WanAnimatePlus Uni3C Embeds`
 - `WanAnimatePlus Bernini`
 - `WanAnimatePlus SCAIL_2 Embeds`
+- `WanAnimatePlus SCAIL_2 Flow Embeds`
+- `WanAnimatePlus SCAIL_2 Flow Sampler`
+- `WanAnimatePlus VAE Decode`
 
 ### WanAnimatePlus Easy Sampler / Easy SamplerSettings
 
@@ -205,6 +213,16 @@ For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or 
 
 When `bg_image` is connected in animation mode, the node internally adds a white mask for that background image. User-provided `prefix_frames` and `prefix_mask` are limited to four images each so the background can occupy the remaining reference/prefix capacity. In replacement mode, `bg_image` is ignored.
 
+### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
+
+These nodes are for official ComfyUI type chains and do not depend on legacy `WANVID...` input/output types. `Flow Embeds` accepts official `CONDITIONING`, `VAE`, images, and masks, then outputs updated `CONDITIONING` and `LATENT`; `Flow Sampler` samples through the official sampler core; `WanAnimatePlus VAE Decode` can decode ordinary latents and can also return decoded video stored inside the `LATENT` object by Flow Sampler's internal loop.
+
+The Flow nodes preserve the main SCAIL-2 behavior: `bg_image` occupies one prefix/reference slot in animation mode, final reference order remains `prefix -> main ref -> bg`, `transition_video` uses a 21 front pixel-frame hard-freeze canvas that is trimmed from output, loop mode uses a random chunk seed per chunk, and `transition_colormatch` / `auto_drift` reuse WanAnimatePlus SCAIL-2 loop seam correction.
+
+`single_frame_prefix_encoding` is fixed on and is not exposed in Flow Embeds. Two-phase controls are provided directly on `Flow Sampler`: `phase1_mask`, `phase2_mask`, and `phase2_start_step`. These masks are protection strengths: `1=freeze/protect`, `0=free denoise`.
+
+When the upstream official model already has a context handler, Flow Sampler disables its internal loop and leaves context sampling to the official path. In that case, two-phase settings only affect internal-loop handoff chunks and do not force-control official context sampling.
+
 ## Project Structure
 
 ```text
@@ -212,6 +230,7 @@ ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo core model code
 ├─ nodes.py                  # Core WanAnimatePlus embeds / encode / decode nodes
 ├─ nodes_sampler.py          # Core WanAnimatePlus sampler / scheduler nodes
+├─ scail2_flow.py            # Official-compatible SCAIL-2 Flow helpers
 ├─ nodes_model_loading.py    # Core WanAnimatePlus model / VAE / LoRA / block swap nodes
 ├─ context_windows/          # Context-window scheduling
 ├─ cache_methods/            # Cache acceleration

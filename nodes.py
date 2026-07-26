@@ -15,6 +15,9 @@
 #   - Added SCAIL-2 loop two-phase sampling settings; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
+#   - Added official-ComfyUI-compatible SCAIL-2 Flow embeds and VAE decode nodes
+#     using MODEL/VAE/CONDITIONING/LATENT/IMAGE interfaces while preserving
+#     WanAnimatePlus SCAIL-2 bg/prefix/reference/transition behavior.
 # Licensed under the Apache License, Version 2.0
 import os, gc, math
 import torch
@@ -24,6 +27,7 @@ from tqdm import tqdm
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
+from .scail2_flow import build_conditioning_and_latent, decode_latent_to_images, make_runtime
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -2541,6 +2545,123 @@ class WanAnimatePlusSCAIL2TwoPhaseSettings:
         return (updated,)
 
 
+class WanAnimatePlusSCAIL2FlowEmbeds:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "width": ("INT", {"default": 832, "min": 64, "max": 8096, "step": 32}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 8096, "step": 32}),
+                "num_frames": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4}),
+                "frame_window_size": ("INT", {"default": 81, "min": 1, "max": 10000, "step": 4}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "pose_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001}),
+                "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.001}),
+                "replacement_mode": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "clip_vision_output": ("CLIP_VISION_OUTPUT",),
+                "ref_image": ("IMAGE",),
+                "bg_image": ("IMAGE",),
+                "pose_images": ("IMAGE",),
+                "prefix_frames": ("IMAGE",),
+                "prefix_mask": ("IMAGE",),
+                "transition_video": ("IMAGE",),
+                "pose_image_mask": ("IMAGE",),
+                "reference_image_mask": ("IMAGE",),
+                "tiled_vae": ("BOOLEAN", {"default": False}),
+                "transition_colormatch": ([
+                    "disabled",
+                    "auto_drift",
+                    "mkl",
+                    "hm",
+                    "reinhard",
+                    "mvgd",
+                    "hm-mvgd-hm",
+                    "hm-mkl-hm",
+                ], {"default": "disabled"}),
+                "loop_colormatch_reference": ([
+                    "previous_matched_frame",
+                    "main_ref_image",
+                ], {"default": "previous_matched_frame"}),
+                "prefix_alpha_crop": ("BOOLEAN", {"default": False}),
+                "preserve_main_ref_background": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = "Official ComfyUI-compatible SCAIL-2 conditioning bundle. It outputs CONDITIONING and LATENT and does not depend on legacy WanAnimatePlus node types."
+
+    def process(
+        self,
+        positive,
+        negative,
+        vae,
+        width,
+        height,
+        num_frames,
+        frame_window_size,
+        batch_size,
+        pose_strength,
+        ref_strength,
+        replacement_mode,
+        clip_vision_output=None,
+        ref_image=None,
+        bg_image=None,
+        pose_images=None,
+        prefix_frames=None,
+        prefix_mask=None,
+        transition_video=None,
+        pose_image_mask=None,
+        reference_image_mask=None,
+        tiled_vae=False,
+        transition_colormatch="disabled",
+        loop_colormatch_reference="previous_matched_frame",
+        prefix_alpha_crop=False,
+        preserve_main_ref_background=True,
+    ):
+        runtime = make_runtime(
+            width,
+            height,
+            num_frames,
+            frame_window_size,
+            batch_size,
+            pose_strength,
+            ref_strength,
+            replacement_mode,
+            tiled_vae,
+            transition_colormatch,
+            loop_colormatch_reference,
+            prefix_alpha_crop,
+            preserve_main_ref_background,
+            ref_image=ref_image,
+            bg_image=bg_image,
+            pose_images=pose_images,
+            prefix_frames=prefix_frames,
+            prefix_mask=prefix_mask,
+            transition_video=transition_video,
+            pose_image_mask=pose_image_mask,
+            reference_image_mask=reference_image_mask,
+            clip_vision_output=clip_vision_output,
+        )
+        positive, negative, latent = build_conditioning_and_latent(
+            positive,
+            negative,
+            vae,
+            runtime,
+            start_frame=0,
+            length=runtime["num_frames"],
+            include_runtime=True,
+        )
+        return (positive, negative, latent)
+
+
 class WanAnimatePlusEverAnimateEmbeds:
     @classmethod
     def INPUT_TYPES(s):
@@ -3588,6 +3709,45 @@ class WanVideoDecode:
 
         return (images.permute(1, 2, 3, 0),)
 
+
+class WanAnimatePlusVAEDecode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "samples": ("LATENT",),
+                "tiled_vae": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "decode"
+    CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = "Official-compatible VAE decode. If SCAIL-2 Flow Sampler returns decoded video in the LATENT object, this node returns it directly."
+
+    def decode(self, vae, samples, tiled_vae=False):
+        video = samples.get("video", None)
+        if video is not None:
+            images = video.detach().cpu().float()
+            if len(images.shape) == 5:
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            if images.numel() > 0 and float(images.min()) < 0.0:
+                images = images.clamp(-1.0, 1.0).add(1.0).div(2.0)
+            else:
+                images = images.clamp(0.0, 1.0)
+            return (images,)
+
+        images = decode_latent_to_images(vae, samples, tiled_vae=tiled_vae)
+        canvas_expansion_px = int(samples.get("canvas_expansion_px", 0) or 0)
+        if canvas_expansion_px and images.shape[0] > canvas_expansion_px:
+            images = images[canvas_expansion_px:]
+        output_frame_count = samples.get("output_frame_count", None)
+        if output_frame_count is not None and images.shape[0] > int(output_frame_count):
+            images = images[:int(output_frame_count)]
+        return (images,)
+
 #region VideoEncode
 class WanVideoEncodeLatentBatch:
     @classmethod
@@ -3835,6 +3995,7 @@ class WanAnimatePlusBernini:
 
 NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
+    "WanAnimatePlusVAEDecode": WanAnimatePlusVAEDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
     "WanVideoTextEncodeSingle": WanVideoTextEncodeSingle,
     "WanVideoClipVisionEncode": WanVideoClipVisionEncode,
@@ -3869,6 +4030,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAnimateEmbeds": WanVideoAnimateEmbeds,
     "WanAnimatePlusSCAIL2Embeds": WanAnimatePlusSCAIL2Embeds,
     "WanAnimatePlusSCAIL2TwoPhaseSettings": WanAnimatePlusSCAIL2TwoPhaseSettings,
+    "WanAnimatePlusSCAIL2FlowEmbeds": WanAnimatePlusSCAIL2FlowEmbeds,
     "WanAnimatePlusEverAnimateEmbeds": WanAnimatePlusEverAnimateEmbeds,
     "WanVideoAddLucyEditLatents": WanVideoAddLucyEditLatents,
     "WanVideoAddBindweaveEmbeds": WanVideoAddBindweaveEmbeds,
@@ -3881,6 +4043,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoDecode": "WanVideo Decode",
+    "WanAnimatePlusVAEDecode": "WanAnimatePlus VAE Decode",
     "WanVideoTextEncode": "WanVideo TextEncode",
     "WanVideoTextEncodeSingle": "WanVideo TextEncodeSingle",
     "WanVideoTextImageEncode": "WanVideo TextImageEncode (IP2V)",
@@ -3916,6 +4079,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAnimateEmbeds": "WanVideo Animate Embeds",
     "WanAnimatePlusSCAIL2Embeds": "WanAnimatePlus SCAIL_2 Embeds",
     "WanAnimatePlusSCAIL2TwoPhaseSettings": "WanAnimatePlus SCAIL_2 TwoPhase Settings",
+    "WanAnimatePlusSCAIL2FlowEmbeds": "WanAnimatePlus SCAIL_2 Flow Embeds",
     "WanAnimatePlusEverAnimateEmbeds": "WanAnimatePlus EverAnimate Embeds",
     "WanVideoAddLucyEditLatents": "WanVideo Add LucyEdit Latents",
     "WanVideoAddBindweaveEmbeds": "WanVideo Add Bindweave Embeds",

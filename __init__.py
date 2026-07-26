@@ -6,6 +6,8 @@
 #   - Adds WanAnimatePlus Bernini and EverAnimate embeds nodes to the public mappings.
 #   - Adds WanAnimatePlus SCAIL-2 embeds node to the public mappings.
 #   - Adds WanAnimatePlus SCAIL-2 two-phase settings node to the public mappings.
+#   - Adds official-compatible SCAIL-2 Flow embeds/sampler/VAE decode nodes for
+#     MODEL/VAE/CONDITIONING/LATENT workflow chains.
 #   - Adds WanAnimatePlus Easy Sampler and Easy SamplerSettings nodes to the public mappings.
 #   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility.
 #   - Forces registered node categories to WanAnimatePlus.
@@ -26,7 +28,9 @@ from .nodes import (
     WanAnimatePlusBernini,
     WanAnimatePlusEverAnimateEmbeds,
     WanAnimatePlusSCAIL2Embeds,
+    WanAnimatePlusSCAIL2FlowEmbeds,
     WanAnimatePlusSCAIL2TwoPhaseSettings,
+    WanAnimatePlusVAEDecode,
     WanVideoAnimateEmbeds,
     WanVideoClipVisionEncode,
     WanVideoClipVisionEncodeV2,
@@ -39,6 +43,7 @@ from .nodes import (
 from .nodes_sampler import (
     WanAnimatePlusEasySampler,
     WanAnimatePlusEasySamplerSettings,
+    WanAnimatePlusSCAIL2FlowSampler,
     WanVideoSampler,
     WanVideoSamplerv2,
     WanVideoScheduler,
@@ -64,12 +69,14 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Samplerv2": WanVideoSamplerv2,
     "WanAnimatePlus Easy Sampler": WanAnimatePlusEasySampler,
     "WanAnimatePlus Easy SamplerSettings": WanAnimatePlusEasySamplerSettings,
+    "WanAnimatePlus SCAIL_2 Flow Sampler": WanAnimatePlusSCAIL2FlowSampler,
     "WanAnimatePlus Scheduler": WanVideoScheduler,
     "WanAnimatePlus Schedulerv2": WanVideoSchedulerv2,
     "WanAnimatePlus SamplerSettings": WanVideoSamplerSettings,
     "WanAnimatePlus SamplerFromSettings": WanVideoSamplerFromSettings,
     "WanAnimatePlus Encode": WanVideoEncode,
     "WanAnimatePlus Decode": WanVideoDecode,
+    "WanAnimatePlus VAE Decode": WanAnimatePlusVAEDecode,
     "WanAnimatePlus ModelLoader": WanVideoModelLoader,
     "WanAnimatePlus VAELoader": WanVideoVAELoader,
     "WanAnimatePlus ContextOptions": WanVideoContextOptions,
@@ -88,6 +95,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Bernini": WanAnimatePlusBernini,
     "WanAnimatePlus EverAnimate Embeds": WanAnimatePlusEverAnimateEmbeds,
     "WanAnimatePlus SCAIL_2 Embeds": WanAnimatePlusSCAIL2Embeds,
+    "WanAnimatePlus SCAIL_2 Flow Embeds": WanAnimatePlusSCAIL2FlowEmbeds,
     "WanAnimatePlus SCAIL_2 TwoPhase Settings": WanAnimatePlusSCAIL2TwoPhaseSettings,
 }
 

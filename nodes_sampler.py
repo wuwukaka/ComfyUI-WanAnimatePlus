@@ -19,6 +19,9 @@
 #   - Added SCAIL-2 loop two-phase handoff sampling controls; thanks to
 #     checknickname/ComfyUI-Scail2-Sampler-Helper for the idea and
 #     user2318/ComfyUI-CustomNodeKit as an MIT-licensed reference project.
+#   - Added official-compatible SCAIL-2 Flow sampler with legacy-aligned
+#     reference/freeze masks, loop colormatch, random chunk seeds, and
+#     two-phase freeze handling for official MODEL/CONDITIONING/LATENT chains.
 #   - Added simplified WanAnimatePlus Easy Sampler and Easy SamplerSettings wrapper nodes.
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
@@ -29,6 +32,9 @@ import numpy as np
 from tqdm import tqdm
 import inspect
 import folder_paths
+import comfy.sample
+import comfy.samplers
+import comfy.model_sampling
 from .wanvideo.modules.model import rope_params
 from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
 from .wanvideo.schedulers import get_scheduler, scheduler_list
@@ -47,6 +53,18 @@ from contextlib import nullcontext
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.cli_args import args, LatentPreviewMethod
+from .scail2_flow import (
+    FLOW_FREEZE_MASK_KEY,
+    FLOW_HANDOFF_MASK_KEY,
+    FLOW_RUNTIME_KEY,
+    align_4n1,
+    auto_drift_frames,
+    auto_drift_tail_means,
+    build_conditioning_and_latent,
+    color_match_frames,
+    decode_latent_to_images,
+    take_tail_with_front_pad,
+)
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -5620,6 +5638,409 @@ class WanAnimatePlusEasySamplerSettings:
         )
 
 
+def _wanap_flow_patch_shift(model, shift):
+    if shift is None:
+        return model
+    try:
+        m = model.clone()
+        sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+        sampling_type = comfy.model_sampling.CONST
+
+        class ModelSamplingAdvanced(sampling_base, sampling_type):
+            pass
+
+        original = m.get_model_object("model_sampling")
+        model_sampling = ModelSamplingAdvanced(model.model.model_config)
+        model_sampling.set_parameters(shift=float(shift), multiplier=1000)
+        if hasattr(original, "noise_scale"):
+            model_sampling.set_noise_scale(original.noise_scale)
+        m.add_object_patch("model_sampling", model_sampling)
+        return m
+    except Exception as e:
+        log.warning(f"WanAnimatePlus SCAIL-2 Flow Sampler could not apply shift={shift}: {e}")
+        return model
+
+
+def _wanap_flow_sample_once(
+    model,
+    positive,
+    negative,
+    latent,
+    seed,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler,
+    disable_noise=False,
+    start_step=None,
+    last_step=None,
+    force_full_denoise=True,
+    final_freeze_strength=1.0,
+):
+    latent_image = latent["samples"]
+    latent_image = comfy.sample.fix_empty_latent_channels(
+        model,
+        latent_image,
+        latent.get("downscale_ratio_spacial", None),
+        latent.get("downscale_ratio_temporal", None),
+    )
+    if disable_noise:
+        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+    else:
+        batch_inds = latent.get("batch_index", None)
+        noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+
+    noise_mask = latent.get("noise_mask", None)
+    samples = comfy.sample.sample(
+        model,
+        noise,
+        int(steps),
+        float(cfg),
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        denoise=1.0,
+        disable_noise=disable_noise,
+        start_step=start_step,
+        last_step=last_step,
+        force_full_denoise=force_full_denoise,
+        noise_mask=noise_mask,
+        callback=None,
+        disable_pbar=False,
+        seed=seed,
+    )
+    out = latent.copy()
+    out.pop("downscale_ratio_spacial", None)
+    out.pop("downscale_ratio_temporal", None)
+    out["samples"] = samples
+    out = _wanap_flow_apply_freeze_strength(latent, out, final_freeze_strength)
+    return out
+
+
+def _wanap_flow_apply_freeze_strength(source_latent, sampled_latent, strength):
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0:
+        return sampled_latent
+    freeze = source_latent.get(FLOW_FREEZE_MASK_KEY, None)
+    if freeze is None:
+        base = source_latent.get("noise_mask", None)
+        if base is None:
+            return sampled_latent
+        freeze = base != 1.0
+    samples = sampled_latent["samples"]
+    source = source_latent["samples"].to(device=samples.device, dtype=samples.dtype)
+    freeze = freeze.to(device=samples.device, dtype=samples.dtype)
+    if freeze.shape[0] != samples.shape[0]:
+        freeze = freeze.repeat(math.ceil(samples.shape[0] / freeze.shape[0]), 1, 1, 1, 1)[:samples.shape[0]]
+    if source.shape[0] != samples.shape[0]:
+        source = source.repeat(math.ceil(samples.shape[0] / source.shape[0]), 1, 1, 1, 1)[:samples.shape[0]]
+    mask = (freeze * strength).clamp(0.0, 1.0)
+    out = sampled_latent.copy()
+    out["samples"] = source * mask + samples * (1.0 - mask)
+    return out
+
+
+def _wanap_flow_phase_noise_mask(latent, phase_protect):
+    samples = latent["samples"]
+    base = latent.get("noise_mask", None)
+    if base is None:
+        base = torch.ones((samples.shape[0], 1, samples.shape[2], samples.shape[-2], samples.shape[-1]), device=samples.device, dtype=samples.dtype)
+    else:
+        base = base.to(device=samples.device, dtype=samples.dtype)
+    freeze = latent.get(FLOW_FREEZE_MASK_KEY, None)
+    if freeze is None:
+        handoff = latent.get(FLOW_HANDOFF_MASK_KEY, None)
+        freeze = handoff if handoff is not None else (base != 1.0)
+    freeze = freeze.to(device=base.device, dtype=torch.bool)
+    out = base.clone()
+    denoise_value = max(0.0, min(1.0, 1.0 - float(phase_protect)))
+    out = torch.where(freeze, torch.full_like(out, denoise_value), out)
+    return out
+
+
+def _wanap_flow_sample_two_phase(
+    model,
+    positive,
+    negative,
+    latent,
+    seed,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler,
+    phase1_mask,
+    phase2_mask,
+    phase2_start_step,
+    allow_two_phase,
+):
+    phase2_start_step = int(phase2_start_step or 0)
+    if not allow_two_phase or phase2_start_step <= 0:
+        return _wanap_flow_sample_once(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler)
+    if phase2_start_step >= int(steps):
+        log.warning("WanAnimatePlus SCAIL-2 Flow two-phase start step is outside the sampling range; using one-phase sampling.")
+        return _wanap_flow_sample_once(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler)
+
+    phase1_latent = latent.copy()
+    phase1_latent["noise_mask"] = _wanap_flow_phase_noise_mask(latent, phase1_mask)
+    phase1 = _wanap_flow_sample_once(
+        model,
+        positive,
+        negative,
+        phase1_latent,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        last_step=phase2_start_step,
+        force_full_denoise=False,
+        final_freeze_strength=0.0,
+    )
+    phase1 = _wanap_flow_apply_freeze_strength(latent, phase1, 1.0)
+
+    phase2_latent = latent.copy()
+    phase2_latent["samples"] = phase1["samples"]
+    phase2_latent["noise_mask"] = _wanap_flow_phase_noise_mask(latent, phase2_mask)
+    phase2 = _wanap_flow_sample_once(
+        model,
+        positive,
+        negative,
+        phase2_latent,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        disable_noise=True,
+        start_step=phase2_start_step,
+        force_full_denoise=True,
+        final_freeze_strength=0.0,
+    )
+    return _wanap_flow_apply_freeze_strength(latent, phase2, phase2_mask)
+
+
+class WanAnimatePlusSCAIL2FlowSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+                "vae": ("VAE",),
+                "steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "normal"}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "phase1_mask": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "phase2_mask": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "phase2_start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = "Official ComfyUI-compatible SCAIL-2 sampler. Uses MODEL/CONDITIONING/LATENT and comfy.sample.sample."
+
+    def process(
+        self,
+        model,
+        positive,
+        negative,
+        latent,
+        vae,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        shift,
+        seed,
+        force_offload,
+        phase1_mask,
+        phase2_mask,
+        phase2_start_step,
+    ):
+        runtime = latent.get(FLOW_RUNTIME_KEY, None)
+        model = _wanap_flow_patch_shift(model, shift)
+        has_context_handler = bool(getattr(model, "model_options", {}).get("context_handler", None))
+
+        try:
+            if runtime is not None and runtime.get("looping", False) and not has_context_handler:
+                out = self._process_loop(
+                    model,
+                    positive,
+                    negative,
+                    latent,
+                    vae,
+                    runtime,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    int(seed),
+                    phase1_mask,
+                    phase2_mask,
+                    phase2_start_step,
+                )
+            else:
+                if runtime is not None and runtime.get("looping", False) and has_context_handler:
+                    log.info("WanAnimatePlus SCAIL-2 Flow: official model context handler detected; disabling internal loop.")
+                if int(phase2_start_step or 0) > 0:
+                    log.warning("WanAnimatePlus SCAIL-2 Flow two-phase settings only affect internal loop handoff chunks; ignoring them for this sample.")
+                out = _wanap_flow_sample_once(model, positive, negative, latent, int(seed), steps, cfg, sampler_name, scheduler)
+        finally:
+            if force_offload:
+                if hasattr(mm, "unload_all_models"):
+                    mm.unload_all_models()
+                mm.soft_empty_cache()
+                gc.collect()
+
+        return (out,)
+
+    def _main_ref_frames(self, runtime):
+        ref = runtime.get("ref_image", None)
+        if ref is None:
+            return None
+        return ref[:1, :, :, :3]
+
+    def _process_loop(
+        self,
+        model,
+        positive,
+        negative,
+        latent,
+        vae,
+        runtime,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        seed,
+        phase1_mask,
+        phase2_mask,
+        phase2_start_step,
+    ):
+        total_frames = int(runtime["num_frames"])
+        requested_output_frames = int(runtime.get("requested_output_frames", total_frames))
+        canvas_expansion_px = int(runtime.get("canvas_expansion_px", 0) or 0)
+        window_frames = int(runtime["frame_window_size"])
+        prev_count = int(runtime.get("previous_frame_count", 5))
+        if window_frames <= prev_count:
+            raise ValueError("WanAnimatePlus SCAIL-2 Flow frame_window_size must be larger than the 5-frame handoff.")
+        if canvas_expansion_px and window_frames <= canvas_expansion_px:
+            raise ValueError("WanAnimatePlus SCAIL-2 Flow frame_window_size must be larger than the 21-frame transition canvas.")
+        stride = max(1, window_frames - prev_count)
+        num_chunks = 1 if total_frames <= window_frames else math.ceil((total_frames - window_frames) / stride) + 1
+
+        previous_frames = None
+        output_chunks = []
+        chunk_seeds = []
+        transition_match_ref = runtime.get("transition_match_ref", None)
+        transition_raw_last_frame = runtime.get("transition_raw_last_frame", None)
+        last_matched_ref_frame = transition_raw_last_frame
+        last_auto_drift_means = runtime.get("transition_raw_tail_means", None)
+
+        def _select_loop_colormatch_ref(chunk_idx, last_ref_frame):
+            method = runtime.get("transition_colormatch", "disabled")
+            if method in ("disabled", "auto_drift"):
+                return None
+            has_transition = runtime.get("transition_video", None) is not None
+            loop_ref = runtime.get("loop_colormatch_reference", "previous_matched_frame")
+            if chunk_idx == 0:
+                if not has_transition:
+                    return None
+                if loop_ref == "main_ref_image":
+                    return transition_match_ref
+                return transition_raw_last_frame
+            if loop_ref == "main_ref_image":
+                return transition_match_ref
+            if last_ref_frame is not None:
+                return last_ref_frame
+            return transition_match_ref
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * stride
+            has_handoff = chunk_idx > 0 and previous_frames is not None and previous_frames.shape[0] > 0
+            if has_handoff:
+                chunk_frames = window_frames
+                cond_start = chunk_start
+            else:
+                chunk_frames = window_frames
+                cond_start = chunk_start
+
+            aligned_chunk_frames = align_4n1(chunk_frames)
+            chunk_positive, chunk_negative, chunk_latent = build_conditioning_and_latent(
+                positive,
+                negative,
+                vae,
+                runtime,
+                start_frame=cond_start,
+                length=aligned_chunk_frames,
+                previous_frames=previous_frames,
+                include_runtime=False,
+            )
+
+            chunk_seed = int.from_bytes(os.urandom(8), "little")
+            chunk_seeds.append(chunk_seed)
+            log.info(
+                f"WanAnimatePlus SCAIL-2 Flow chunk {chunk_idx + 1}: "
+                f"start={chunk_start}, frames={chunk_frames}, seed={chunk_seed}"
+            )
+            sampled = _wanap_flow_sample_two_phase(
+                model,
+                chunk_positive,
+                chunk_negative,
+                chunk_latent,
+                chunk_seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                phase1_mask,
+                phase2_mask,
+                phase2_start_step,
+                allow_two_phase=has_handoff,
+            )
+
+            decoded = decode_latent_to_images(vae, sampled, tiled_vae=runtime.get("tiled_vae", False))
+            decoded = decoded[:chunk_frames]
+            if chunk_idx == 0 and canvas_expansion_px > 0:
+                output_chunk = decoded[canvas_expansion_px:]
+            elif has_handoff:
+                output_chunk = decoded[prev_count:]
+            else:
+                output_chunk = decoded
+
+            method = runtime.get("transition_colormatch", "disabled")
+            if method != "disabled":
+                if method == "auto_drift":
+                    output_chunk = auto_drift_frames(output_chunk, last_auto_drift_means, chunk_idx, num_chunks)
+                else:
+                    ref_frames = _select_loop_colormatch_ref(chunk_idx, last_matched_ref_frame)
+                    output_chunk = color_match_frames(output_chunk, ref_frames, method)
+
+            output_chunks.append(output_chunk.detach().cpu())
+            previous_frames = take_tail_with_front_pad(output_chunk.detach().cpu(), prev_count)
+            last_matched_ref_frame = previous_frames[-1:, :, :, :3]
+            last_auto_drift_means = auto_drift_tail_means(output_chunk)
+
+        video = torch.cat(output_chunks, dim=0)[:requested_output_frames].clamp(0.0, 1.0)
+        return {
+            "video": video.mul(2.0).sub(1.0),
+            "output_frame_count": requested_output_frames,
+            "scail2_chunk_seeds": chunk_seeds,
+            FLOW_RUNTIME_KEY: runtime,
+        }
+
+
 class WanVideoSamplerExtraArgs():
     @classmethod
     def INPUT_TYPES(s):
@@ -5834,6 +6255,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoSamplerFromSettings": WanVideoSamplerFromSettings,
     "WanAnimatePlusEasySampler": WanAnimatePlusEasySampler,
     "WanAnimatePlusEasySamplerSettings": WanAnimatePlusEasySamplerSettings,
+    "WanAnimatePlusSCAIL2FlowSampler": WanAnimatePlusSCAIL2FlowSampler,
     "WanVideoSamplerv2": WanVideoSamplerv2,
     "WanVideoSamplerExtraArgs": WanVideoSamplerExtraArgs,
     "WanVideoScheduler": WanVideoScheduler,
@@ -5845,6 +6267,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoSamplerFromSettings": "WanVideo Sampler From Settings",
     "WanAnimatePlusEasySampler": "WanAnimatePlus Easy Sampler",
     "WanAnimatePlusEasySamplerSettings": "WanAnimatePlus Easy SamplerSettings",
+    "WanAnimatePlusSCAIL2FlowSampler": "WanAnimatePlus SCAIL_2 Flow Sampler",
     "WanVideoSamplerv2": "WanVideo Sampler v2",
     "WanVideoSamplerExtraArgs": "WanVideoSampler v2 Extra Args",
     "WanVideoScheduler": "WanVideo Scheduler",
