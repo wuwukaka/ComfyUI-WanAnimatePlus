@@ -5981,6 +5981,14 @@ class WanAnimatePlusSCAIL2FlowSampler:
                     latent[FLOW_RUNTIME_KEY] = runtime
                 if int(phase2_start_step or 0) > 0:
                     log.warning("WanAnimatePlus SCAIL-2 Flow two-phase settings only affect internal loop handoff chunks; ignoring them for this sample.")
+                if runtime is not None:
+                    sample_mode = "context handler" if runtime.get("looping", False) and has_context_handler else "one-shot"
+                    log.info(
+                        f"WanAnimatePlus SCAIL-2 Flow {sample_mode} sampling: "
+                        f"{int(runtime.get('requested_output_frames', runtime.get('num_frames', 0)))} frames "
+                        f"at {runtime['width']}x{runtime['height']} with {steps} steps, "
+                        f"sampler={sampler_name}, scheduler={scheduler}"
+                    )
                 callback = _wanap_flow_prepare_callback(model, steps)
                 out = _wanap_flow_sample_once(
                     model,
@@ -6038,6 +6046,11 @@ class WanAnimatePlusSCAIL2FlowSampler:
             raise ValueError("WanAnimatePlus SCAIL-2 Flow frame_window_size must be larger than the 21-frame transition canvas.")
         stride = max(1, window_frames - prev_count)
         num_chunks = 1 if total_frames <= window_frames else math.ceil((total_frames - window_frames) / stride) + 1
+        log.info(
+            f"WanAnimatePlus SCAIL-2 Flow loop sampling: "
+            f"{requested_output_frames} requested frames, {total_frames} sample frames, "
+            f"{num_chunks} chunks, {window_frames} frames/chunk, stride {stride}, {prev_count} frame handoff"
+        )
 
         previous_frames = None
         output_chunks = []
@@ -6094,6 +6107,12 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 f"WanAnimatePlus SCAIL-2 Flow chunk {chunk_idx + 1}: "
                 f"start={chunk_start}, frames={chunk_frames}, seed={chunk_seed}"
             )
+            if has_handoff and 0 < int(phase2_start_step or 0) < int(steps):
+                log.info(
+                    f"WanAnimatePlus SCAIL-2 Flow two-phase chunk {chunk_idx + 1}/{num_chunks}: "
+                    f"phase2 starts at step {int(phase2_start_step)}, "
+                    f"phase1_mask={float(phase1_mask):.3f}, phase2_mask={float(phase2_mask):.3f}"
+                )
             chunk_callback = _wanap_flow_prepare_callback(model, steps)
             sampled = _wanap_flow_sample_two_phase(
                 model,
@@ -6136,6 +6155,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
             last_auto_drift_means = auto_drift_tail_means(output_chunk)
 
         video = torch.cat(output_chunks, dim=0)[:requested_output_frames].clamp(0.0, 1.0)
+        log.info(f"WanAnimatePlus SCAIL-2 Flow chunk seeds: {chunk_seeds}")
         return {
             "video": video.mul(2.0).sub(1.0),
             "output_frame_count": requested_output_frames,

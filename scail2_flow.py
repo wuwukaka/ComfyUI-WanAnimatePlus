@@ -26,6 +26,7 @@ FLOW_FREEZE_MASK_KEY = "_wananimateplus_scail2_freeze_mask"
 FLOW_DEFERRED_BUILD_KEY = "_wananimateplus_scail2_deferred_build"
 FLOW_RUNTIME_VAE_KEY = "_wananimateplus_scail2_vae"
 FLOW_STATIC_CACHE_KEY = "_wananimateplus_scail2_static_cache"
+FLOW_LOGGED_KEYS = "_wananimateplus_scail2_logged_keys"
 
 
 log = logging.getLogger(__name__)
@@ -193,7 +194,16 @@ def clean_flow_runtime_for_output(runtime):
     cleaned = dict(runtime)
     cleaned.pop(FLOW_RUNTIME_VAE_KEY, None)
     cleaned.pop(FLOW_STATIC_CACHE_KEY, None)
+    cleaned.pop(FLOW_LOGGED_KEYS, None)
     return cleaned
+
+
+def _log_once(runtime, key, message):
+    logged = runtime.setdefault(FLOW_LOGGED_KEYS, set())
+    if key in logged:
+        return
+    logged.add(key)
+    log.info(message)
 
 
 def make_runtime(
@@ -478,9 +488,18 @@ def _get_static_conditioning_cache(runtime, vae):
         cache["reference_latents"] = [
             _maybe_cpu(lat) for lat in _rotate_reference_latents_for_official(ref_latents)
         ]
-        log.info(f"SCAIL-2 Flow reference latents: {len(ref_latents)}")
+        _log_once(
+            runtime,
+            "reference_latents",
+            f"SCAIL-2 Flow reference latents: {len(ref_latents)} item(s), first shape {tuple(ref_latents[0].shape)}",
+        )
         if any(mask is not None for mask in ref_masks):
             cache["ref_mask_prefix"] = _maybe_cpu(torch.cat(mask_latents, dim=1))
+            _log_once(
+                runtime,
+                "reference_mask_latents",
+                f"SCAIL-2 Flow reference mask latents shape: {tuple(cache['ref_mask_prefix'].shape)}",
+            )
 
     clip_vision_output = runtime.get("clip_vision_output")
     if clip_vision_output is not None:
@@ -536,6 +555,11 @@ def _prepare_transition_freeze(runtime, vae):
     )
     runtime["transition_freeze_latents"] = freeze_latents.detach().cpu()
     runtime["transition_freeze_mask"] = freeze_mask.detach().cpu()
+    _log_once(
+        runtime,
+        "freeze_latents",
+        f"SCAIL-2 Flow freeze latents shape: {tuple(freeze_latents.shape)}",
+    )
     return runtime["transition_freeze_latents"], runtime["transition_freeze_mask"]
 
 
@@ -619,6 +643,11 @@ def build_conditioning_and_latent(
             mode="area",
         )
         values["pose_video_latent"] = pose_latent
+        _log_once(
+            runtime,
+            "pose_latent",
+            f"SCAIL-2 Flow pose latent shape: {tuple(pose_latent.shape)}",
+        )
 
     pose_mask = runtime.get("pose_image_mask")
     if pose_mask is not None:
@@ -626,6 +655,11 @@ def build_conditioning_and_latent(
         mask_slice = normalize_mask_background(mask_slice, white_background=runtime["replacement_mode"])
         mask_video = resize_bhwc(mask_slice, width // 2, height // 2, mode="area")
         values["driving_mask_28ch"] = extract_mask_to_28ch(mask_video)
+        _log_once(
+            runtime,
+            "driving_mask",
+            f"SCAIL-2 Flow driving mask latents shape: {tuple(values['driving_mask_28ch'].shape)}",
+        )
 
     positive = node_helpers.conditioning_set_values(positive, values)
     negative = node_helpers.conditioning_set_values(negative, values)

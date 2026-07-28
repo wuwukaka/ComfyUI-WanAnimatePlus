@@ -2607,6 +2607,16 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
     CATEGORY = "WanAnimatePlus"
     DESCRIPTION = "Official ComfyUI-compatible SCAIL-2 conditioning bundle. It outputs CONDITIONING and LATENT and does not depend on legacy WanAnimatePlus node types."
 
+    @staticmethod
+    def _flow_input_summary(label, value):
+        if value is None:
+            return f"{label}=none"
+        if isinstance(value, torch.Tensor):
+            if value.ndim >= 4:
+                return f"{label}={value.shape[0]}@{value.shape[2]}x{value.shape[1]}"
+            return f"{label}=shape{tuple(value.shape)}"
+        return f"{label}=yes"
+
     def process(
         self,
         positive,
@@ -2660,6 +2670,26 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
             reference_image_mask=reference_image_mask,
             clip_vision_output=clip_vision_output,
         )
+        mode = "loop deferred build" if runtime.get("looping", False) else "context full build"
+        log.info(
+            f"SCAIL-2 Flow Embeds: {mode}, "
+            f"{runtime['requested_output_frames']} requested frames, {runtime['num_frames']} sample frames, "
+            f"window={runtime['frame_window_size']}, {runtime['width']}x{runtime['height']}, "
+            f"batch={runtime['batch_size']}, tiled_vae={runtime['tiled_vae']}, replacement={runtime['replacement_mode']}"
+        )
+        log.info(
+            "SCAIL-2 Flow inputs: "
+            + ", ".join([
+                self._flow_input_summary("ref", ref_image),
+                self._flow_input_summary("bg", bg_image),
+                self._flow_input_summary("pose", pose_images),
+                self._flow_input_summary("prefix", prefix_frames),
+                self._flow_input_summary("transition", transition_video),
+                self._flow_input_summary("pose_mask", pose_image_mask),
+                self._flow_input_summary("ref_mask", reference_image_mask),
+                self._flow_input_summary("clip_vision", clip_vision_output),
+            ])
+        )
         if runtime.get("looping", False):
             runtime[FLOW_DEFERRED_BUILD_KEY] = "loop"
             runtime[FLOW_RUNTIME_VAE_KEY] = vae
@@ -2667,10 +2697,6 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
                 runtime,
                 length=runtime["frame_window_size"],
                 include_runtime=True,
-            )
-            log.info(
-                f"SCAIL-2 Flow Embeds: loop deferred build, "
-                f"{runtime['requested_output_frames']} requested frames, window={runtime['frame_window_size']}"
             )
         else:
             positive, negative, latent = build_conditioning_and_latent(
