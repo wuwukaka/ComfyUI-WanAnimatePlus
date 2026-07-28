@@ -5661,6 +5661,15 @@ def _wanap_flow_patch_shift(model, shift):
         return model
 
 
+def _wanap_flow_prepare_callback(model, steps):
+    steps = max(1, int(steps))
+    if args.preview_method in [LatentPreviewMethod.Auto, LatentPreviewMethod.Latent2RGB]:
+        from latent_preview import prepare_callback
+    else:
+        from .latent_preview import prepare_callback
+    return prepare_callback(model, steps)
+
+
 def _wanap_flow_sample_once(
     model,
     positive,
@@ -5676,6 +5685,9 @@ def _wanap_flow_sample_once(
     last_step=None,
     force_full_denoise=True,
     final_freeze_strength=1.0,
+    callback=None,
+    callback_offset=0,
+    callback_total=None,
 ):
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(
@@ -5691,6 +5703,14 @@ def _wanap_flow_sample_once(
         noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
 
     noise_mask = latent.get("noise_mask", None)
+    sample_callback = None
+    if callback is not None:
+        callback_offset = int(callback_offset or 0)
+        callback_total = max(1, int(callback_total if callback_total is not None else steps))
+
+        def sample_callback(step, x0, x, total_steps):
+            callback(callback_offset + int(step), x0, x, callback_total)
+
     samples = comfy.sample.sample(
         model,
         noise,
@@ -5707,7 +5727,7 @@ def _wanap_flow_sample_once(
         last_step=last_step,
         force_full_denoise=force_full_denoise,
         noise_mask=noise_mask,
-        callback=None,
+        callback=sample_callback,
         disable_pbar=False,
         seed=seed,
     )
@@ -5774,13 +5794,43 @@ def _wanap_flow_sample_two_phase(
     phase2_mask,
     phase2_start_step,
     allow_two_phase,
+    callback=None,
+    callback_offset=0,
+    callback_total=None,
 ):
     phase2_start_step = int(phase2_start_step or 0)
+    callback_total = max(1, int(callback_total if callback_total is not None else steps))
     if not allow_two_phase or phase2_start_step <= 0:
-        return _wanap_flow_sample_once(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler)
+        return _wanap_flow_sample_once(
+            model,
+            positive,
+            negative,
+            latent,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            callback=callback,
+            callback_offset=callback_offset,
+            callback_total=callback_total,
+        )
     if phase2_start_step >= int(steps):
         log.warning("WanAnimatePlus SCAIL-2 Flow two-phase start step is outside the sampling range; using one-phase sampling.")
-        return _wanap_flow_sample_once(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler)
+        return _wanap_flow_sample_once(
+            model,
+            positive,
+            negative,
+            latent,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            callback=callback,
+            callback_offset=callback_offset,
+            callback_total=callback_total,
+        )
 
     phase1_latent = latent.copy()
     phase1_latent["noise_mask"] = _wanap_flow_phase_noise_mask(latent, phase1_mask)
@@ -5797,6 +5847,9 @@ def _wanap_flow_sample_two_phase(
         last_step=phase2_start_step,
         force_full_denoise=False,
         final_freeze_strength=0.0,
+        callback=callback,
+        callback_offset=callback_offset,
+        callback_total=callback_total,
     )
     phase1 = _wanap_flow_apply_freeze_strength(latent, phase1, 1.0)
 
@@ -5817,6 +5870,9 @@ def _wanap_flow_sample_two_phase(
         start_step=phase2_start_step,
         force_full_denoise=True,
         final_freeze_strength=0.0,
+        callback=callback,
+        callback_offset=int(callback_offset or 0) + phase2_start_step,
+        callback_total=callback_total,
     )
     return _wanap_flow_apply_freeze_strength(latent, phase2, phase2_mask)
 
@@ -5902,7 +5958,20 @@ class WanAnimatePlusSCAIL2FlowSampler:
                     log.info("WanAnimatePlus SCAIL-2 Flow: official model context handler detected; disabling internal loop.")
                 if int(phase2_start_step or 0) > 0:
                     log.warning("WanAnimatePlus SCAIL-2 Flow two-phase settings only affect internal loop handoff chunks; ignoring them for this sample.")
-                out = _wanap_flow_sample_once(model, positive, negative, latent, int(seed), steps, cfg, sampler_name, scheduler)
+                callback = _wanap_flow_prepare_callback(model, steps)
+                out = _wanap_flow_sample_once(
+                    model,
+                    positive,
+                    negative,
+                    latent,
+                    int(seed),
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    callback=callback,
+                    callback_total=steps,
+                )
         finally:
             if force_offload:
                 if hasattr(mm, "unload_all_models"):
@@ -6001,6 +6070,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 f"WanAnimatePlus SCAIL-2 Flow chunk {chunk_idx + 1}: "
                 f"start={chunk_start}, frames={chunk_frames}, seed={chunk_seed}"
             )
+            chunk_callback = _wanap_flow_prepare_callback(model, steps)
             sampled = _wanap_flow_sample_two_phase(
                 model,
                 chunk_positive,
@@ -6015,6 +6085,8 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 phase2_mask,
                 phase2_start_step,
                 allow_two_phase=has_handoff,
+                callback=chunk_callback,
+                callback_total=steps,
             )
 
             decoded = decode_latent_to_images(vae, sampled, tiled_vae=runtime.get("tiled_vae", False))
