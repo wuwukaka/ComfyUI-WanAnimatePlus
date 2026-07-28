@@ -7,6 +7,7 @@
 #   - Provides shared Flow helper logic used by the official-compatible embeds,
 #     sampler, and VAE decode nodes.
 # Licensed under the Apache License, Version 2.0
+import gc
 import math
 import logging
 import numpy as np
@@ -22,6 +23,9 @@ from comfy.utils import common_upscale
 FLOW_RUNTIME_KEY = "_wananimateplus_scail2_flow"
 FLOW_HANDOFF_MASK_KEY = "_wananimateplus_scail2_handoff_mask"
 FLOW_FREEZE_MASK_KEY = "_wananimateplus_scail2_freeze_mask"
+FLOW_DEFERRED_BUILD_KEY = "_wananimateplus_scail2_deferred_build"
+FLOW_RUNTIME_VAE_KEY = "_wananimateplus_scail2_vae"
+FLOW_STATIC_CACHE_KEY = "_wananimateplus_scail2_static_cache"
 
 
 log = logging.getLogger(__name__)
@@ -168,6 +172,28 @@ def _maybe_cpu(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
     return value
+
+
+def release_flow_vae(vae):
+    if vae is None:
+        return
+    patcher = getattr(vae, "patcher", None)
+    if patcher is not None and hasattr(mm, "unload_model_and_clones"):
+        try:
+            mm.unload_model_and_clones(patcher)
+        except Exception as e:
+            log.debug(f"SCAIL-2 Flow: VAE targeted unload skipped: {e}")
+    mm.soft_empty_cache()
+    gc.collect()
+
+
+def clean_flow_runtime_for_output(runtime):
+    if runtime is None:
+        return runtime
+    cleaned = dict(runtime)
+    cleaned.pop(FLOW_RUNTIME_VAE_KEY, None)
+    cleaned.pop(FLOW_STATIC_CACHE_KEY, None)
+    return cleaned
 
 
 def make_runtime(
@@ -420,6 +446,67 @@ def _rotate_reference_latents_for_official(final_order_latents):
     return final_order_latents[-1:] + final_order_latents[:-1]
 
 
+def _get_static_conditioning_cache(runtime, vae):
+    cache = runtime.get(FLOW_STATIC_CACHE_KEY, None)
+    if cache is not None:
+        return cache
+
+    cache = {"ref_mask_flag": not runtime["replacement_mode"]}
+    refs, ref_masks = _prepare_reference_inputs(runtime)
+    ref_latents = []
+    mask_latents = []
+    width = runtime["width"]
+    height = runtime["height"]
+    for ref, mask in zip(refs, ref_masks):
+        ref_lat = encode_video_latent(
+            vae,
+            ref,
+            width,
+            height,
+            runtime["tiled_vae"],
+            scale=runtime["ref_strength"],
+            mode="lanczos",
+        )
+        ref_latents.append(ref_lat)
+        if mask is not None:
+            mask_resized = resize_bhwc(mask, width, height, mode="bicubic")
+            mask_latents.append(extract_mask_to_28ch(mask_resized).to(device=ref_lat.device, dtype=ref_lat.dtype))
+        else:
+            mask_latents.append(_empty_ref_mask_like(ref_lat))
+
+    if ref_latents:
+        cache["reference_latents"] = [
+            _maybe_cpu(lat) for lat in _rotate_reference_latents_for_official(ref_latents)
+        ]
+        log.info(f"SCAIL-2 Flow reference latents: {len(ref_latents)}")
+        if any(mask is not None for mask in ref_masks):
+            cache["ref_mask_prefix"] = _maybe_cpu(torch.cat(mask_latents, dim=1))
+
+    clip_vision_output = runtime.get("clip_vision_output")
+    if clip_vision_output is not None:
+        cache["clip_vision_output"] = clip_vision_output
+
+    runtime[FLOW_STATIC_CACHE_KEY] = cache
+    return cache
+
+
+def _static_conditioning_values_for_length(runtime, vae, t_lat):
+    cache = _get_static_conditioning_cache(runtime, vae)
+    values = {"ref_mask_flag": cache.get("ref_mask_flag", not runtime["replacement_mode"])}
+    if "reference_latents" in cache:
+        values["reference_latents"] = cache["reference_latents"]
+    ref_mask_prefix = cache.get("ref_mask_prefix", None)
+    if ref_mask_prefix is not None:
+        zeros = torch.zeros(
+            1, t_lat, 28, ref_mask_prefix.shape[-2], ref_mask_prefix.shape[-1],
+            device=ref_mask_prefix.device, dtype=ref_mask_prefix.dtype,
+        )
+        values["ref_mask_28ch"] = torch.cat([ref_mask_prefix, zeros], dim=1)
+    if "clip_vision_output" in cache:
+        values["clip_vision_output"] = cache["clip_vision_output"]
+    return values
+
+
 def _prepare_transition_freeze(runtime, vae):
     canvas_expansion_px = int(runtime.get("canvas_expansion_px", 0) or 0)
     transition_video = runtime.get("transition_video", None)
@@ -517,40 +604,7 @@ def build_conditioning_and_latent(
         noise_mask[:, :, :prev_latents] = 0.0
         handoff_mask[:, :, :prev_latents] = 1.0
 
-    values = {"ref_mask_flag": not runtime["replacement_mode"]}
-
-    refs, ref_masks = _prepare_reference_inputs(runtime)
-    ref_latents = []
-    mask_latents = []
-    for ref, mask in zip(refs, ref_masks):
-        ref_lat = encode_video_latent(
-            vae,
-            ref,
-            width,
-            height,
-            runtime["tiled_vae"],
-            scale=runtime["ref_strength"],
-            mode="lanczos",
-        )
-        ref_latents.append(ref_lat)
-        if mask is not None:
-            mask_resized = resize_bhwc(mask, width, height, mode="bicubic")
-            mask_latents.append(extract_mask_to_28ch(mask_resized).to(device=ref_lat.device, dtype=ref_lat.dtype))
-        else:
-            mask_latents.append(_empty_ref_mask_like(ref_lat))
-
-    if ref_latents:
-        values["reference_latents"] = _rotate_reference_latents_for_official(ref_latents)
-        if any(mask is not None for mask in ref_masks):
-            zeros = torch.zeros(
-                1, t_lat, 28, mask_latents[0].shape[-2], mask_latents[0].shape[-1],
-                device=mask_latents[0].device, dtype=mask_latents[0].dtype,
-            )
-            values["ref_mask_28ch"] = torch.cat(mask_latents + [zeros], dim=1)
-
-    clip_vision_output = runtime.get("clip_vision_output")
-    if clip_vision_output is not None:
-        values["clip_vision_output"] = clip_vision_output
+    values = _static_conditioning_values_for_length(runtime, vae, t_lat)
 
     pose_images = runtime.get("pose_images")
     if pose_images is not None:
@@ -590,6 +644,28 @@ def build_conditioning_and_latent(
     if runtime.get("requested_output_frames", None) is not None:
         out_latent["output_frame_count"] = int(runtime["requested_output_frames"])
     return positive, negative, out_latent
+
+
+def build_deferred_latent(runtime, length=None, include_runtime=True):
+    width = runtime["width"]
+    height = runtime["height"]
+    if length is None:
+        length = runtime["frame_window_size"] if runtime.get("looping", False) else runtime["num_frames"]
+    length = align_4n1(length)
+    t_lat = latent_frames_for_pixels(length)
+    lat_h = height // 8
+    lat_w = width // 8
+    batch_size = runtime["batch_size"]
+    latent = torch.zeros((batch_size, 16, t_lat, lat_h, lat_w), device=mm.intermediate_device())
+    out_latent = {"samples": latent}
+    if include_runtime:
+        out_latent[FLOW_RUNTIME_KEY] = runtime
+    canvas_expansion_px = int(runtime.get("canvas_expansion_px", 0) or 0)
+    if canvas_expansion_px:
+        out_latent["canvas_expansion_px"] = canvas_expansion_px
+    if runtime.get("requested_output_frames", None) is not None:
+        out_latent["output_frame_count"] = int(runtime["requested_output_frames"])
+    return out_latent
 
 
 def decode_latent_to_images(vae, latent, tiled_vae=False):

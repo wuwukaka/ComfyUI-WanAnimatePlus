@@ -54,15 +54,19 @@ from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 from comfy.cli_args import args, LatentPreviewMethod
 from .scail2_flow import (
+    FLOW_DEFERRED_BUILD_KEY,
     FLOW_FREEZE_MASK_KEY,
     FLOW_HANDOFF_MASK_KEY,
     FLOW_RUNTIME_KEY,
+    FLOW_RUNTIME_VAE_KEY,
     align_4n1,
     auto_drift_frames,
     auto_drift_tail_means,
     build_conditioning_and_latent,
+    clean_flow_runtime_for_output,
     color_match_frames,
     decode_latent_to_images,
+    release_flow_vae,
     take_tail_with_front_pad,
 )
 
@@ -5929,10 +5933,14 @@ class WanAnimatePlusSCAIL2FlowSampler:
         runtime = latent.get(FLOW_RUNTIME_KEY, None)
         model = _wanap_flow_patch_shift(model, shift)
         has_context_handler = bool(getattr(model, "model_options", {}).get("context_handler", None))
+        flow_vae = vae
+        if flow_vae is None and runtime is not None:
+            flow_vae = runtime.get(FLOW_RUNTIME_VAE_KEY, None)
+        deferred_mode = runtime.get(FLOW_DEFERRED_BUILD_KEY, None) if runtime is not None else None
 
         try:
             if runtime is not None and runtime.get("looping", False) and not has_context_handler:
-                if vae is None:
+                if flow_vae is None:
                     raise ValueError(
                         "WanAnimatePlus SCAIL-2 Flow internal loop requires a VAE. "
                         "Connect VAE or use official context mode."
@@ -5942,7 +5950,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
                     positive,
                     negative,
                     latent,
-                    vae,
+                    flow_vae,
                     runtime,
                     steps,
                     cfg,
@@ -5956,6 +5964,21 @@ class WanAnimatePlusSCAIL2FlowSampler:
             else:
                 if runtime is not None and runtime.get("looping", False) and has_context_handler:
                     log.info("WanAnimatePlus SCAIL-2 Flow: official model context handler detected; disabling internal loop.")
+                if runtime is not None and deferred_mode is not None:
+                    if flow_vae is None:
+                        raise ValueError("WanAnimatePlus SCAIL-2 Flow deferred build requires a VAE.")
+                    positive, negative, latent = build_conditioning_and_latent(
+                        positive,
+                        negative,
+                        flow_vae,
+                        runtime,
+                        start_frame=0,
+                        length=runtime["num_frames"],
+                        include_runtime=True,
+                    )
+                    release_flow_vae(flow_vae)
+                    runtime = clean_flow_runtime_for_output(runtime)
+                    latent[FLOW_RUNTIME_KEY] = runtime
                 if int(phase2_start_step or 0) > 0:
                     log.warning("WanAnimatePlus SCAIL-2 Flow two-phase settings only affect internal loop handoff chunks; ignoring them for this sample.")
                 callback = _wanap_flow_prepare_callback(model, steps)
@@ -6063,6 +6086,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
                 previous_frames=previous_frames,
                 include_runtime=False,
             )
+            release_flow_vae(vae)
 
             chunk_seed = int.from_bytes(os.urandom(8), "little")
             chunk_seeds.append(chunk_seed)
@@ -6116,7 +6140,7 @@ class WanAnimatePlusSCAIL2FlowSampler:
             "video": video.mul(2.0).sub(1.0),
             "output_frame_count": requested_output_frames,
             "scail2_chunk_seeds": chunk_seeds,
-            FLOW_RUNTIME_KEY: runtime,
+            FLOW_RUNTIME_KEY: clean_flow_runtime_for_output(runtime),
         }
 
 

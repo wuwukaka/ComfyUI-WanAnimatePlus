@@ -27,7 +27,15 @@ from tqdm import tqdm
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
-from .scail2_flow import build_conditioning_and_latent, decode_latent_to_images, make_runtime
+from .scail2_flow import (
+    FLOW_DEFERRED_BUILD_KEY,
+    FLOW_RUNTIME_VAE_KEY,
+    build_conditioning_and_latent,
+    build_deferred_latent,
+    decode_latent_to_images,
+    make_runtime,
+    release_flow_vae,
+)
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -2652,15 +2660,29 @@ class WanAnimatePlusSCAIL2FlowEmbeds:
             reference_image_mask=reference_image_mask,
             clip_vision_output=clip_vision_output,
         )
-        positive, negative, latent = build_conditioning_and_latent(
-            positive,
-            negative,
-            vae,
-            runtime,
-            start_frame=0,
-            length=runtime["num_frames"],
-            include_runtime=True,
-        )
+        if runtime.get("looping", False):
+            runtime[FLOW_DEFERRED_BUILD_KEY] = "loop"
+            runtime[FLOW_RUNTIME_VAE_KEY] = vae
+            latent = build_deferred_latent(
+                runtime,
+                length=runtime["frame_window_size"],
+                include_runtime=True,
+            )
+            log.info(
+                f"SCAIL-2 Flow Embeds: loop deferred build, "
+                f"{runtime['requested_output_frames']} requested frames, window={runtime['frame_window_size']}"
+            )
+        else:
+            positive, negative, latent = build_conditioning_and_latent(
+                positive,
+                negative,
+                vae,
+                runtime,
+                start_frame=0,
+                length=runtime["num_frames"],
+                include_runtime=True,
+            )
+            release_flow_vae(vae)
         return (positive, negative, latent)
 
 
