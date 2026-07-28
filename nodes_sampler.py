@@ -4986,8 +4986,14 @@ class WanVideoSampler:
 
                             loop_ref_latents = wananim_static_ref_latents if wananim_static_ref_latents > 0 else 1
                             loop_extra_prefix_latents = 0 if wananim_static_ref_latents > 0 else prefix_T
+                            loop_target_latents = latent_window_size + loop_ref_latents
                             noise = torch.randn(16, latent_window_size + loop_ref_latents + loop_extra_prefix_latents, lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
                             seq_len = math.ceil((noise.shape[2] * noise.shape[3]) / 4 * noise.shape[1])
+
+                            def _trim_loop_prefix_latents(tensor):
+                                if tensor is not None and loop_extra_prefix_latents > 0 and tensor.shape[1] > loop_target_latents:
+                                    return tensor[:, -loop_target_latents:]
+                                return tensor
 
                             if current_ref_images is not None or bg_images is not None or ref_latent is not None or has_transition or prefix_ctx is not None:
                                 if offload:
@@ -5188,8 +5194,9 @@ class WanVideoSampler:
                                     context_latents=context_latents, context_roles=context_roles,
                                  )
                                 if loop_extra_prefix_latents > 0:
-                                    noise_pred = noise_pred[:, loop_extra_prefix_latents:]
-                                    latent = latent[:, loop_extra_prefix_latents:]
+                                    noise_pred = _trim_loop_prefix_latents(noise_pred)
+                                    latent = _trim_loop_prefix_latents(latent)
+                                    latent_model_input = _trim_loop_prefix_latents(latent_model_input)
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                                     callback(step_iteration_count, callback_latent, None, estimated_iterations*(len(timesteps)))
