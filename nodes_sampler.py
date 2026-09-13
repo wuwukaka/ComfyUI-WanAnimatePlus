@@ -22,6 +22,8 @@
 #   - Added official-compatible SCAIL-2 Flow sampler with legacy-aligned
 #     reference/freeze masks, loop colormatch, random chunk seeds, and
 #     two-phase freeze handling for official MODEL/CONDITIONING/LATENT chains.
+#   - Added official-compatible Animate2 sampler with prefix/bg canvas mapping
+#     and 5-frame internal-loop handoff.
 #   - Added simplified WanAnimatePlus Easy Sampler and Easy SamplerSettings wrapper nodes.
 #   RoPE math/mechanisms, upstream Wan/Bernini source-id RoPE mechanisms, and
 #   Comfy RoPE implementations remain upstream/third-party work.
@@ -68,6 +70,16 @@ from .scail2_flow import (
     decode_latent_to_images,
     release_flow_vae,
     take_tail_with_front_pad,
+)
+from .animate2_flow import (
+    ANIMATE2_DEFERRED_BUILD_KEY,
+    ANIMATE2_RUNTIME_KEY,
+    ANIMATE2_RUNTIME_VAE_KEY,
+    attach_pose_reader,
+    build_conditioning_and_latent as build_animate2_conditioning_and_latent,
+    clean_animate2_runtime_for_output,
+    cleanup_loop_inputs as cleanup_animate2_loop_inputs,
+    trim_and_decode as trim_and_decode_animate2,
 )
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -6168,6 +6180,247 @@ class WanAnimatePlusSCAIL2FlowSampler:
             "output_frame_count": requested_output_frames,
             "scail2_chunk_seeds": chunk_seeds,
             FLOW_RUNTIME_KEY: clean_flow_runtime_for_output(runtime),
+        }
+
+
+class WanAnimatePlusAnimate2Sampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+                "steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
+                "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "normal"}),
+                "shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "vae": ("VAE",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "process"
+    CATEGORY = "WanAnimatePlus"
+    DESCRIPTION = (
+        "Official ComfyUI-compatible Animate2 sampler. Uses MODEL/CONDITIONING/LATENT "
+        "and comfy.sample.sample. Trims the identity latent frames and decodes internally."
+    )
+
+    def process(
+        self,
+        model,
+        positive,
+        negative,
+        latent,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        shift,
+        seed,
+        force_offload,
+        vae=None,
+    ):
+        runtime = latent.get(ANIMATE2_RUNTIME_KEY, None)
+        model = _wanap_flow_patch_shift(model, shift)
+        has_context_handler = bool(getattr(model, "model_options", {}).get("context_handler", None))
+        flow_vae = vae
+        if flow_vae is None and runtime is not None:
+            flow_vae = runtime.get(ANIMATE2_RUNTIME_VAE_KEY, None)
+        deferred_mode = runtime.get(ANIMATE2_DEFERRED_BUILD_KEY, None) if runtime is not None else None
+
+        try:
+            if runtime is not None and runtime.get("looping", False) and not has_context_handler:
+                if flow_vae is None:
+                    raise ValueError(
+                        "WanAnimatePlus Animate2 internal loop requires a VAE. "
+                        "Connect VAE or use official context mode."
+                    )
+                out = self._process_loop(
+                    model,
+                    positive,
+                    negative,
+                    flow_vae,
+                    runtime,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    int(seed),
+                )
+            else:
+                if runtime is not None and runtime.get("looping", False) and has_context_handler:
+                    log.info("WanAnimatePlus Animate2: official model context handler detected; disabling internal loop.")
+                if runtime is not None and deferred_mode is not None:
+                    if flow_vae is None:
+                        raise ValueError("WanAnimatePlus Animate2 deferred build requires a VAE.")
+                    positive, negative, latent = build_animate2_conditioning_and_latent(
+                        positive,
+                        negative,
+                        flow_vae,
+                        runtime,
+                        start_frame=0,
+                        length=runtime["num_frames"],
+                        include_runtime=True,
+                    )
+                    release_flow_vae(flow_vae)
+                    runtime = clean_animate2_runtime_for_output(runtime)
+                    latent[ANIMATE2_RUNTIME_KEY] = runtime
+                if runtime is not None:
+                    sample_mode = "context handler" if runtime.get("looping", False) and has_context_handler else "one-shot"
+                    log.info(
+                        f"WanAnimatePlus Animate2 {sample_mode} sampling: "
+                        f"{int(runtime.get('requested_output_frames', runtime.get('num_frames', 0)))} frames "
+                        f"at {runtime['width']}x{runtime['height']} with {steps} steps, "
+                        f"sampler={sampler_name}, scheduler={scheduler}"
+                    )
+                if flow_vae is None:
+                    raise ValueError(
+                        "WanAnimatePlus Animate2 Sampler needs a VAE to trim identity latents and decode."
+                    )
+                callback = _wanap_flow_prepare_callback(model, steps)
+                sampled = _wanap_flow_sample_once(
+                    model,
+                    positive,
+                    negative,
+                    latent,
+                    int(seed),
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    callback=callback,
+                    callback_total=steps,
+                )
+                if runtime is None:
+                    runtime = {
+                        "trim_latent": int(latent.get("trim_latent", 0) or 0),
+                        "tiled_vae": False,
+                        "requested_output_frames": None,
+                    }
+                decoded = trim_and_decode_animate2(flow_vae, sampled, runtime)
+                requested = runtime.get("requested_output_frames", None)
+                if requested is not None and decoded.shape[0] > int(requested):
+                    decoded = decoded[:int(requested)]
+                out = {
+                    "samples": sampled["samples"],
+                    "video": decoded.detach().cpu().float().mul(2.0).sub(1.0),
+                    "output_frame_count": int(decoded.shape[0]),
+                    ANIMATE2_RUNTIME_KEY: clean_animate2_runtime_for_output(runtime),
+                }
+        finally:
+            if runtime is not None:
+                cleanup_animate2_loop_inputs(runtime, log)
+            if force_offload:
+                if hasattr(mm, "unload_all_models"):
+                    mm.unload_all_models()
+                mm.soft_empty_cache()
+                gc.collect()
+
+        return (out,)
+
+    def _process_loop(
+        self,
+        model,
+        positive,
+        negative,
+        vae,
+        runtime,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        seed,
+    ):
+        total_frames = int(runtime["num_frames"])
+        requested_output_frames = int(runtime.get("requested_output_frames", total_frames))
+        window_frames = int(runtime["frame_window_size"])
+        prev_count = int(runtime.get("previous_frame_count", 5))
+        if window_frames <= prev_count:
+            raise ValueError("WanAnimatePlus Animate2 frame_window_size must be larger than the 5-frame handoff.")
+        stride = max(1, window_frames - prev_count)
+        num_chunks = 1 if total_frames <= window_frames else math.ceil((total_frames - window_frames) / stride) + 1
+        log.info(
+            f"WanAnimatePlus Animate2 loop sampling: "
+            f"{requested_output_frames} frames, "
+            f"{num_chunks} chunks, {window_frames} frames/chunk, stride {stride}, {prev_count} frame handoff"
+        )
+
+        reader = attach_pose_reader(runtime)
+        previous_frames = None
+        output_chunks = []
+        chunk_seeds = []
+
+        try:
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * stride
+                has_handoff = chunk_idx > 0 and previous_frames is not None and previous_frames.shape[0] > 0
+                aligned_chunk_frames = align_4n1(window_frames)
+                if reader is not None:
+                    reader.preload_available(log)
+
+                chunk_positive, chunk_negative, chunk_latent = build_animate2_conditioning_and_latent(
+                    positive,
+                    negative,
+                    vae,
+                    runtime,
+                    start_frame=chunk_start,
+                    length=aligned_chunk_frames,
+                    previous_frames=previous_frames,
+                    include_runtime=False,
+                )
+                release_flow_vae(vae)
+
+                chunk_seed = int.from_bytes(os.urandom(8), "little")
+                chunk_seeds.append(chunk_seed)
+                log.info(
+                    f"WanAnimatePlus Animate2 chunk {chunk_idx + 1}/{num_chunks}: "
+                    f"start={chunk_start}, frames={aligned_chunk_frames}, seed={chunk_seed}"
+                )
+                chunk_callback = _wanap_flow_prepare_callback(model, steps)
+                sampled = _wanap_flow_sample_once(
+                    model,
+                    chunk_positive,
+                    chunk_negative,
+                    chunk_latent,
+                    chunk_seed,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    callback=chunk_callback,
+                    callback_total=steps,
+                )
+                decoded = trim_and_decode_animate2(vae, sampled, runtime)
+                decoded = decoded[:aligned_chunk_frames]
+                if has_handoff:
+                    output_chunk = decoded[prev_count:]
+                else:
+                    output_chunk = decoded
+
+                output_chunks.append(output_chunk.detach().cpu())
+                previous_frames = take_tail_with_front_pad(output_chunk.detach().cpu(), prev_count)
+                if reader is not None:
+                    next_keep = min(total_frames, chunk_start + stride)
+                    reader.trim_before(next_keep, log)
+        finally:
+            cleanup_animate2_loop_inputs(runtime, log)
+
+        video = torch.cat(output_chunks, dim=0)[:requested_output_frames].clamp(0.0, 1.0)
+        log.info(f"WanAnimatePlus Animate2 chunk seeds: {chunk_seeds}")
+        return {
+            "video": video.mul(2.0).sub(1.0),
+            "output_frame_count": requested_output_frames,
+            "animate2_chunk_seeds": chunk_seeds,
+            ANIMATE2_RUNTIME_KEY: clean_animate2_runtime_for_output(runtime),
         }
 
 

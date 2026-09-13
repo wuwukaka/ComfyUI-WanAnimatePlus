@@ -8,6 +8,8 @@
 #   - Adds WanAnimatePlus SCAIL-2 two-phase settings node to the public mappings.
 #   - Adds official-compatible SCAIL-2 Flow embeds/sampler/VAE decode nodes for
 #     MODEL/VAE/CONDITIONING/LATENT workflow chains.
+#   - Adds official-compatible Animate2 embeds/sampler nodes with prefix,
+#     bg canvas fill, and 5-frame internal-loop handoff.
 #   - Adds WanAnimatePlus Easy Sampler and Easy SamplerSettings nodes to the public mappings.
 #   - Includes WanAnimatePlus Uni3C loader/embeds nodes for same-package sampling compatibility.
 #   - Forces registered node categories to WanAnimatePlus.
@@ -40,7 +42,9 @@ from .nodes import (
     WanVideoSetBlockSwap,
     WanVideoTextEncodeCached,
 )
+from .nodes_animate2 import WanAnimatePlusAnimate2Embeds
 from .nodes_sampler import (
+    WanAnimatePlusAnimate2Sampler,
     WanAnimatePlusEasySampler,
     WanAnimatePlusEasySamplerSettings,
     WanAnimatePlusSCAIL2FlowSampler,
@@ -70,6 +74,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus Easy Sampler": WanAnimatePlusEasySampler,
     "WanAnimatePlus Easy SamplerSettings": WanAnimatePlusEasySamplerSettings,
     "WanAnimatePlus SCAIL_2 Flow Sampler": WanAnimatePlusSCAIL2FlowSampler,
+    "WanAnimatePlus Animate2 Sampler": WanAnimatePlusAnimate2Sampler,
     "WanAnimatePlus Scheduler": WanVideoScheduler,
     "WanAnimatePlus Schedulerv2": WanVideoSchedulerv2,
     "WanAnimatePlus SamplerSettings": WanVideoSamplerSettings,
@@ -97,6 +102,7 @@ NODE_CLASS_MAPPINGS = {
     "WanAnimatePlus SCAIL_2 Embeds": WanAnimatePlusSCAIL2Embeds,
     "WanAnimatePlus SCAIL_2 Flow Embeds": WanAnimatePlusSCAIL2FlowEmbeds,
     "WanAnimatePlus SCAIL_2 TwoPhase Settings": WanAnimatePlusSCAIL2TwoPhaseSettings,
+    "WanAnimatePlus Animate2 Embeds": WanAnimatePlusAnimate2Embeds,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {k: k for k in NODE_CLASS_MAPPINGS}
