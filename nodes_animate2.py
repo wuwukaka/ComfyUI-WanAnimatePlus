@@ -56,7 +56,7 @@ class WanAnimatePlusAnimate2Embeds:
         "Official ComfyUI-compatible Animate2 conditioning. Outputs CONDITIONING and LATENT. "
         "prefix_frames are frozen identity latents trimmed after sampling. "
         "bg_image fills the unknown canvas instead of mid-grey. "
-        "Internal looping is handled by WanAnimatePlus Animate2 Sampler."
+        "Internal looping is handled by WanAnimatePlus SCAIL_2 Flow Sampler."
     )
 
     @staticmethod

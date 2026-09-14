@@ -6,7 +6,7 @@ Multi-reference image injection and seamless video connection for ComfyUI's WanA
 
 ## Overview
 
-`ComfyUI-WanAnimatePlus` adds four major feature groups to the WanVideo workflow:
+`ComfyUI-WanAnimatePlus` adds five major feature groups to the WanVideo workflow:
 
 ### prefix_frames & transition_video
 
@@ -34,6 +34,10 @@ Adds a wrapper-native `WanAnimatePlus SCAIL_2 Embeds` node for SCAIL-2 models. I
 ### Official-Compatible SCAIL-2 Flow Nodes
 
 Adds `WanAnimatePlus SCAIL_2 Flow Embeds`, `WanAnimatePlus SCAIL_2 Flow Sampler`, and `WanAnimatePlus VAE Decode`. These nodes use official ComfyUI `MODEL`, `VAE`, `CONDITIONING`, `LATENT`, and `IMAGE` interfaces so they can fit into official-style workflows while preserving WanAnimatePlus SCAIL-2 prefix, transition, bg, mask, loop colormatch, and two-phase sampling behavior.
+
+### Official-Compatible Animate2 Embeds
+
+Adds `WanAnimatePlus Animate2 Embeds` for official ComfyUI Animate2 models. It maps Plus-style `ref_image`, `prefix_frames`, and `bg_image` onto official Animate2 `CONDITIONING` (`concat_latent_image`, `concat_mask`, `pose_video_latent`) and `LATENT`. Sample with the same `WanAnimatePlus SCAIL_2 Flow Sampler` used by SCAIL-2 Flow; there is no separate Animate2 sampler.
 
 ## Demo
 
@@ -93,6 +97,16 @@ Provides SCAIL-2 ref / pose / mask conditioning through `WanAnimatePlus SCAIL_2 
 - In single-frame prefix mode, `prefix_mask` follows the same reference-mask path as `reference_image_mask`
 - Supports context-window sampling; non-first windows can see prepended prefix/transition context without fusing those prepended predictions
 
+### Animate2
+
+Provides official Animate2 conditioning through `WanAnimatePlus Animate2 Embeds`, sampled by `WanAnimatePlus SCAIL_2 Flow Sampler`.
+
+- Maps `ref_image`, `prefix_frames`, and `bg_image` onto official `concat_latent_image` / `concat_mask` / `pose_video_latent`
+- `prefix_frames` are extra frozen identity latents (max 5) and are trimmed after sampling
+- `bg_image` fills the unknown canvas instead of mid-grey and remains generated
+- Internal looping uses a 5-frame concat/mask handoff when `frame_window_size` is smaller than `num_frames`
+- Does not wrap official `WanAnimate2Cache` / `PoseBranchCache`; use those nodes directly when caching is needed
+
 ## Installation
 
 Place this repository into ComfyUI's `custom_nodes` directory:
@@ -112,7 +126,9 @@ Restart ComfyUI after installation.
 2. **Replace the entire workflow chain** with WanAnimatePlus counterparts: `ModelLoader`, `VAELoader`, `ContextOptions`, `AnimateEmbeds`, `Sampler`, `Decode`, and supporting nodes
 3. Do **not** mix original WanVideoWrapper nodes in the same workflow
 4. For SCAIL-2 and WanAnimate workflows, `WanAnimatePlus Easy Sampler` or `WanAnimatePlus Easy SamplerSettings` is recommended because they keep the full sampler functionality while exposing only the common controls
-5. For official ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` chains, use `WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+5. For official ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` chains:
+   - SCAIL-2: `WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+   - Animate2: `WanAnimatePlus Animate2 Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
 6. Connect `prefix_frames` and/or `transition_video` inputs as needed
 7. Example workflows are available in the `example_workflows/` directory
 
@@ -141,6 +157,7 @@ Core nodes:
 - `WanAnimatePlus SCAIL_2 Embeds`
 - `WanAnimatePlus SCAIL_2 Flow Embeds`
 - `WanAnimatePlus SCAIL_2 Flow Sampler`
+- `WanAnimatePlus Animate2 Embeds`
 - `WanAnimatePlus VAE Decode`
 
 ### WanAnimatePlus Easy Sampler / Easy SamplerSettings
@@ -223,6 +240,35 @@ The Flow nodes preserve the main SCAIL-2 behavior: `bg_image` occupies one prefi
 
 When the upstream official model already has a context handler, Flow Sampler disables its internal loop and leaves context sampling to the official path. In that case, two-phase settings only affect internal-loop handoff chunks and do not force-control official context sampling.
 
+The same Flow Sampler also runs `WanAnimatePlus Animate2 Embeds`. It detects Animate2 runtime on the latent, trims identity frames after sampling, and uses a 5-pixel-frame internal-loop handoff. Two-phase, colormatch, canvas-expansion, and freeze-mask controls stay on the node but are ignored for Animate2.
+
+### WanAnimatePlus Animate2 Embeds
+
+Official ComfyUI-compatible Animate2 conditioning for Animate2 checkpoints. Outputs `positive`, `negative`, and `latent` only; loop/prefix/bg state stays inside the latent. Sample with `WanAnimatePlus SCAIL_2 Flow Sampler`, then decode with `WanAnimatePlus VAE Decode`. Official `WanAnimate2Cache` / `PoseBranchCache` remain the cache nodes to use when needed.
+
+**Inputs:**
+
+| Input | Description |
+|------|------|
+| `positive` / `negative` | Official text `CONDITIONING` |
+| `vae` | VAE for encoding ref / prefix / bg canvas / pose |
+| `width` / `height` / `num_frames` | Target size and output length; width and height are aligned to multiples of 32, `num_frames` to `4n+1` |
+| `frame_window_size` | Internal-loop window. When it is smaller than `num_frames`, Flow Sampler loops with a 5-frame handoff |
+| `batch_size` | Latent batch size |
+| `pose_strength` / `ref_strength` | Official extra-cond strengths; not multiplied onto latents |
+| `clip_vision_output` | Optional CLIP vision for the identity/ref path |
+| `clip_vision_output_pose` | Optional CLIP vision for the pose path; falls back to `clip_vision_output` |
+| `positive_pose` | Optional pose-branch text `CONDITIONING`; falls back to `positive` |
+| `ref_image` | Official identity slot (frame 0), frozen (`concat_mask=0`) and trimmed after sampling |
+| `prefix_frames` | Up to 5 extra frozen identity latents after the official ref slot; trimmed from output so length stays `num_frames` |
+| `bg_image` | Optional single image that fills the unknown canvas instead of mid-grey; still generated (`concat_mask=1`) |
+| `pose_images` | Driving pose video/images. Pose latent time is padded so `pose_T = gen_T - 1` |
+| `tiled_vae` | Use tiled VAE encoding when available |
+
+Animate2 does not use SCAIL-2 `replacement_mode`, prefix masks, two-phase sampling, or loop colormatch. Identity frames are frozen through `concat_mask`; `bg_image` is a canvas fill, not a second frozen ref slot.
+
+Long pose sequences in loop mode may spill to a temporary disk cache. If the official model already has a context handler, Flow Sampler disables its internal loop and leaves context sampling to the official path.
+
 ## Project Structure
 
 ```text
@@ -230,7 +276,10 @@ ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo core model code
 ├─ nodes.py                  # Core WanAnimatePlus embeds / encode / decode nodes
 ├─ nodes_sampler.py          # Core WanAnimatePlus sampler / scheduler nodes
+├─ nodes_animate2.py         # Official-compatible Animate2 Embeds node
+├─ animate2_flow.py          # Animate2 prefix / bg / 5-frame loop helpers
 ├─ scail2_flow.py            # Official-compatible SCAIL-2 Flow helpers
+├─ scail2_loop_inputs.py     # Temporary disk cache for Flow / Animate2 loop inputs
 ├─ nodes_model_loading.py    # Core WanAnimatePlus model / VAE / LoRA / block swap nodes
 ├─ context_windows/          # Context-window scheduling
 ├─ cache_methods/            # Cache acceleration
@@ -263,6 +312,10 @@ No. All node names use the `WanAnimatePlus` prefix, completely avoiding conflict
 ### 4. How many frames for transition_video?
 
 Input is automatically cropped to 21 frames (padded with the first frame if insufficient).
+
+### 5. How do I run official Animate2 models?
+
+Use `WanAnimatePlus Animate2 Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`. There is no separate Animate2 Sampler. Official `WanAnimate2Cache` / `PoseBranchCache` stay the cache nodes.
 
 ## Acknowledgments
 

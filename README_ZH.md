@@ -6,7 +6,7 @@
 
 ## 项目简介
 
-`ComfyUI-WanAnimatePlus` 在 WanVideo 工作流上新增了四大功能：
+`ComfyUI-WanAnimatePlus` 在 WanVideo 工作流上新增了五大功能：
 
 ### prefix_frames 与 transition_video
 
@@ -34,6 +34,10 @@
 ### SCAIL-2 Flow 官方兼容节点
 
 新增 `WanAnimatePlus SCAIL_2 Flow Embeds`、`WanAnimatePlus SCAIL_2 Flow Sampler` 和 `WanAnimatePlus VAE Decode`。这套节点使用官方 ComfyUI 的 `MODEL`、`VAE`、`CONDITIONING`、`LATENT` 和 `IMAGE` 接口，方便接入官方流程，同时保留 WanAnimatePlus SCAIL-2 的 prefix、transition、bg、mask、loop colormatch 和二阶段采样行为。
+
+### Animate2 官方兼容 Embeds
+
+新增 `WanAnimatePlus Animate2 Embeds`，用于官方 ComfyUI Animate2 模型。它把 Plus 风格的 `ref_image`、`prefix_frames`、`bg_image` 映射到官方 Animate2 的 `CONDITIONING`（`concat_latent_image`、`concat_mask`、`pose_video_latent`）和 `LATENT`。采样仍走 SCAIL-2 同一套 `WanAnimatePlus SCAIL_2 Flow Sampler`，没有单独的 Animate2 Sampler。
 
 ## 效果展示
 
@@ -93,6 +97,16 @@ RunningHub 是一个在线 ComfyUI 算力平台。如果你的本地配置无法
 - 单帧 prefix 模式下，`prefix_mask` 走与 `reference_image_mask` 相同的 reference-mask 路径
 - 支持 context window；非首窗口可以看到 prepend 的 prefix/transition 上下文，但这些 prepend 预测不会进入 overlap 融合
 
+### Animate2
+
+通过 `WanAnimatePlus Animate2 Embeds` 提供官方 Animate2 条件注入，采样走 `WanAnimatePlus SCAIL_2 Flow Sampler`。
+
+- 把 `ref_image`、`prefix_frames`、`bg_image` 映射到官方 `concat_latent_image` / `concat_mask` / `pose_video_latent`
+- `prefix_frames` 是最多 5 张额外冻结身份 latent，采样后裁掉
+- `bg_image` 填未知画布（替代中灰），仍然生成
+- `frame_window_size` 小于 `num_frames` 时，内循环用 5 帧 concat/mask 交接
+- 不包装官方 `WanAnimate2Cache` / `PoseBranchCache`；需要缓存时直接用官方节点
+
 ## 安装方式
 
 将本仓库放入 ComfyUI 的 `custom_nodes` 目录：
@@ -112,7 +126,9 @@ git clone https://github.com/wuwukaka/ComfyUI-WanAnimatePlus.git
 2. **将整个工作流链路替换**为 WanAnimatePlus 版本：`ModelLoader`、`VAELoader`、`ContextOptions`、`AnimateEmbeds`、`Sampler`、`Decode` 及配套节点
 3. **不要**在同一个工作流中混用原版 WanVideoWrapper 节点
 4. SCAIL-2 和 WanAnimate 工作流推荐优先使用 `WanAnimatePlus Easy Sampler` 或 `WanAnimatePlus Easy SamplerSettings`，它们只精简常用可见参数，底层仍保留完整采样功能，搭建更方便
-5. 如果要接入官方 ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` 流程，可使用 `WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+5. 如果要接入官方 ComfyUI `MODEL/VAE/CONDITIONING/LATENT/IMAGE` 流程：
+   - SCAIL-2：`WanAnimatePlus SCAIL_2 Flow Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
+   - Animate2：`WanAnimatePlus Animate2 Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`
 6. 根据需要接入 `prefix_frames` 或 `transition_video` 输入
 7. 示例工作流见 `example_workflows/` 目录
 
@@ -141,6 +157,7 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 - `WanAnimatePlus SCAIL_2 Embeds`
 - `WanAnimatePlus SCAIL_2 Flow Embeds`
 - `WanAnimatePlus SCAIL_2 Flow Sampler`
+- `WanAnimatePlus Animate2 Embeds`
 - `WanAnimatePlus VAE Decode`
 
 ### WanAnimatePlus Easy Sampler / Easy SamplerSettings
@@ -223,6 +240,35 @@ Flow Embeds 中 `single_frame_prefix_encoding` 固定开启且不暴露。二阶
 
 当官方模型上游已经带有 context handler 时，Flow Sampler 会关闭内部 loop，交给官方 context 路径处理；此时二阶段设置只对内部 loop handoff chunk 生效，不会强制接管官方 context 采样。
 
+同一套 Flow Sampler 也能跑 `WanAnimatePlus Animate2 Embeds`。它根据 latent 上的 Animate2 runtime 识别路径，采样后裁掉身份帧，内循环用 5 像素帧交接。二阶段、colormatch、canvas expansion、freeze mask 仍留在节点上，但对 Animate2 不生效。
+
+### WanAnimatePlus Animate2 Embeds
+
+官方 ComfyUI 兼容的 Animate2 条件注入，配合 Animate2 checkpoint 使用。节点口只有 `positive`、`negative`、`latent`；loop / prefix / bg 状态藏在 latent 里。采样用 `WanAnimatePlus SCAIL_2 Flow Sampler`，解码用 `WanAnimatePlus VAE Decode`。需要缓存时继续用官方 `WanAnimate2Cache` / `PoseBranchCache`。
+
+**输入：**
+
+| 输入 | 说明 |
+|------|------|
+| `positive` / `negative` | 官方文本 `CONDITIONING` |
+| `vae` | 用于编码 ref / prefix / bg 画布 / pose 的 VAE |
+| `width` / `height` / `num_frames` | 目标尺寸和输出长度；宽高对齐到 32 像素倍数，`num_frames` 对齐到 `4n+1` |
+| `frame_window_size` | 内循环窗口。小于 `num_frames` 时，Flow Sampler 按 5 帧交接做内循环 |
+| `batch_size` | latent batch 大小 |
+| `pose_strength` / `ref_strength` | 官方 extra-cond 强度，不会直接乘到 latent 上 |
+| `clip_vision_output` | 可选，身份/参考路径的 CLIP vision |
+| `clip_vision_output_pose` | 可选，pose 路径的 CLIP vision；缺省时回退到 `clip_vision_output` |
+| `positive_pose` | 可选，pose 分支文本 `CONDITIONING`；缺省时回退到 `positive` |
+| `ref_image` | 官方身份槽（第 0 帧），冻结（`concat_mask=0`），采样后裁掉 |
+| `prefix_frames` | 最多 5 张额外冻结身份 latent，接在官方 ref 槽后面；输出时裁掉，成片长度仍是 `num_frames` |
+| `bg_image` | 可选单张图，用来填未知画布（替代中灰）；仍然生成（`concat_mask=1`） |
+| `pose_images` | 驱动 pose 视频/图像。pose latent 时间维会补齐到 `pose_T = gen_T - 1` |
+| `tiled_vae` | 可用时使用分块 VAE 编码 |
+
+Animate2 不用 SCAIL-2 的 `replacement_mode`、prefix mask、二阶段采样或 loop colormatch。身份帧靠 `concat_mask` 冻结；`bg_image` 只是画布填充，不是第二个冻结 ref 槽。
+
+内循环下过长的 pose 序列可能落到临时磁盘缓存。如果官方模型已经带有 context handler，Flow Sampler 会关闭内部 loop，交给官方 context 路径。
+
 ## 项目结构
 
 ```text
@@ -230,7 +276,10 @@ ComfyUI-WanAnimatePlus/
 ├─ wanvideo/                 # WanVideo 核心模型代码
 ├─ nodes.py                  # WanAnimatePlus embeds / encode / decode 核心节点
 ├─ nodes_sampler.py          # WanAnimatePlus sampler / scheduler 核心节点
+├─ nodes_animate2.py         # 官方兼容 Animate2 Embeds 节点
+├─ animate2_flow.py          # Animate2 prefix / bg / 5 帧内循环 helper
 ├─ scail2_flow.py            # 官方兼容 SCAIL-2 Flow helper
+├─ scail2_loop_inputs.py     # Flow / Animate2 内循环临时磁盘缓存
 ├─ nodes_model_loading.py    # WanAnimatePlus model / VAE / LoRA / block swap 节点
 ├─ context_windows/          # Context window 调度
 ├─ cache_methods/            # 缓存加速方法
@@ -263,6 +312,10 @@ ComfyUI-WanAnimatePlus/
 ### 4. transition_video 需要多少帧？
 
 会自动裁剪到 21 帧（不足则用首帧补齐）。21 像素帧对应约 6 个 latent 帧的过渡空间。
+
+### 5. 官方 Animate2 怎么跑？
+
+用 `WanAnimatePlus Animate2 Embeds` -> `WanAnimatePlus SCAIL_2 Flow Sampler` -> `WanAnimatePlus VAE Decode`。没有单独的 Animate2 Sampler。缓存继续用官方 `WanAnimate2Cache` / `PoseBranchCache`。
 
 ## 致谢
 

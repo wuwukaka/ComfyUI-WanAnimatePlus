@@ -86,6 +86,15 @@ The wuwukasi/wuwukaka additions/modifications include, without limitation:
   canvas trimming, context-window prepend/fusion integration, loop tensor
   caching/background saves, loop colormatch/auto_drift correction, and
   two-phase freeze-mask sampling controls.
+- Official-compatible Animate2 embeds and Flow Sampler integration, including
+  Plus-style prefix identity-latent conditioning, bg canvas fill instead of
+  mid-grey, 5-frame concat/mask internal-loop handoff (not official 1-frame
+  continue_motion wiring), identity latent trimming, pose-sequence disk
+  caching, and mapping onto official Animate2 CONDITIONING keys
+  (concat_latent_image / concat_mask / pose_video_latent). Official ComfyUI
+  WanAnimate2 interfaces and cache nodes remain ComfyUI's; WanAnimatePlus
+  claims only its prefix/bg/loop mapping and Flow Sampler integration around
+  those official interfaces.
 - EverAnimate embeds and sampler support, including anchor selection and
   padding, pose/face/bg/mask conditioning, ping-pong sequence handling, segment
   sampling, and related safeguards.
@@ -113,6 +122,13 @@ Authorship scope exclusions:
   context_window_start parameter threading, cache identity fixes, local
   context-window strategy changes, and source-id rotation application for the
   added context streams.
+- Official ComfyUI WanAnimate2 interfaces and nodes, including
+  concat_latent_image / concat_mask / pose_video_latent conditioning,
+  WanAnimate2ToVideo, WanAnimate2Cache, PoseBranchCache, and TrimVideoLatent,
+  are not claimed as original wuwukasi/wuwukaka code. WanAnimatePlus claims
+  only its Plus-style prefix/bg canvas mapping, 5-frame internal-loop handoff,
+  identity trim, pose disk cache, and Flow Sampler integration around those
+  official interfaces.
 - ComfyUI native quantized linear loading combines WanAnimatePlus work that
   predates PR #2029, including MXFP8/block-wise scale_weight support, with code
   later imported or adapted from PR #2029 in this fork's upstream/original
