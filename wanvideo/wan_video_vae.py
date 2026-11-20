@@ -303,16 +303,22 @@ class ResidualBlock(nn.Module):
         for layer in self.residual:
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                cache_x = x[:, :, -CACHE_T:, :, :].detach()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cached_frame = feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device)
                     cache_x = torch.cat([cached_frame, cache_x], dim=2)
 
-                prev_cache = feat_cache[idx].to(x.device) if feat_cache[idx] is not None else None
+                x = layer(x, feat_cache[idx])
 
-                x = layer(x, prev_cache)
-
-                feat_cache[idx] = cache_x.to("cpu", non_blocking=True)
+                try:
+                    feat_cache[idx] = cache_x.to("cpu")
+                except Exception as exc:
+                    if "out of memory" in str(exc).lower():
+                        raise RuntimeError(
+                            "WanVideo VAE CPU cache ran out of GPU memory while moving a feature cache to CPU. "
+                            "Disable use_cpu_cache or reduce the VAE decode size."
+                        ) from exc
+                    raise
                 feat_idx[0] += 1
             else:
                 x = layer(x)
