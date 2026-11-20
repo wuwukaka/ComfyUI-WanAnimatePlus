@@ -46,6 +46,12 @@ from comfy import model_management as mm
 
 __all__ = ['WanModel']
 
+def _is_directml_enabled():
+    directml_check = getattr(mm, "is_directml_enabled", None)
+    if callable(directml_check):
+        return bool(directml_check())
+    return bool(getattr(mm, "directml_enabled", False))
+
 def _module_first_device(module):
     for tensor in module.parameters(recurse=True):
         return tensor.device
@@ -184,7 +190,7 @@ def torch_dfs(model: nn.Module, parent_name='root'):
 
 def rope_riflex(pos, dim, i, theta, L_test, k, ntk_factor=1.0):
     assert dim % 2 == 0
-    if mm.is_device_mps(pos.device) or mm.is_intel_xpu() or mm.is_directml_enabled():
+    if mm.is_device_mps(pos.device) or mm.is_intel_xpu() or _is_directml_enabled():
         device = torch.device("cpu")
     else:
         device = pos.device
