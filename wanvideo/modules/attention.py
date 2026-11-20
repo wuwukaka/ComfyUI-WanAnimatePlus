@@ -1,7 +1,31 @@
 import torch
 from ...utils import log
 
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules import attention as comfy_attention
+
+
+def _get_comfy_kitchen_int8_attention():
+    backend = getattr(comfy_attention, "attention_comfy_kitchen_int8", None)
+    if not callable(backend):
+        raise ValueError(
+            "Comfy Kitchen INT8 attention is unavailable in this ComfyUI version. "
+            "Update ComfyUI and install a comfy-kitchen build with INT8 attention support."
+        )
+    return backend
+
+
+def check_comfy_kitchen_int8_attention(device):
+    _get_comfy_kitchen_int8_attention()
+    try:
+        from comfy_kitchen import int8_attention_is_available
+
+        available = int8_attention_is_available(device)
+    except (ImportError, OSError, RuntimeError, TypeError) as exc:
+        raise ValueError(
+            "Comfy Kitchen INT8 attention requires a compatible comfy-kitchen installation."
+        ) from exc
+    if not available:
+        raise ValueError(f"Comfy Kitchen INT8 attention is unavailable on {device}.")
 
 def attention_func_error(*args, **kwargs):
     raise ImportError("Selected attention mode not available. Please ensure required packages are installed correctly.")
@@ -110,8 +134,28 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
         return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
     elif attention_mode == 'sageattn_ultravico':
         return sageattn_func_ultravico([q, k, v], multi_factor=transformer_options.get("ultravico_alpha", 0.9), frame_tokens=frame_tokens).contiguous()
-    elif attention_mode == 'comfy':
-        return optimized_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), heads=heads, skip_reshape=True)
+    elif attention_mode in ('comfy', 'comfy_kitchen_int8'):
+        backend = comfy_attention.optimized_attention
+        if attention_mode == 'comfy_kitchen_int8':
+            backend = _get_comfy_kitchen_int8_attention()
+            k, v = k.to(q.dtype), v.to(q.dtype)
+            q, k, v = (tensor if tensor.stride(-1) == 1 else tensor.contiguous() for tensor in (q, k, v))
+
+        kwargs = {}
+        if softmax_scale is not None:
+            kwargs["scale"] = softmax_scale
+        if "low_precision_attention" in transformer_options:
+            kwargs["low_precision_attention"] = transformer_options["low_precision_attention"]
+        out = backend(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            heads=q.shape[2],
+            mask=attn_mask,
+            skip_reshape=True,
+            **kwargs,
+        )
+        return out.unflatten(-1, (q.shape[2], v.shape[-1]))
     else: # sdpa
         if not (q.dtype == k.dtype == v.dtype):
             return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2).to(q.dtype), v.transpose(1, 2).to(q.dtype), attn_mask=attn_mask).transpose(1, 2).contiguous()

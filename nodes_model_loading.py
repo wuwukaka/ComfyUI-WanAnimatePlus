@@ -19,6 +19,7 @@ import numpy as np
 from tqdm import tqdm
 import re
 
+from .wanvideo.modules.attention import check_comfy_kitchen_int8_attention
 from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
@@ -117,7 +118,7 @@ except Exception:
     PromptServer = None
 
 attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
-                    "sageattn_ultravico", "comfy"]
+                    "sageattn_ultravico", "comfy", "comfy_kitchen_int8"]
 
 def add_weight_scale_aliases(sd):
     aliased_sd = dict(sd)
@@ -1157,6 +1158,8 @@ class WanVideoSetAttentionModeOverride:
     DESCRIPTION = "Override the attention mode for the model for specific step and/or block range"
 
     def getmodelpath(self, model, attention_mode, start_step, end_step, verbose, blocks=None):
+        if attention_mode == "comfy_kitchen_int8":
+            check_comfy_kitchen_int8_attention(device)
         model_clone = model.clone()
         attention_mode_override = {
             "mode": attention_mode,
@@ -1230,6 +1233,8 @@ class WanVideoModelLoader:
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, extra_model=None, vace_model=None,
                   fantasytalking_model=None, multitalk_model=None, fantasyportrait_model=None, rms_norm_function="default"):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
+        if attention_mode == "comfy_kitchen_int8":
+            check_comfy_kitchen_int8_attention(device)
         if vace_model is not None:
             extra_model = vace_model
         lora_low_mem_load = merge_loras = False
